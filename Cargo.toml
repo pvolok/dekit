@@ -5,10 +5,6 @@ lto = true        # link time optimization
 panic = "abort"
 codegen-units = 1
 
-[profile.dist]
-inherits = "release"
-lto = "thin"
-
 [workspace]
 resolver = "2"
 default-members = ["src"]

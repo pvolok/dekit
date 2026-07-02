@@ -1,0 +1,47 @@
+name: canary
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: canary
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      cache-prefix: canary
+      artifact-prefix: canary
+      retention-days: 3
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: canary-*
+          path: out
+          merge-multiple: true
+
+      - name: Add installers and checksums
+        run: packaging/bundle.sh out
+
+      - name: Force-update the canary prerelease
+        run: |
+          gh release delete canary --cleanup-tag --yes || true
+          gh release create canary out/* \
+            --title "Latest master (canary)" \
+            --notes "Rolling build of the latest master commit (${GITHUB_SHA}). Updated on every push to master. Prerelease; not a stable release." \
+            --prerelease \
+            --target "${GITHUB_SHA}"

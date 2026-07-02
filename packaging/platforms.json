@@ -1,0 +1,55 @@
+{
+  "package": "dekit",
+  "platforms": [
+    {
+      "target": "x86_64-unknown-linux-musl",
+      "runner": "ubuntu-latest",
+      "musl": true,
+      "archive": "tar.gz",
+      "binary": "dekit",
+      "npmPackage": "@dekit/dekit-linux-x64",
+      "npmOs": "linux",
+      "npmCpu": "x64"
+    },
+    {
+      "target": "aarch64-unknown-linux-musl",
+      "runner": "ubuntu-24.04-arm",
+      "musl": true,
+      "archive": "tar.gz",
+      "binary": "dekit",
+      "npmPackage": "@dekit/dekit-linux-arm64",
+      "npmOs": "linux",
+      "npmCpu": "arm64"
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "runner": "macos-15-intel",
+      "musl": false,
+      "archive": "tar.gz",
+      "binary": "dekit",
+      "npmPackage": "@dekit/dekit-darwin-x64",
+      "npmOs": "darwin",
+      "npmCpu": "x64"
+    },
+    {
+      "target": "aarch64-apple-darwin",
+      "runner": "macos-15",
+      "musl": false,
+      "archive": "tar.gz",
+      "binary": "dekit",
+      "npmPackage": "@dekit/dekit-darwin-arm64",
+      "npmOs": "darwin",
+      "npmCpu": "arm64"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "runner": "windows-latest",
+      "musl": false,
+      "archive": "zip",
+      "binary": "dekit.exe",
+      "npmPackage": "@dekit/dekit-win32-x64",
+      "npmOs": "win32",
+      "npmCpu": "x64"
+    }
+  ]
+}

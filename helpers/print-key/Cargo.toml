@@ -7,9 +7,6 @@ edition = "2021"
 name = "print-key"
 path = "main.rs"
 
-[package.metadata.dist]
-dist = false
-
 [dependencies]
 crossterm = { version = "0.27" }
 termwiz = "*"

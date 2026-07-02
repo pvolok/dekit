@@ -2,7 +2,7 @@
 name = "dekit"
 version = "0.9.6"
 description = "A scriptable process manager you drive from a CLI, TUI, API, or script"
-repository = "https://github.com/pvolok/mprocs"
+repository = "https://github.com/pvolok/dekit"
 authors = ["Pavel Volokitin <pavelvolokitin@gmail.com>"]
 license = "MIT"
 edition = "2024"
@@ -21,9 +21,6 @@ include = ["*"]
 [[bin]]
 name = "dekit"
 path = "bin/dekit.rs"
-
-[package.metadata.dist]
-dist = true
 
 [lib]
 name = "lib"

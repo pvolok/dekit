@@ -1,0 +1,73 @@
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      cache-prefix:
+        type: string
+        required: true
+      artifact-prefix:
+        type: string
+        required: true
+      retention-days:
+        type: number
+        required: false
+        default: 7
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: matrix
+        run: |
+          echo "matrix=$(jq -c '{include: .platforms}' packaging/platforms.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: matrix
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ inputs.cache-prefix }}-${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build -p dekit --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="dekit-${{ matrix.target }}"
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          mkdir -p staging out
+          cp "$binary" "staging/${{ matrix.binary }}"
+          cp LICENSE staging/LICENSE
+          chmod 755 "staging/${{ matrix.binary }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd staging && 7z a "../out/${name}.zip" "${{ matrix.binary }}" LICENSE >/dev/null)
+          else
+            tar -czf "out/${name}.tar.gz" -C staging "${{ matrix.binary }}" LICENSE
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-${{ matrix.target }}
+          path: out/*
+          retention-days: ${{ inputs.retention-days }}
