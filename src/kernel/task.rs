@@ -275,6 +275,10 @@ pub struct TaskHandle {
   /// `supported`: wanted, and every dependency is itself supported and
   /// currently satisfied.
   pub supported: bool,
+  /// Count of requirers that are wanted; a pin counts as one.
+  pub wanted_parents: u32,
+  /// Count of active tasks that require this one (the shutdown gate).
+  pub active_dependents: u32,
 
   pub kind: TaskKind,
   pub ready: ReadyMode,

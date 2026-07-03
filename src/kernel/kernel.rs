@@ -67,6 +67,9 @@ struct Graph {
   now: Instant,
   /// Timers armed during a `step`, taken by the runtime afterwards.
   pending_timers: Vec<TimerRequest>,
+  /// Effects reported by tasks during the current step; `settle` applies
+  /// them one at a time, each against settled state.
+  pending_effects: VecDeque<(TaskId, TaskEffect)>,
 }
 
 impl Graph {
@@ -87,6 +90,7 @@ impl Graph {
 
       now: Instant::now(),
       pending_timers: Vec::new(),
+      pending_effects: VecDeque::new(),
     }
   }
 
@@ -127,6 +131,25 @@ impl Graph {
     let label = def.label.clone();
     let vt = def.vt.clone();
     let tags = def.tags.clone();
+    // Edges may predate registration; start the counters from them.
+    let mut wanted_parents = 0;
+    let mut active_dependents = 0;
+    if let Some(parents) = self.redges.get(&task_id) {
+      for p in parents {
+        if *p == INIT_TASK_ID {
+          wanted_parents += 1;
+          continue;
+        }
+        if let Some(t) = self.tasks.get(p) {
+          if t.wanted {
+            wanted_parents += 1;
+          }
+          if t.state.is_active() {
+            active_dependents += 1;
+          }
+        }
+      }
+    }
     let handle = TaskHandle {
       task,
       state: TaskState::Idle,
@@ -137,6 +160,8 @@ impl Graph {
       last_start: None,
       wanted: false,
       supported: false,
+      wanted_parents,
+      active_dependents,
       kind: def.kind,
       ready: def.ready,
       restart: def.restart,
@@ -317,8 +342,21 @@ impl Graph {
       log::warn!("Edge would create a cycle: {:?} -> {:?}", from, to);
       return;
     }
-    self.edges.entry(from).or_default().insert(to);
-    self.redges.entry(to).or_default().insert(from);
+    if self.edges.entry(from).or_default().insert(to) {
+      self.redges.entry(to).or_default().insert(from);
+      let parent_wanted =
+        from == INIT_TASK_ID || self.tasks.get(&from).is_some_and(|t| t.wanted);
+      let parent_active = from != INIT_TASK_ID
+        && self.tasks.get(&from).is_some_and(|t| t.state.is_active());
+      if let Some(task) = self.tasks.get_mut(&to) {
+        if parent_wanted {
+          task.wanted_parents += 1;
+        }
+        if parent_active {
+          task.active_dependents += 1;
+        }
+      }
+    }
     // `to`'s wanted may change (new parent);
     self.enqueue(to);
     // `from`'s supported may change (new dependency).
@@ -326,16 +364,34 @@ impl Graph {
   }
 
   fn remove_edge(&mut self, from: TaskId, to: TaskId) {
-    if let Some(set) = self.edges.get_mut(&from) {
-      set.remove(&to);
-      if set.is_empty() {
-        self.edges.remove(&from);
+    let removed = match self.edges.get_mut(&from) {
+      Some(set) => {
+        let removed = set.remove(&to);
+        if set.is_empty() {
+          self.edges.remove(&from);
+        }
+        removed
       }
-    }
-    if let Some(set) = self.redges.get_mut(&to) {
-      set.remove(&from);
-      if set.is_empty() {
-        self.redges.remove(&to);
+      None => false,
+    };
+    if removed {
+      if let Some(set) = self.redges.get_mut(&to) {
+        set.remove(&from);
+        if set.is_empty() {
+          self.redges.remove(&to);
+        }
+      }
+      let parent_wanted =
+        from == INIT_TASK_ID || self.tasks.get(&from).is_some_and(|t| t.wanted);
+      let parent_active = from != INIT_TASK_ID
+        && self.tasks.get(&from).is_some_and(|t| t.state.is_active());
+      if let Some(task) = self.tasks.get_mut(&to) {
+        if parent_wanted {
+          task.wanted_parents -= 1;
+        }
+        if parent_active {
+          task.active_dependents -= 1;
+        }
       }
     }
     self.enqueue(to);
@@ -389,47 +445,56 @@ impl Graph {
     }
   }
 
-  /// Re-evaluate every dependency of `id`: their `wanted` reads `id`'s
-  /// `wanted`, and the shutdown gate reads `id`'s active state.
-  fn enqueue_deps(&mut self, id: TaskId) {
-    if let Some(deps) = self.edges.get(&id) {
-      let deps: Vec<TaskId> = deps.iter().copied().collect();
-      for d in deps {
-        self.enqueue(d);
-      }
-    }
-  }
-
-  fn reconcile(&mut self) {
-    let limit = self.tasks.len() * 4 + 16;
-    let mut rounds = 0;
+  /// Complete the current step: apply queued effects and reconcile until
+  /// both are exhausted. Effects are applied before any driving, so a
+  /// stop decided by the reconciler can never overtake an exit the task
+  /// already reported (a job's success must land in Done, not Idle).
+  ///
+  /// Termination relies on: drives are the only Idle -> Starting source,
+  /// and self-exits land in Backoff/Done/Exited, which only timers
+  /// (arriving as later messages) can leave. A restart mode that retries
+  /// within the same step would loop here.
+  fn settle(&mut self) {
+    let budget = self.tasks.len() * 16 + 64;
+    let mut steps = 0;
     loop {
-      // Phase A: propagate caches to a fixed point; collect what to drive.
-      let mut to_drive: Vec<TaskId> = Vec::new();
-      let mut seen: HashSet<TaskId> = HashSet::new();
-      while let Some(id) = self.pop_dirty() {
-        if seen.insert(id) {
-          to_drive.push(id);
+      if let Some((task_id, effect)) = self.pending_effects.pop_front() {
+        match effect {
+          TaskEffect::Started => self.on_task_started(task_id),
+          TaskEffect::Ready => self.on_task_ready(task_id),
+          TaskEffect::Stopped(info) => self.on_task_stopped(task_id, info),
         }
-        self.recompute_caches(id);
-      }
-      if to_drive.is_empty() {
+      } else if !self.dirty.is_empty() {
+        self.reconcile_round();
+      } else {
         break;
       }
-      // Phase B: drive against the snapshot frozen in phase A.
-      for id in to_drive {
-        self.drive_task(id);
-      }
-      rounds += 1;
-      if rounds > limit {
-        log::warn!("Reconcile did not settle after {} rounds", rounds);
-        self.dirty.clear();
-        self.in_queue.clear();
-        break;
+      steps += 1;
+      if steps > budget {
+        // Keep the queues: the work continues on the next message
+        // instead of leaving the caches silently stale.
+        log::warn!("Settle did not finish after {} steps", steps);
+        return;
       }
     }
     #[cfg(debug_assertions)]
     self.debug_check_invariants();
+  }
+
+  /// One reconcile round: propagate caches to a fixed point, then drive
+  /// the affected tasks against that snapshot.
+  fn reconcile_round(&mut self) {
+    let mut to_drive: Vec<TaskId> = Vec::new();
+    let mut seen: HashSet<TaskId> = HashSet::new();
+    while let Some(id) = self.pop_dirty() {
+      if seen.insert(id) {
+        to_drive.push(id);
+      }
+      self.recompute_caches(id);
+    }
+    for id in to_drive {
+      self.drive_task(id);
+    }
   }
 
   /// Recompute one task's cached `wanted`/`supported` from its neighbors'
@@ -442,8 +507,20 @@ impl Graph {
     let new_wanted = self.compute_wanted(id);
     if self.tasks[&id].wanted != new_wanted {
       self.tasks.get_mut(&id).unwrap().wanted = new_wanted;
-      // Children's `wanted` is computed from this one.
-      self.enqueue_deps(id);
+      // Children count this task among their wanted parents.
+      if let Some(deps) = self.edges.get(&id) {
+        let deps: Vec<TaskId> = deps.iter().copied().collect();
+        for dep in deps {
+          if let Some(t) = self.tasks.get_mut(&dep) {
+            if new_wanted {
+              t.wanted_parents += 1;
+            } else {
+              t.wanted_parents -= 1;
+            }
+          }
+          self.enqueue(dep);
+        }
+      }
     }
 
     let new_supported = self.compute_supported(id);
@@ -490,20 +567,13 @@ impl Graph {
   }
 
   /// Whether `id` should be up: reachable from a pin through non-kept-down
-  /// nodes. Reads only the cached `wanted` of immediate parents.
+  /// nodes. Reads the counted wanted parents (a pin counts as one).
   fn compute_wanted(&self, id: TaskId) -> bool {
     if self.quitting {
       return false;
     }
-    if self.tasks.get(&id).expect("queued id live").kept_down {
-      return false;
-    }
-    let Some(parents) = self.redges.get(&id) else {
-      return false;
-    };
-    parents.iter().any(|p| {
-      *p == INIT_TASK_ID || self.tasks.get(p).is_some_and(|t| t.wanted)
-    })
+    let task = self.tasks.get(&id).expect("queued id live");
+    !task.kept_down && task.wanted_parents > 0
   }
 
   /// Whether `id` may run right now: wanted, with every dependency supported
@@ -525,13 +595,10 @@ impl Graph {
   }
 
   fn has_active_dependent(&self, task_id: TaskId) -> bool {
-    let Some(dependents) = self.redges.get(&task_id) else {
-      return false;
-    };
-    dependents.iter().any(|from| {
-      *from != INIT_TASK_ID
-        && self.tasks.get(from).is_some_and(|t| t.state.is_active())
-    })
+    self
+      .tasks
+      .get(&task_id)
+      .is_some_and(|t| t.active_dependents > 0)
   }
 
   fn no_active_tasks(&self) -> bool {
@@ -555,6 +622,34 @@ impl Graph {
         task.supported,
         supported.contains(id),
         "cached supported disagrees with oracle for {:?}",
+        id
+      );
+      let mut wanted_parents = 0;
+      let mut active_dependents = 0;
+      if let Some(parents) = self.redges.get(id) {
+        for p in parents {
+          if *p == INIT_TASK_ID {
+            wanted_parents += 1;
+            continue;
+          }
+          if let Some(t) = self.tasks.get(p) {
+            if t.wanted {
+              wanted_parents += 1;
+            }
+            if t.state.is_active() {
+              active_dependents += 1;
+            }
+          }
+        }
+      }
+      debug_assert_eq!(
+        task.wanted_parents, wanted_parents,
+        "wanted_parents counter disagrees with oracle for {:?}",
+        id
+      );
+      debug_assert_eq!(
+        task.active_dependents, active_dependents,
+        "active_dependents counter disagrees with oracle for {:?}",
         id
       );
     }
@@ -663,7 +758,7 @@ impl Graph {
     if let Some(task) = self.tasks.get_mut(&task_id) {
       task.task.handle_cmd(cmd, &mut fx);
     }
-    self.apply_effects(task_id, &mut fx);
+    self.queue_effects(task_id, &mut fx);
   }
 
   fn schedule_state_timeout(
@@ -694,9 +789,12 @@ impl Graph {
       TaskState::Stopping => {
         if task.killed {
           // The task ignored a hard kill for a full grace period; stop
-          // waiting so the graph (and quit) can make progress.
+          // waiting so the graph (and quit) can make progress. Land in
+          // Idle like any completed stop: the reconciler restarts the
+          // task if it is still wanted (a Start during the grace must
+          // not be lost). The real process may be leaked.
           log::warn!("Task {:?} did not stop after kill; giving up", task_id);
-          self.set_state(task_id, TaskState::Exited(ExitInfo::error()));
+          self.set_state(task_id, TaskState::Idle);
         } else {
           // The stop was ignored for the whole grace period: hard-kill.
           self.hard_kill(task_id);
@@ -822,8 +920,21 @@ impl Graph {
       self.enqueue_parents(task_id);
     }
     if was_active != state.is_active() {
-      // The shutdown gate holds a dependency up while a dependent is active.
-      self.enqueue_deps(task_id);
+      // The shutdown gate counts active dependents on each dependency.
+      let now_active = state.is_active();
+      if let Some(deps) = self.edges.get(&task_id) {
+        let deps: Vec<TaskId> = deps.iter().copied().collect();
+        for dep in deps {
+          if let Some(t) = self.tasks.get_mut(&dep) {
+            if now_active {
+              t.active_dependents += 1;
+            } else {
+              t.active_dependents -= 1;
+            }
+          }
+          self.enqueue(dep);
+        }
+      }
     }
 
     self.notify_subscribers(task_id, path, TaskNotify::StateChanged(state));
@@ -849,10 +960,20 @@ impl Graph {
       }
     }
 
+    let was_wanted = handle.wanted;
+    let was_active = handle.state.is_active();
     if let Some(deps) = self.edges.remove(&task_id) {
       for dep in deps {
         if let Some(set) = self.redges.get_mut(&dep) {
           set.remove(&task_id);
+        }
+        if let Some(t) = self.tasks.get_mut(&dep) {
+          if was_wanted {
+            t.wanted_parents -= 1;
+          }
+          if was_active {
+            t.active_dependents -= 1;
+          }
         }
         // A lost parent may make the dependency no longer wanted.
         self.enqueue(dep);
@@ -1026,13 +1147,11 @@ impl Graph {
     })
   }
 
-  fn apply_effects(&mut self, task_id: TaskId, fx: &mut Effects) {
+  /// Effects are queued, never applied mid-step: a reconcile pass in
+  /// progress can never be invalidated from underneath.
+  fn queue_effects(&mut self, task_id: TaskId, fx: &mut Effects) {
     for effect in fx.drain() {
-      match effect {
-        TaskEffect::Started => self.on_task_started(task_id),
-        TaskEffect::Ready => self.on_task_ready(task_id),
-        TaskEffect::Stopped(info) => self.on_task_stopped(task_id, info),
-      }
+      self.pending_effects.push_back((task_id, effect));
     }
   }
 
@@ -1103,7 +1222,6 @@ impl Graph {
     notify: TaskNotify,
     targets: HashSet<TaskId>,
   ) {
-    let mut all_fx: Vec<(TaskId, Effects)> = Vec::new();
     for listener_id in targets {
       if let Some(listener) = self.tasks.get_mut(&listener_id) {
         let mut fx = Effects::new();
@@ -1115,11 +1233,8 @@ impl Graph {
           }),
           &mut fx,
         );
-        all_fx.push((listener_id, fx));
+        self.queue_effects(listener_id, &mut fx);
       }
-    }
-    for (task_id, mut fx) in all_fx {
-      self.apply_effects(task_id, &mut fx);
     }
   }
 }
@@ -1172,7 +1287,7 @@ impl Kernel {
       if self.dispatch(msg) {
         break;
       }
-      self.graph.reconcile();
+      self.graph.settle();
       for req in self.graph.take_timers() {
         let sender = self.sender.clone();
         tokio::spawn(async move {
@@ -1321,6 +1436,33 @@ mod tests {
           },
           Err(_) => (),
         },
+      }
+    }
+  }
+
+  /// Records commands like `RecordingTask`; reports success the moment
+  /// any message arrives.
+  struct ExitOnNotify {
+    name: &'static str,
+    tx: UnboundedSender<(&'static str, RecordedCmd)>,
+  }
+
+  impl Task for ExitOnNotify {
+    fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
+      match cmd {
+        TaskCmd::Start => {
+          self.tx.send((self.name, RecordedCmd::Start)).unwrap();
+          fx.started();
+        }
+        TaskCmd::Stop => {
+          self.tx.send((self.name, RecordedCmd::Stop)).unwrap();
+          fx.stopped(ExitInfo::code(1));
+        }
+        TaskCmd::Kill => {
+          self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
+          fx.stopped(ExitInfo::signal(9));
+        }
+        TaskCmd::Msg(_) => fx.stopped(ExitInfo::code(0)),
       }
     }
   }
@@ -2336,7 +2478,7 @@ mod tests {
   }
 
   #[tokio::test(start_paused = true)]
-  async fn unresponsive_task_is_killed_then_marked_exited() {
+  async fn unresponsive_task_is_killed_then_given_up() {
     let mut fx = Fixture::new();
     let tx = fx.tx.clone();
     let a = fx
@@ -2361,12 +2503,90 @@ mod tests {
     fx.flush().await;
 
     // The kill is also ignored: the kernel gives up so the graph (and
-    // quit) can make progress.
+    // quit) can make progress. Nothing wants the task, so it stays down.
     tokio::time::advance(STOP_GRACE + Duration::from_millis(1)).await;
     fx.flush().await;
+    assert_eq!(state_of(&fx.pc, a).await, Some(TaskState::Idle));
+
+    fx.quit(handle).await;
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn start_during_stop_grace_survives_give_up() {
+    let mut fx = Fixture::new();
+    let tx = fx.tx.clone();
+    let a = fx
+      .kernel
+      .as_mut()
+      .unwrap()
+      .register_task(path_def("/a"), move |_| {
+        Box::new(StubbornTask { name: "a", tx })
+      });
+    let handle = fx.run();
+
+    fx.pc.send(KernelCommand::Start(a));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+    fx.pc.send(KernelCommand::Stop(a));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+
+    // Change of mind while the stop grace is running.
+    fx.pc.send(KernelCommand::Start(a));
+    fx.flush().await;
+    fx.assert_no_cmd();
+
+    // The stop is ignored: hard kill, then give-up. The start intent
+    // survives both; the task comes back instead of wedging.
+    tokio::time::advance(STOP_GRACE + Duration::from_millis(1)).await;
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Kill));
+    tokio::time::advance(STOP_GRACE + Duration::from_millis(1)).await;
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+    // Quit must wind the stubborn task down through both graces again.
+    fx.pc.send(KernelCommand::Quit);
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+    tokio::time::advance(STOP_GRACE + Duration::from_millis(1)).await;
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Kill));
+    tokio::time::advance(STOP_GRACE + Duration::from_millis(1)).await;
+    tokio::time::timeout(Duration::from_secs(1), handle)
+      .await
+      .expect("timed out waiting for kernel to quit")
+      .unwrap();
+  }
+
+  /// A job that reports success in the same step where the reconciler
+  /// would stop it must land in Done, not be treated as merely stopped.
+  #[tokio::test]
+  async fn job_success_beats_stop_decided_in_same_step() {
+    let mut fx = Fixture::new();
+    let d = fx.add("d", path_def("/d"));
+    let tx = fx.tx.clone();
+    let j = fx.kernel.as_mut().unwrap().register_task(
+      TaskDef {
+        kind: TaskKind::Job,
+        deps: vec![d],
+        ..path_def("/j")
+      },
+      move |ctx| {
+        ctx.subscribe_path(TaskPath::new("/d").unwrap(), SubMode::Subtree);
+        Box::new(ExitOnNotify { name: "j", tx })
+      },
+    );
+    let handle = fx.run();
+
+    fx.pc.send(KernelCommand::Start(j));
+    assert_eq!(fx.recv().await, ("d", RecordedCmd::Start));
+    assert_eq!(fx.recv().await, ("j", RecordedCmd::Start));
+    fx.flush().await;
+
+    // Stopping the dep breaks j's support in the same step in which j's
+    // success report is queued (j exits when it hears the dep stopping).
+    // The success must win: j is Done, never commanded to stop.
+    fx.pc.send(KernelCommand::Stop(d));
+    assert_eq!(fx.recv().await, ("d", RecordedCmd::Stop));
     assert_eq!(
-      state_of(&fx.pc, a).await,
-      Some(TaskState::Exited(ExitInfo::error()))
+      state_of(&fx.pc, j).await,
+      Some(TaskState::Done(ExitInfo::code(0)))
     );
 
     fx.quit(handle).await;
