@@ -44,6 +44,15 @@ struct TimerRequest {
   delay: Duration,
 }
 
+/// A command the kernel sent to a task, logged for the property harness.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SentCmd {
+  Start,
+  Stop,
+  Kill,
+}
+
 struct Graph {
   sender: UnboundedSender<KernelMessage>,
 
@@ -70,6 +79,14 @@ struct Graph {
   /// Effects reported by tasks during the current step; `settle` applies
   /// them one at a time, each against settled state.
   pending_effects: VecDeque<(TaskId, TaskEffect)>,
+  /// Every state transition, for the property harness to check against
+  /// the legal state diagram.
+  #[cfg(test)]
+  transitions: Vec<(TaskId, TaskState, TaskState)>,
+  /// Every command sent to a task, for the property harness to check
+  /// that commands are never silently swallowed.
+  #[cfg(test)]
+  sent: Vec<(TaskId, SentCmd)>,
 }
 
 impl Graph {
@@ -91,6 +108,10 @@ impl Graph {
       now: Instant::now(),
       pending_timers: Vec::new(),
       pending_effects: VecDeque::new(),
+      #[cfg(test)]
+      transitions: Vec::new(),
+      #[cfg(test)]
+      sent: Vec::new(),
     }
   }
 
@@ -754,6 +775,13 @@ impl Graph {
   }
 
   fn send_cmd(&mut self, task_id: TaskId, cmd: TaskCmd) {
+    #[cfg(test)]
+    match &cmd {
+      TaskCmd::Start => self.sent.push((task_id, SentCmd::Start)),
+      TaskCmd::Stop => self.sent.push((task_id, SentCmd::Stop)),
+      TaskCmd::Kill => self.sent.push((task_id, SentCmd::Kill)),
+      TaskCmd::Msg(_) => (),
+    }
     let mut fx = Effects::new();
     if let Some(task) = self.tasks.get_mut(&task_id) {
       task.task.handle_cmd(cmd, &mut fx);
@@ -908,12 +936,16 @@ impl Graph {
     }
     let was_satisfied = task.is_satisfied();
     let was_active = task.state.is_active();
+    #[cfg(test)]
+    let old_state = task.state;
     task.state = state;
     task.epoch += 1;
     task.killed = false;
     let now_satisfied = task.is_satisfied();
     let path = task.path.clone();
 
+    #[cfg(test)]
+    self.transitions.push((task_id, old_state, state));
     self.enqueue(task_id);
     if was_satisfied != now_satisfied {
       // Dependents' `supported` depends on whether this task is satisfied.
@@ -1463,6 +1495,32 @@ mod tests {
           fx.stopped(ExitInfo::signal(9));
         }
         TaskCmd::Msg(_) => fx.stopped(ExitInfo::code(0)),
+      }
+    }
+  }
+
+  /// Records commands like `RecordingTask` but never reports starting:
+  /// stays in Starting until commanded down.
+  struct SilentTask {
+    name: &'static str,
+    tx: UnboundedSender<(&'static str, RecordedCmd)>,
+  }
+
+  impl Task for SilentTask {
+    fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
+      match cmd {
+        TaskCmd::Start => {
+          self.tx.send((self.name, RecordedCmd::Start)).unwrap();
+        }
+        TaskCmd::Stop => {
+          self.tx.send((self.name, RecordedCmd::Stop)).unwrap();
+          fx.stopped(ExitInfo::code(0));
+        }
+        TaskCmd::Kill => {
+          self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
+          fx.stopped(ExitInfo::signal(9));
+        }
+        TaskCmd::Msg(_) => (),
       }
     }
   }
@@ -2511,6 +2569,55 @@ mod tests {
     fx.quit(handle).await;
   }
 
+  #[tokio::test]
+  async fn stop_while_starting_stops_it() {
+    let mut fx = Fixture::new();
+    let tx = fx.tx.clone();
+    let a = fx
+      .kernel
+      .as_mut()
+      .unwrap()
+      .register_task(path_def("/a"), move |_| {
+        Box::new(SilentTask { name: "a", tx })
+      });
+    let handle = fx.run();
+
+    fx.pc.send(KernelCommand::Start(a));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+    // Still Starting: the stop must reach the task, not wait for it to
+    // finish starting.
+    fx.pc.send(KernelCommand::Stop(a));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+    fx.flush().await;
+    assert_eq!(state_of(&fx.pc, a).await, Some(TaskState::Idle));
+
+    fx.quit(handle).await;
+  }
+
+  #[tokio::test]
+  async fn restart_while_starting_bounces_it() {
+    let mut fx = Fixture::new();
+    let tx = fx.tx.clone();
+    let a = fx
+      .kernel
+      .as_mut()
+      .unwrap()
+      .register_task(path_def("/a"), move |_| {
+        Box::new(SilentTask { name: "a", tx })
+      });
+    let handle = fx.run();
+
+    fx.pc.send(KernelCommand::Start(a));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+    fx.pc.send(KernelCommand::Restart(a));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+    fx.quit(handle).await;
+  }
+
   #[tokio::test(start_paused = true)]
   async fn start_during_stop_grace_survives_give_up() {
     let mut fx = Fixture::new();
@@ -2640,3 +2747,7 @@ mod tests {
     fx.quit(handle).await;
   }
 }
+
+#[cfg(test)]
+#[path = "kernel_prop.rs"]
+mod kernel_prop;

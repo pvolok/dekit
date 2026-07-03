@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f4dde7bb3de18f76bc8a0efdc1031d2f54532082d989f5100b3682ca9d21cd85 # shrinks to w = World { tasks: [TaskGen { job: true, reported: false, restart: Never, pinned: false, deps: [], script: Script { on_start: Started, on_stop: Started, on_kill: Started, on_msg: StartedThenExitOk } }, TaskGen { job: false, reported: false, restart: Never, pinned: false, deps: [], script: Script { on_start: Ignore, on_stop: Started, on_kill: Started, on_msg: Started } }], registered: [false, false], cmds: [Register(0), Restart(0)] }
+cc 0665fa1c2d82411048c18aee8202e5584e75e5f056ac78607b5679aaf5ca8545 # shrinks to w = World { tasks: [TaskGen { job: false, reported: false, restart: Never, pinned: false, deps: [], script: Script { on_start: Ignore, on_stop: Started, on_kill: Started, on_msg: Started } }, TaskGen { job: false, reported: false, restart: Never, pinned: false, deps: [0], script: Script { on_start: Started, on_stop: Started, on_kill: Started, on_msg: Started } }], registered: [true, true], cmds: [Restart(0), Restart(0)] }

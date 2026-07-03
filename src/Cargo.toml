@@ -72,6 +72,7 @@ rustix = { version = "1", features = ["all-apis"] }
 rquickjs = { version = "0.12", features = ["full-async", "bindgen"] }
 
 [dev-dependencies]
+proptest = "1"
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [target."cfg(unix)".dependencies]
