@@ -163,6 +163,10 @@ settings in the _global_ config.
     **proc_log** config.
 - **hide_keymap_window**: _bool_ - Hide the pane at the bottom of the screen
   showing key bindings.
+- **hide_zen_message**: _bool_ - Hide the zoom mode hint while zoomed.
+  Default: _false_.
+- **hide_proc_frame**: _bool_ - Hide process pane titles, borders, and padding.
+  Default: _false_.
 - **mouse_scroll_speed**: _integer_ - Number of lines to scroll per one mouse
   scroll.
 - **scrollback**: _integer_ - Scrollback size. Default: _1000_.

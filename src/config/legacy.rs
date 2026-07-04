@@ -25,6 +25,8 @@ impl From<crate::mprocs::config::Config> for Config {
         tips: TipsConfig {
           show: !legacy.hide_keymap_window,
         },
+        hide_zen_message: legacy.hide_zen_message,
+        hide_proc_frame: legacy.hide_proc_frame,
       },
       keymap: KeymapConfig::default(),
       on_init: legacy.on_init.map(Hook::Action),

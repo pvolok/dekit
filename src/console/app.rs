@@ -171,8 +171,14 @@ impl App {
         let state = &mut self.state;
         let config = &mut self.config;
         let keymap = &self.keymap;
-        render_procs(layout.procs.into(), grid, state, config);
-        render_term(layout.term, grid, state);
+        render_procs(
+          layout.procs.into(),
+          grid,
+          state,
+          config,
+          layout.proc_frame,
+        );
+        render_term(layout.term, grid, state, layout.proc_frame);
         render_keymap(layout.keymap.into(), grid, state, keymap);
         render_zoom_tip(layout.zoom_banner.into(), grid, keymap);
 
@@ -436,6 +442,7 @@ impl App {
           layout.procs.into(),
           mouse_event.x as u16,
           mouse_event.y as u16,
+          layout.proc_frame,
         ) {
           if let (Scope::Term, MouseEventKind::Down(_)) =
             (self.state.scope, mouse_event.kind)
@@ -450,6 +457,7 @@ impl App {
                   mouse_event.x as u16,
                   mouse_event.y as u16,
                   &self.state,
+                  layout.proc_frame,
                 ) {
                   self.state.select_proc(index);
                 }

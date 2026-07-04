@@ -19,6 +19,8 @@ pub struct Settings {
   keymap_term: IndexMap<Key, Action>,
   keymap_copy: IndexMap<Key, Action>,
   pub hide_keymap_window: bool,
+  pub hide_zen_message: bool,
+  pub hide_proc_frame: bool,
   pub mouse_scroll_speed: usize,
   pub scrollback_len: usize,
   pub proc_list_width: usize,
@@ -34,6 +36,8 @@ impl Default for Settings {
       keymap_term: Default::default(),
       keymap_copy: Default::default(),
       hide_keymap_window: false,
+      hide_zen_message: false,
+      hide_proc_frame: false,
       mouse_scroll_speed: 5,
       scrollback_len: 1000,
       proc_list_width: 30,
@@ -135,6 +139,14 @@ impl Settings {
       obj.get(&Value::from("hide_keymap_window"))
     {
       self.hide_keymap_window = hide_keymap_window.as_bool()?;
+    }
+
+    if let Some(hide_zen_message) = obj.get(&Value::from("hide_zen_message")) {
+      self.hide_zen_message = hide_zen_message.as_bool()?;
+    }
+
+    if let Some(hide_proc_frame) = obj.get(&Value::from("hide_proc_frame")) {
+      self.hide_proc_frame = hide_proc_frame.as_bool()?;
     }
 
     if let Some(mouse_scroll_speed) =

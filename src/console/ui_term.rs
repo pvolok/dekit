@@ -1,8 +1,17 @@
 use crate::console::state::{Scope, State};
 use crate::term::{Color, Grid, Screen, attrs::Attrs, grid::Rect};
 
-pub fn render_term(area: Rect, grid: &mut Grid, state: &mut State) {
-  if area.width < 3 || area.height < 3 {
+pub fn render_term(
+  area: Rect,
+  grid: &mut Grid,
+  state: &mut State,
+  frame: bool,
+) {
+  if area.width == 0 || area.height == 0 {
+    return;
+  }
+
+  if frame && (area.width < 3 || area.height < 3) {
     return;
   }
 
@@ -15,12 +24,14 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &mut State) {
     return;
   };
 
-  let chars = match active {
-    true => crate::term::grid::BorderType::Thick,
-    false => crate::term::grid::BorderType::Plain,
+  if frame {
+    let chars = match active {
+      true => crate::term::grid::BorderType::Thick,
+      false => crate::term::grid::BorderType::Plain,
+    }
+    .chars();
+    grid.draw_block(area, &chars, Attrs::default());
   }
-  .chars();
-  grid.draw_block(area, &chars, Attrs::default());
 
   let handle = proc.present.as_ref().unwrap_or(&proc.vt);
   let Ok(parser) = handle.read() else {
@@ -28,24 +39,29 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &mut State) {
   };
   let screen = parser.screen();
 
-  let mut top_line = Rect {
-    x: area.x + 1,
-    y: area.y,
-    width: area.width - 2,
-    height: 1,
-  };
-  let r =
-    grid.draw_text(top_line, "Terminal", Attrs::default().set_bold(active));
-  top_line = top_line.move_left(r.width as i32);
-  let title = screen.title();
-  if !title.is_empty() {
-    let r = grid.draw_text(top_line, " ", Attrs::default());
+  if frame {
+    let mut top_line = Rect {
+      x: area.x + 1,
+      y: area.y,
+      width: area.width - 2,
+      height: 1,
+    };
+    let r =
+      grid.draw_text(top_line, "Terminal", Attrs::default().set_bold(active));
     top_line = top_line.move_left(r.width as i32);
-    let _r =
-      grid.draw_text(top_line, title, Attrs::default().fg(Color::BRIGHT_BLACK));
+    let title = screen.title();
+    if !title.is_empty() {
+      let r = grid.draw_text(top_line, " ", Attrs::default());
+      top_line = top_line.move_left(r.width as i32);
+      let _r = grid.draw_text(
+        top_line,
+        title,
+        Attrs::default().fg(Color::BRIGHT_BLACK),
+      );
+    }
   }
 
-  let inner = area.inner(1);
+  let inner = if frame { area.inner(1) } else { area };
   render_screen(screen, inner, grid);
 
   if active && !screen.hide_cursor() {

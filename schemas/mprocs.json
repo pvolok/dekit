@@ -20,6 +20,14 @@
       "type": "boolean",
       "description": "Hide the pane at the bottom of the screen showing key bindings."
     },
+    "hide_zen_message": {
+      "type": "boolean",
+      "description": "Hide the zoom mode hint while zoomed. Default: false."
+    },
+    "hide_proc_frame": {
+      "type": "boolean",
+      "description": "Hide process pane titles, borders, and padding. Default: false."
+    },
     "mouse_scroll_speed": {
       "type": "integer",
       "description": "Number of lines to scroll per one mouse scroll."
