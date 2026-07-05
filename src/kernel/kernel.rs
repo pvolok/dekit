@@ -123,32 +123,32 @@ impl Graph {
     )
   }
 
+  /// Returns whether the task was registered.
   fn register_task_with_id(
     &mut self,
     task_id: TaskId,
     def: TaskDef,
     factory: Box<dyn FnOnce(TaskContext) -> Box<dyn Task>>,
-  ) {
+  ) -> bool {
     if self.tasks.contains_key(&task_id) {
       log::warn!("Duplicate task id {:?}; registration ignored", task_id);
-      return;
+      return false;
     }
-    let ctx =
-      TaskContext::new(self.next_task_id.clone(), task_id, self.sender.clone());
-    let task = factory(ctx);
-    // The handle only keeps the path if the trie insert succeeds, so the
-    // handle and the trie owner never disagree.
-    // TODO: Probaly should fail if path already exists.
+    // A taken path refuses the whole registration, checked before the
+    // factory runs so a refused task spawns nothing.
     let path = match def.path {
       Some(p) => match self.ns.insert(&p, task_id) {
         Ok(()) => Some(p),
         Err(err) => {
-          log::warn!("Path conflict while registering task: {}", err);
-          None
+          log::warn!("Registration refused: {}", err);
+          return false;
         }
       },
       None => None,
     };
+    let ctx =
+      TaskContext::new(self.next_task_id.clone(), task_id, self.sender.clone());
+    let task = factory(ctx);
     let label = def.label.clone();
     let vt = def.vt.clone();
     let tags = def.tags.clone();
@@ -215,6 +215,7 @@ impl Graph {
         vt,
       },
     );
+    true
   }
 
   /// Begin quitting. Returns true if a quit was already in progress (the
@@ -1342,8 +1343,11 @@ impl Kernel {
     match msg.command {
       KernelCommand::Quit => return self.graph.begin_quit(),
 
-      KernelCommand::RegisterTask(task_id, def, factory) => {
-        self.graph.register_task_with_id(task_id, def, factory);
+      KernelCommand::RegisterTask(task_id, def, factory, ack) => {
+        let registered = self.graph.register_task_with_id(task_id, def, factory);
+        if let Some(ack) = ack {
+          let _ = ack.send(registered);
+        }
       }
       KernelCommand::RemoveTask(task_id) => self.graph.remove_task(task_id),
 
@@ -1639,6 +1643,42 @@ mod tests {
 
     fx.pc.send(KernelCommand::Down(a));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+
+    fx.quit(handle).await;
+  }
+
+  #[tokio::test]
+  async fn second_task_at_same_path_is_refused() {
+    let mut fx = Fixture::new();
+    let a = fx.add("a", path_def("/x"));
+    let b = fx.add("b", path_def("/x"));
+    let handle = fx.run();
+
+    fx.pc.send(KernelCommand::Start(b));
+    fx.flush().await;
+    fx.assert_no_cmd();
+
+    fx.pc.send(KernelCommand::Start(a));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+    fx.quit(handle).await;
+  }
+
+  #[tokio::test]
+  async fn registration_ack_reports_the_outcome() {
+    let mut fx = Fixture::new();
+    let _a = fx.add("a", path_def("/x"));
+    let handle = fx.run();
+
+    let taken = fx
+      .pc
+      .spawn_async_with_id(fx.pc.alloc_id(), path_def("/x"), |_, _| async {});
+    assert_eq!(taken.await, Ok(false));
+
+    let free = fx
+      .pc
+      .spawn_async_with_id(fx.pc.alloc_id(), path_def("/y"), |_, _| async {});
+    assert_eq!(free.await, Ok(true));
 
     fx.quit(handle).await;
   }

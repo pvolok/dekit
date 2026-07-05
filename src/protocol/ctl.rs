@@ -120,7 +120,9 @@ pub mod codes {
   pub const UNKNOWN_METHOD: &str = "unknown_method";
   pub const INVALID_PARAMS: &str = "invalid_params";
   pub const NO_MATCH: &str = "no_match";
+  pub const NO_AUTOSTART_TARGET: &str = "no_autostart_target";
   pub const BAD_PATH: &str = "bad_path";
+  pub const PATH_TAKEN: &str = "path_taken";
   pub const NO_SCREEN: &str = "no_screen";
   pub const INTERNAL: &str = "internal";
   pub const UNSUPPORTED_PROTOCOL: &str = "unsupported_protocol";

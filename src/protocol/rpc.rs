@@ -34,15 +34,17 @@ pub enum RpcRequest {
     pattern: String,
   },
   /// Unpin matching tasks; each stops only if nothing else wants it.
+  /// Without a pattern, unpin every task.
   Down {
-    pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pattern: Option<String>,
   },
   /// Like `Stop` but with an immediate hard kill.
   Kill {
     pattern: String,
   },
-  /// Keep matching tasks down until started again.
-  KeepDown {
+  /// Veto matching tasks: they stay down until started again.
+  Veto {
     pattern: String,
   },
   Restart {
@@ -69,7 +71,7 @@ const METHODS: &[&str] = &[
   "stop",
   "down",
   "kill",
-  "keep_down",
+  "veto",
   "restart",
   "why",
   "screen",
@@ -141,7 +143,7 @@ pub struct RpcWhy {
   pub state: String,
   pub wanted: bool,
   pub supported: bool,
-  pub kept_down: bool,
+  pub vetoed: bool,
   pub pinned: bool,
   pub required_by: Vec<String>,
   pub deps: Vec<RpcWhyDep>,
@@ -182,13 +184,14 @@ mod tests {
       RpcRequest::Stop {
         pattern: "/web".to_string(),
       },
+      RpcRequest::Down { pattern: None },
       RpcRequest::Down {
-        pattern: "/web".to_string(),
+        pattern: Some("/web".to_string()),
       },
       RpcRequest::Kill {
         pattern: "/web".to_string(),
       },
-      RpcRequest::KeepDown {
+      RpcRequest::Veto {
         pattern: "/web".to_string(),
       },
       RpcRequest::Restart {
@@ -218,9 +221,10 @@ mod tests {
       ("up", r#"null"#),
       ("start", r#"{"pattern":"/web"}"#),
       ("stop", r#"{"pattern":"/web"}"#),
+      ("down", r#"null"#),
       ("down", r#"{"pattern":"/web"}"#),
       ("kill", r#"{"pattern":"/web"}"#),
-      ("keep_down", r#"{"pattern":"/web"}"#),
+      ("veto", r#"{"pattern":"/web"}"#),
       ("restart", r#"{"pattern":"/web"}"#),
       ("why", r#"{"path":"/web"}"#),
       ("screen", r#"{"path":"/web"}"#),

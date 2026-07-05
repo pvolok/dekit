@@ -266,7 +266,7 @@ async fn handle_rpc(
       Ok(ok_result())
     }
 
-    RpcRequest::KeepDown { pattern } => {
+    RpcRequest::Veto { pattern } => {
       for t in match_tasks(pc, &pattern).await? {
         pc.send(KernelCommand::KeepDown(t.id));
       }
@@ -274,7 +274,11 @@ async fn handle_rpc(
     }
 
     RpcRequest::Down { pattern } => {
-      for t in match_tasks(pc, &pattern).await? {
+      let tasks = match pattern {
+        Some(pattern) => match_tasks(pc, &pattern).await?,
+        None => list_tasks(pc, None).await?,
+      };
+      for t in tasks {
         pc.send(KernelCommand::Down(t.id));
       }
       Ok(ok_result())
@@ -303,7 +307,7 @@ async fn handle_rpc(
             state: state_str(explain.state),
             wanted: explain.wanted,
             supported: explain.supported,
-            kept_down: explain.kept_down,
+            vetoed: explain.kept_down,
             pinned: explain.pinned,
             required_by: explain.required_by,
             deps: explain
@@ -366,10 +370,17 @@ async fn handle_rpc(
       }
       let mut cfg = crate::task::proc_task::ProcTaskConfig::new(spec);
       cfg.tags = vec![crate::config::proc::USER_TAG.to_string()];
-      let id =
+      cfg.pinned = true;
+      let (_id, ack) =
         crate::task::proc_task::spawn_proc_task(pc, Some(task_path), cfg);
-      pc.send(KernelCommand::Start(id));
-      Ok(ok_result())
+      match ack.await {
+        Ok(true) => Ok(ok_result()),
+        Ok(false) => Err(RpcError::new(
+          codes::PATH_TAKEN,
+          format!("a task already exists at '{}'", path),
+        )),
+        Err(_) => Err(RpcError::internal("kernel dropped the registration")),
+      }
     }
   }
 }

@@ -313,7 +313,7 @@ impl App {
     let path = TaskPath::resolve(TASK_ROOT, &merged.path)
       .or_else(|_| TaskPath::resolve(TASK_ROOT, &task_id.0.to_string()))
       .ok();
-    spawn_proc_task_with_id(
+    let _ = spawn_proc_task_with_id(
       &self.pc,
       task_id,
       path,
@@ -606,7 +606,7 @@ impl App {
           pc.send(KernelCommand::Kill(proc.id));
         }
       }
-      Action::KeepDownProc => {
+      Action::VetoProc => {
         if let Some(proc) = self.state.get_current_proc() {
           pc.send(KernelCommand::KeepDown(proc.id));
         }
@@ -960,6 +960,7 @@ fn proc_task_config(
     } else {
       Vec::new()
     },
+    pinned: false,
   }
 }
 

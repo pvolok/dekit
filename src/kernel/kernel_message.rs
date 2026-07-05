@@ -25,6 +25,9 @@ pub enum KernelCommand {
     TaskId,
     TaskDef,
     Box<dyn FnOnce(TaskContext) -> Box<dyn Task> + Send>,
+    /// Answered with whether the task was registered (false: refused,
+    /// e.g. the path is taken).
+    Option<tokio::sync::oneshot::Sender<bool>>,
   ),
   RemoveTask(TaskId),
 
@@ -207,7 +210,7 @@ impl TaskContext {
     def: TaskDef,
     factory: Box<dyn FnOnce(TaskContext) -> Box<dyn Task> + Send>,
   ) -> TaskId {
-    self.send(KernelCommand::RegisterTask(task_id, def, factory));
+    self.send(KernelCommand::RegisterTask(task_id, def, factory, None));
     task_id
   }
 
@@ -219,15 +222,17 @@ impl TaskContext {
     Fut: std::future::Future<Output = ()> + Send + 'static,
   {
     let task_id = self.alloc_id();
-    self.spawn_async_with_id(task_id, def, f)
+    let _ = self.spawn_async_with_id(task_id, def, f);
+    task_id
   }
 
+  /// The returned ack resolves to whether the task was registered.
   pub fn spawn_async_with_id<F, Fut>(
     &self,
     task_id: TaskId,
     def: TaskDef,
     f: F,
-  ) -> TaskId
+  ) -> tokio::sync::oneshot::Receiver<bool>
   where
     F: FnOnce(TaskContext, tokio::sync::mpsc::UnboundedReceiver<TaskCmd>) -> Fut
       + Send
@@ -235,7 +240,8 @@ impl TaskContext {
     Fut: std::future::Future<Output = ()> + Send + 'static,
   {
     use super::task::ChannelTask;
-    self.register_with_id(
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    self.send(KernelCommand::RegisterTask(
       task_id,
       def,
       Box::new(|ctx| {
@@ -243,7 +249,9 @@ impl TaskContext {
         tokio::spawn(f(ctx, rx));
         Box::new(ChannelTask::new(tx))
       }),
-    )
+      Some(ack_tx),
+    ));
+    ack_rx
   }
 
   pub fn set_task_path(&self, task_id: TaskId, path: TaskPath) {

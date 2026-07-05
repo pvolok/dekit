@@ -14,6 +14,21 @@ use crate::{
   protocol::{RpcRequest, RpcWhy, ScreenResult, TaskListResult},
 };
 
+/// Report a mutation result: the raw JSON under `--json`, a short
+/// confirmation otherwise.
+fn print_done(
+  result: serde_json::Value,
+  json: bool,
+  msg: &str,
+) -> anyhow::Result<()> {
+  if json {
+    println!("{}", serde_json::to_string(&result)?);
+  } else {
+    println!("{}", msg);
+  }
+  Ok(())
+}
+
 fn print_task_list(
   result: serde_json::Value,
   json: bool,
@@ -42,8 +57,8 @@ fn print_why(result: serde_json::Value, json: bool) -> anyhow::Result<()> {
   if why.wanted && !why.supported {
     println!("  blocked: a dependency is not ready");
   }
-  if why.kept_down {
-    println!("  kept down: yes (start it to release)");
+  if why.vetoed {
+    println!("  vetoed: yes (start it to clear)");
   }
   println!("  pinned: {}", why.pinned);
   if !why.required_by.is_empty() {
@@ -138,14 +153,16 @@ async fn wait_for_daemon(working_dir: &Path) -> anyhow::Result<()> {
 pub async fn dekit_main() -> anyhow::Result<()> {
   let cmd = clap::command!()
     .subcommands([
+      Command::new("tui")
+        .about("Open the TUI, starting the server if needed"),
       Command::new("attach").about("Attach the TUI to the running daemon"),
       Command::new("up")
         .about("Start the daemon if needed and start autostart tasks"),
-      Command::new("down").about(
-        "Unpin tasks matching a pattern; without a pattern, stop the daemon",
-      )
-      .arg(Arg::new("pattern").help("Task path or glob")),
+      Command::new("down")
+        .about("Stop tasks; without a pattern, stop all tasks")
+        .arg(Arg::new("pattern").help("Task path or glob")),
       Command::new("spawn")
+        .about("Add a task at a path and start it")
         .arg(
           Arg::new("path")
             .long("path")
@@ -175,6 +192,9 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         .arg(Arg::new("pattern").required(true).help("Task path or glob")),
       Command::new("kill")
         .about("Like stop, but with an immediate hard kill")
+        .arg(Arg::new("pattern").required(true).help("Task path or glob")),
+      Command::new("veto")
+        .about("Veto tasks: they stay down until started again")
         .arg(Arg::new("pattern").required(true).help("Task path or glob")),
       Command::new("restart")
         .about("Restart tasks matching a path or glob")
@@ -240,6 +260,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         .help("A .js script to run; with no command, launch the TUI"),
     );
   let matches = cmd.get_matches();
+  let json = matches.get_flag("json");
 
   if let Some(("mprocs", sub_m)) = matches.subcommand() {
     let args: Vec<String> = sub_m
@@ -252,6 +273,11 @@ pub async fn dekit_main() -> anyhow::Result<()> {
   }
 
   match matches.subcommand() {
+    Some(("tui", _sub_m)) => {
+      let working_dir = resolve_working_dir(&matches)?;
+      let (sender, receiver) = connect_client_socket(&working_dir, true).await?;
+      client_main(sender, receiver).await?;
+    }
     Some(("attach", _sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let (sender, receiver) =
@@ -264,47 +290,60 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       let cwd = sub_m.get_one::<String>("cwd").cloned();
       let cmd: Vec<String> =
         sub_m.get_many::<String>("cmd").unwrap().cloned().collect();
-      rpc_request(&working_dir, RpcRequest::Spawn { path, cmd, cwd }, true)
-        .await?;
-      println!("Spawned.");
+      let result =
+        rpc_request(&working_dir, RpcRequest::Spawn { path, cmd, cwd }, true)
+          .await?;
+      print_done(result, json, "Spawned.")?;
     }
     Some(("ls", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let glob = sub_m.get_one::<String>("glob").cloned();
       let result =
         rpc_request(&working_dir, RpcRequest::Ls { glob }, false).await?;
-      print_task_list(result, matches.get_flag("json"))?;
+      print_task_list(result, json)?;
     }
     Some(("start", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
-      rpc_request(&working_dir, RpcRequest::Start { pattern }, true).await?;
-      println!("Started.");
+      let result =
+        rpc_request(&working_dir, RpcRequest::Start { pattern }, true).await?;
+      print_done(result, json, "Started.")?;
     }
     Some(("stop", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
-      rpc_request(&working_dir, RpcRequest::Stop { pattern }, false).await?;
-      println!("Stopped.");
+      let result =
+        rpc_request(&working_dir, RpcRequest::Stop { pattern }, false).await?;
+      print_done(result, json, "Stopped.")?;
     }
     Some(("kill", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
-      rpc_request(&working_dir, RpcRequest::Kill { pattern }, false).await?;
-      println!("Killed.");
+      let result =
+        rpc_request(&working_dir, RpcRequest::Kill { pattern }, false).await?;
+      print_done(result, json, "Killed.")?;
+    }
+    Some(("veto", sub_m)) => {
+      let working_dir = resolve_working_dir(&matches)?;
+      let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
+      let result =
+        rpc_request(&working_dir, RpcRequest::Veto { pattern }, false).await?;
+      print_done(result, json, "Vetoed.")?;
     }
     Some(("restart", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
-      rpc_request(&working_dir, RpcRequest::Restart { pattern }, true).await?;
-      println!("Restarted.");
+      let result =
+        rpc_request(&working_dir, RpcRequest::Restart { pattern }, true)
+          .await?;
+      print_done(result, json, "Restarted.")?;
     }
     Some(("why", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let path = sub_m.get_one::<String>("path").unwrap().clone();
       let result =
         rpc_request(&working_dir, RpcRequest::Why { path }, false).await?;
-      print_why(result, matches.get_flag("json"))?;
+      print_why(result, json)?;
     }
     Some(("screen", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
@@ -312,40 +351,30 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       let result =
         rpc_request(&working_dir, RpcRequest::Screen { path }, false).await?;
       let screen: ScreenResult = serde_json::from_value(result)?;
-      match screen.screen {
-        Some(content) => {
-          print!("{}", content);
-          // Reset terminal attributes after printing
-          print!("\x1b[0m\n");
+      if json {
+        println!("{}", serde_json::to_string(&screen)?);
+      } else {
+        match screen.screen {
+          Some(content) => {
+            print!("{}", content);
+            // Reset terminal attributes after printing
+            print!("\x1b[0m\n");
+          }
+          None => anyhow::bail!("no screen content for this task"),
         }
-        None => anyhow::bail!("no screen content for this task"),
       }
     }
     Some(("up", _sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
-      rpc_request(&working_dir, RpcRequest::Up {}, true).await?;
-      println!("Started autostart tasks.");
+      let result = rpc_request(&working_dir, RpcRequest::Up {}, true).await?;
+      print_done(result, json, "Started autostart tasks.")?;
     }
     Some(("down", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
-      match sub_m.get_one::<String>("pattern").cloned() {
-        Some(pattern) => {
-          rpc_request(&working_dir, RpcRequest::Down { pattern }, false)
-            .await?;
-          println!("Unpinned.");
-        }
-        None => match lockfile::get_daemon_status(&working_dir)? {
-          None => println!("Nothing is running."),
-          Some(info) if !info.is_running => {
-            lockfile::cleanup_stale(&working_dir)?;
-            println!("Nothing is running.");
-          }
-          Some(_) => {
-            shutdown_daemon(&working_dir).await?;
-            println!("Daemon stopped.");
-          }
-        },
-      }
+      let pattern = sub_m.get_one::<String>("pattern").cloned();
+      let result =
+        rpc_request(&working_dir, RpcRequest::Down { pattern }, false).await?;
+      print_done(result, json, "Put down.")?;
     }
     Some(("server", sub_m)) => match sub_m.subcommand() {
       Some(("run", run_m)) => {
@@ -459,10 +488,8 @@ pub async fn dekit_main() -> anyhow::Result<()> {
           );
         }
       } else {
-        // No args: bring the workspace up (start the daemon if needed and
-        // start autostart tasks), then attach the TUI.
+        // No args: same as `tui`.
         let working_dir = resolve_working_dir(&matches)?;
-        rpc_request(&working_dir, RpcRequest::Up {}, true).await?;
         let (sender, receiver) =
           connect_client_socket(&working_dir, true).await?;
         client_main(sender, receiver).await?;

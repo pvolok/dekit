@@ -137,6 +137,9 @@ pub struct ProcTaskConfig {
   pub mouse_scroll_speed: usize,
   pub deps: Vec<TaskId>,
   pub tags: Vec<String>,
+  /// Pin to init at registration, so a registered task is already
+  /// started with no separate `Start` command.
+  pub pinned: bool,
 }
 
 impl ProcTaskConfig {
@@ -152,6 +155,7 @@ impl ProcTaskConfig {
       mouse_scroll_speed: 5,
       deps: Vec::new(),
       tags: Vec::new(),
+      pinned: false,
     }
   }
 }
@@ -160,10 +164,10 @@ pub fn spawn_proc_task(
   parent: &TaskContext,
   task_path: Option<TaskPath>,
   config: ProcTaskConfig,
-) -> TaskId {
+) -> (TaskId, tokio::sync::oneshot::Receiver<bool>) {
   let task_id = parent.alloc_id();
-  spawn_proc_task_with_id(parent, task_id, task_path, config);
-  task_id
+  let ack = spawn_proc_task_with_id(parent, task_id, task_path, config);
+  (task_id, ack)
 }
 
 pub fn spawn_proc_task_with_id(
@@ -171,7 +175,7 @@ pub fn spawn_proc_task_with_id(
   task_id: TaskId,
   task_path: Option<TaskPath>,
   config: ProcTaskConfig,
-) {
+) -> tokio::sync::oneshot::Receiver<bool> {
   let ProcTaskConfig {
     spec,
     stop,
@@ -183,6 +187,7 @@ pub fn spawn_proc_task_with_id(
     deps,
     label,
     tags,
+    pinned,
   } = config;
   let vt = SharedVt::new(Parser::new(24, 80, scrollback_len));
   let task_vt = vt.clone();
@@ -200,6 +205,7 @@ pub fn spawn_proc_task_with_id(
       label,
       vt: Some(vt),
       tags,
+      pinned,
       ..Default::default()
     },
     move |ctx, receiver| async move {
@@ -217,7 +223,7 @@ pub fn spawn_proc_task_with_id(
       )
       .await;
     },
-  );
+  )
 }
 
 async fn proc_main(
@@ -334,7 +340,7 @@ async fn proc_main(
             Ok(dup) => {
               let new_id = ctx.alloc_id();
               let path = TaskPath::new(format!("/{}", new_id.0)).ok();
-              spawn_proc_task_with_id(
+              let _ = spawn_proc_task_with_id(
                 &ctx,
                 new_id,
                 path,
@@ -349,9 +355,9 @@ async fn proc_main(
                   deps: Vec::new(),
                   label: dup.0,
                   tags: Vec::new(),
+                  pinned: true,
                 },
               );
-              ctx.send(KernelCommand::Start(new_id));
               continue;
             }
             Err(msg) => msg,
@@ -648,7 +654,7 @@ mod tests {
       "printf hello-log".to_string(),
     ]);
     let sink_path = log_path.clone();
-    let id = spawn_proc_task(
+    let (id, _) = spawn_proc_task(
       &pc,
       Some(path),
       ProcTaskConfig {
@@ -712,7 +718,7 @@ mod tests {
     let seen_pid = Arc::new(Mutex::new(None::<u32>));
     let cap = seen_pid.clone();
     let log_dir = dir.clone();
-    let id = spawn_proc_task(
+    let (id, _) = spawn_proc_task(
       &pc,
       Some(TaskPath::new("/pidlog").unwrap()),
       ProcTaskConfig {
@@ -772,7 +778,7 @@ mod tests {
       "-c".to_string(),
       "sleep 100".to_string(),
     ]);
-    let id = spawn_proc_task(
+    let (id, _) = spawn_proc_task(
       &pc,
       Some(path),
       ProcTaskConfig {
