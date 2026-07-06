@@ -176,10 +176,10 @@ impl From<&ProcConfig> for ProcessSpec {
         .as_ref()
         .and_then(|env| env.get("PATH").cloned().flatten())
         .or_else(|| std::env::var("PATH").ok());
-      let mut paths: Vec<PathBuf> = base
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-      paths.extend(add_path.iter().cloned());
+      let mut paths: Vec<PathBuf> = add_path.clone();
+      if let Some(base) = base {
+        paths.extend(std::env::split_paths(&base));
+      }
       if let Ok(joined) = std::env::join_paths(&paths) {
         cmd.env("PATH", joined.to_string_lossy().into_owned());
       }
@@ -207,4 +207,37 @@ pub fn cmd_from_shell(shell: &str) -> ProcessSpec {
 #[cfg(not(windows))]
 pub fn cmd_from_shell(shell: &str) -> ProcessSpec {
   ProcessSpec::from_argv(vec!["/bin/sh".into(), "-c".into(), shell.into()])
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn add_path_takes_priority_over_base_path() {
+    let mut env = IndexMap::new();
+    env.insert("PATH".to_string(), Some("/base/bin".to_string()));
+
+    let cfg = ProcConfig {
+      cmd: Some(CmdConfig::Cmd {
+        cmd: vec!["true".to_string()],
+      }),
+      env: Some(env),
+      add_path: Some(vec![PathBuf::from("/custom/bin")]),
+      ..Default::default()
+    };
+
+    let spec = ProcessSpec::from(&cfg);
+    let path = spec.env.get("PATH").cloned().flatten().unwrap();
+
+    let expected = std::env::join_paths([
+      PathBuf::from("/custom/bin"),
+      PathBuf::from("/base/bin"),
+    ])
+    .unwrap()
+    .to_string_lossy()
+    .into_owned();
+
+    assert_eq!(path, expected);
+  }
 }
