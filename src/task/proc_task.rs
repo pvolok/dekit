@@ -613,6 +613,7 @@ mod tests {
   use crate::kernel::kernel::Kernel;
   use crate::kernel::kernel_message::{
     KernelCommand, KernelQuery, KernelQueryResponse, TaskContext,
+    TaskSelector,
   };
   use crate::kernel::task::TaskId;
   use crate::task::logger::LogSink;
@@ -667,7 +668,7 @@ mod tests {
         ..ProcTaskConfig::new(spec)
       },
     );
-    pc.send(KernelCommand::Start(id));
+    pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
 
     let kernel_task = tokio::spawn(kernel.run());
 
@@ -732,7 +733,7 @@ mod tests {
         ..ProcTaskConfig::new(spec)
       },
     );
-    pc.send(KernelCommand::Start(id));
+    pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
 
     let kernel_task = tokio::spawn(kernel.run());
 
@@ -786,12 +787,12 @@ mod tests {
         ..ProcTaskConfig::new(spec)
       },
     );
-    pc.send(KernelCommand::Start(id));
+    pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
 
     let kernel_task = tokio::spawn(kernel.run());
 
     let id = resolve(&pc, "/sleeper").await;
-    pc.send(KernelCommand::Stop(id));
+    pc.send(KernelCommand::Stop(TaskSelector::Id(id), None));
 
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -802,7 +803,7 @@ mod tests {
       tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    pc.send(KernelCommand::Kill(id));
+    pc.send(KernelCommand::Kill(TaskSelector::Id(id), None));
     pc.send(KernelCommand::RemoveTask(id));
     pc.send(KernelCommand::Quit);
     tokio::time::timeout(Duration::from_secs(2), kernel_task)

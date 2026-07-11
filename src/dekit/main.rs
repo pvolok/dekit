@@ -11,7 +11,7 @@ use crate::{
   },
   dekit::{rpc_client::rpc_request, server::run_server},
   js::js_vm::JsVm,
-  protocol::{RpcRequest, RpcWhy, ScreenResult, TaskListResult},
+  protocol::{ActResult, RpcRequest, RpcWhy, ScreenResult, TaskListResult},
 };
 
 /// Report a mutation result: the raw JSON under `--json`, a short
@@ -25,6 +25,26 @@ fn print_done(
     println!("{}", serde_json::to_string(&result)?);
   } else {
     println!("{}", msg);
+  }
+  Ok(())
+}
+
+/// Report a selector verb result.
+fn print_acted(
+  result: serde_json::Value,
+  json: bool,
+  verb: &str,
+  zero: &str,
+) -> anyhow::Result<()> {
+  if json {
+    println!("{}", serde_json::to_string(&result)?);
+    return Ok(());
+  }
+  let acted: ActResult = serde_json::from_value(result)?;
+  match acted.matched {
+    0 => println!("{}", zero),
+    1 => println!("{} 1 task.", verb),
+    n => println!("{} {} tasks.", verb, n),
   }
   Ok(())
 }
@@ -275,7 +295,8 @@ pub async fn dekit_main() -> anyhow::Result<()> {
   match matches.subcommand() {
     Some(("tui", _sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
-      let (sender, receiver) = connect_client_socket(&working_dir, true).await?;
+      let (sender, receiver) =
+        connect_client_socket(&working_dir, true).await?;
       client_main(sender, receiver).await?;
     }
     Some(("attach", _sub_m)) => {
@@ -307,28 +328,28 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
       let result =
         rpc_request(&working_dir, RpcRequest::Start { pattern }, true).await?;
-      print_done(result, json, "Started.")?;
+      print_acted(result, json, "Started", "No tasks matched.")?;
     }
     Some(("stop", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
       let result =
         rpc_request(&working_dir, RpcRequest::Stop { pattern }, false).await?;
-      print_done(result, json, "Stopped.")?;
+      print_acted(result, json, "Stopped", "No tasks matched.")?;
     }
     Some(("kill", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
       let result =
         rpc_request(&working_dir, RpcRequest::Kill { pattern }, false).await?;
-      print_done(result, json, "Killed.")?;
+      print_acted(result, json, "Killed", "No tasks matched.")?;
     }
     Some(("veto", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let pattern = sub_m.get_one::<String>("pattern").unwrap().clone();
       let result =
         rpc_request(&working_dir, RpcRequest::Veto { pattern }, false).await?;
-      print_done(result, json, "Vetoed.")?;
+      print_acted(result, json, "Vetoed", "No tasks matched.")?;
     }
     Some(("restart", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
@@ -336,7 +357,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       let result =
         rpc_request(&working_dir, RpcRequest::Restart { pattern }, true)
           .await?;
-      print_done(result, json, "Restarted.")?;
+      print_acted(result, json, "Restarted", "No tasks matched.")?;
     }
     Some(("why", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
@@ -367,14 +388,14 @@ pub async fn dekit_main() -> anyhow::Result<()> {
     Some(("up", _sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let result = rpc_request(&working_dir, RpcRequest::Up {}, true).await?;
-      print_done(result, json, "Started autostart tasks.")?;
+      print_acted(result, json, "Started", "No autostart tasks.")?;
     }
     Some(("down", sub_m)) => {
       let working_dir = resolve_working_dir(&matches)?;
       let pattern = sub_m.get_one::<String>("pattern").cloned();
       let result =
         rpc_request(&working_dir, RpcRequest::Down { pattern }, false).await?;
-      print_done(result, json, "Put down.")?;
+      print_acted(result, json, "Put down", "No tasks matched.")?;
     }
     Some(("server", sub_m)) => match sub_m.subcommand() {
       Some(("run", run_m)) => {

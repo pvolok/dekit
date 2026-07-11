@@ -11,7 +11,7 @@ use crate::kernel::kernel_message::TaskContext;
 use super::{
   kernel_message::{
     DepExplain, KernelCommand, KernelMessage, KernelQuery, KernelQueryResponse,
-    TaskExplain, TaskInfo,
+    TaskExplain, TaskInfo, TaskSelector,
   },
   namespace::Namespace,
   sub_trie::SubMode,
@@ -60,8 +60,9 @@ struct Graph {
   next_task_id: Arc<AtomicUsize>,
   tasks: HashMap<TaskId, TaskHandle>,
   /// `edges[a]` contains `b` when `a` requires `b`. Edges from
-  /// `INIT_TASK_ID` are pins. Edges may reference ids that have not
-  /// registered yet; an unregistered dep is unsatisfied.
+  /// `INIT_TASK_ID` are pins. Every endpoint is a registered task:
+  /// `add_edge` refuses anything else and `remove_task` deletes all
+  /// incident edges, so dangling edges cannot exist.
   edges: HashMap<TaskId, HashSet<TaskId>>,
   /// Reverse of `edges`: `redges[b]` contains `a` when `a` requires `b`.
   redges: HashMap<TaskId, HashSet<TaskId>>,
@@ -134,6 +135,18 @@ impl Graph {
       log::warn!("Duplicate task id {:?}; registration ignored", task_id);
       return false;
     }
+    // Deps must exist: refusing here keeps every edge endpoint a
+    // registered task and register-with-deps atomic.
+    for dep in &def.deps {
+      if !self.tasks.contains_key(dep) {
+        log::warn!(
+          "Registration of {:?} refused: dep {:?} is not registered",
+          task_id,
+          dep
+        );
+        return false;
+      }
+    }
     // A taken path refuses the whole registration, checked before the
     // factory runs so a refused task spawns nothing.
     let path = match def.path {
@@ -152,37 +165,18 @@ impl Graph {
     let label = def.label.clone();
     let vt = def.vt.clone();
     let tags = def.tags.clone();
-    // Edges may predate registration; start the counters from them.
-    let mut wanted_parents = 0;
-    let mut active_dependents = 0;
-    if let Some(parents) = self.redges.get(&task_id) {
-      for p in parents {
-        if *p == INIT_TASK_ID {
-          wanted_parents += 1;
-          continue;
-        }
-        if let Some(t) = self.tasks.get(p) {
-          if t.wanted {
-            wanted_parents += 1;
-          }
-          if t.state.is_active() {
-            active_dependents += 1;
-          }
-        }
-      }
-    }
     let handle = TaskHandle {
       task,
       state: TaskState::Idle,
       epoch: 0,
-      kept_down: false,
+      vetoed: false,
       killed: false,
       attempts: 0,
       last_start: None,
       wanted: false,
       supported: false,
-      wanted_parents,
-      active_dependents,
+      wanted_parents: 0,
+      active_dependents: 0,
       kind: def.kind,
       ready: def.ready,
       restart: def.restart,
@@ -251,7 +245,7 @@ impl Graph {
     self.demand(task_id);
   }
 
-  /// An explicit start demands the whole requirement closure: kept-down
+  /// An explicit start demands the whole requirement closure: vetoed
   /// tasks are released and dead deps revived, so the pull is never blocked
   /// by an earlier stop or crash. Done jobs stay done unless directly
   /// targeted.
@@ -274,7 +268,7 @@ impl Graph {
         continue;
       };
       let state = task.state;
-      self.set_kept_down(id, false);
+      self.set_vetoed(id, false);
       let revive = match state {
         TaskState::Backoff | TaskState::Exited(_) => true,
         TaskState::Done(_) => id == task_id,
@@ -290,14 +284,14 @@ impl Graph {
     }
   }
 
-  fn set_kept_down(&mut self, task_id: TaskId, value: bool) {
+  fn set_vetoed(&mut self, task_id: TaskId, value: bool) {
     let Some(task) = self.tasks.get_mut(&task_id) else {
       return;
     };
-    if task.kept_down == value {
+    if task.vetoed == value {
       return;
     }
-    task.kept_down = value;
+    task.vetoed = value;
     self.enqueue(task_id);
   }
 
@@ -327,9 +321,9 @@ impl Graph {
     }
   }
 
-  fn cmd_keep_down(&mut self, task_id: TaskId) {
+  fn cmd_veto(&mut self, task_id: TaskId) {
     self.remove_edge(INIT_TASK_ID, task_id);
-    self.set_kept_down(task_id, true);
+    self.set_vetoed(task_id, true);
   }
 
   fn cmd_restart(&mut self, task_id: TaskId) {
@@ -358,6 +352,12 @@ impl Graph {
   fn add_edge(&mut self, from: TaskId, to: TaskId) {
     if from == to || to == INIT_TASK_ID {
       log::warn!("Invalid edge: {:?} -> {:?}", from, to);
+      return;
+    }
+    if !self.tasks.contains_key(&to)
+      || (from != INIT_TASK_ID && !self.tasks.contains_key(&from))
+    {
+      log::warn!("Edge endpoint is not registered: {:?} -> {:?}", from, to);
       return;
     }
     if self.reaches(to, from) {
@@ -588,14 +588,14 @@ impl Graph {
     }
   }
 
-  /// Whether `id` should be up: reachable from a pin through non-kept-down
+  /// Whether `id` should be up: reachable from a pin through non-vetoed
   /// nodes. Reads the counted wanted parents (a pin counts as one).
   fn compute_wanted(&self, id: TaskId) -> bool {
     if self.quitting {
       return false;
     }
     let task = self.tasks.get(&id).expect("queued id live");
-    !task.kept_down && task.wanted_parents > 0
+    !task.vetoed && task.wanted_parents > 0
   }
 
   /// Whether `id` may run right now: wanted, with every dependency supported
@@ -696,7 +696,7 @@ impl Graph {
         let Some(task) = self.tasks.get(to) else {
           continue;
         };
-        if task.kept_down {
+        if task.vetoed {
           continue;
         }
         wanted.insert(*to);
@@ -977,6 +977,10 @@ impl Graph {
     let Some(mut handle) = self.tasks.remove(&task_id) else {
       return;
     };
+    // Queued ids must be live when reconciliation drives them.
+    if self.in_queue.remove(&task_id) {
+      self.dirty.retain(|d| *d != task_id);
+    }
     if handle.state.is_active() {
       let mut fx = Effects::new();
       handle.task.handle_cmd(TaskCmd::Kill, &mut fx);
@@ -1111,6 +1115,25 @@ impl Graph {
     }
   }
 
+  fn matching_ids(&self, selector: &TaskSelector) -> Vec<TaskId> {
+    match selector {
+      TaskSelector::Id(id) => match self.tasks.contains_key(id) {
+        true => vec![*id],
+        false => Vec::new(),
+      },
+      TaskSelector::All => {
+        self.ns.iter().into_iter().map(|(_, id)| id).collect()
+      }
+      TaskSelector::Glob(pattern) => self
+        .ns
+        .glob(pattern)
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect(),
+      TaskSelector::Tag(tag) => self.tasks_with_tag(tag),
+    }
+  }
+
   fn screen(&self, path: &TaskPath) -> Option<String> {
     self
       .ns
@@ -1172,7 +1195,7 @@ impl Graph {
       state: task.state,
       wanted: task.wanted,
       supported: task.supported,
-      kept_down: task.kept_down,
+      vetoed: task.vetoed,
       pinned,
       required_by,
       deps,
@@ -1344,20 +1367,67 @@ impl Kernel {
       KernelCommand::Quit => return self.graph.begin_quit(),
 
       KernelCommand::RegisterTask(task_id, def, factory, ack) => {
-        let registered = self.graph.register_task_with_id(task_id, def, factory);
+        let registered =
+          self.graph.register_task_with_id(task_id, def, factory);
         if let Some(ack) = ack {
           let _ = ack.send(registered);
         }
       }
       KernelCommand::RemoveTask(task_id) => self.graph.remove_task(task_id),
 
-      KernelCommand::Start(task_id) => self.graph.cmd_start(task_id),
-      KernelCommand::Stop(task_id) => self.graph.cmd_stop(task_id),
-      KernelCommand::Kill(task_id) => self.graph.cmd_kill(task_id),
-      KernelCommand::KeepDown(task_id) => self.graph.cmd_keep_down(task_id),
-      KernelCommand::Restart(task_id) => self.graph.cmd_restart(task_id),
-      KernelCommand::Down(task_id) => {
-        self.graph.remove_edge(INIT_TASK_ID, task_id);
+      KernelCommand::Start(selector, ack) => {
+        let ids = self.graph.matching_ids(&selector);
+        for id in &ids {
+          self.graph.cmd_start(*id);
+        }
+        if let Some(ack) = ack {
+          let _ = ack.send(ids.len());
+        }
+      }
+      KernelCommand::Stop(selector, ack) => {
+        let ids = self.graph.matching_ids(&selector);
+        for id in &ids {
+          self.graph.cmd_stop(*id);
+        }
+        if let Some(ack) = ack {
+          let _ = ack.send(ids.len());
+        }
+      }
+      KernelCommand::Kill(selector, ack) => {
+        let ids = self.graph.matching_ids(&selector);
+        for id in &ids {
+          self.graph.cmd_kill(*id);
+        }
+        if let Some(ack) = ack {
+          let _ = ack.send(ids.len());
+        }
+      }
+      KernelCommand::Restart(selector, ack) => {
+        let ids = self.graph.matching_ids(&selector);
+        for id in &ids {
+          self.graph.cmd_restart(*id);
+        }
+        if let Some(ack) = ack {
+          let _ = ack.send(ids.len());
+        }
+      }
+      KernelCommand::Down(selector, ack) => {
+        let ids = self.graph.matching_ids(&selector);
+        for id in &ids {
+          self.graph.remove_edge(INIT_TASK_ID, *id);
+        }
+        if let Some(ack) = ack {
+          let _ = ack.send(ids.len());
+        }
+      }
+      KernelCommand::Veto(selector, ack) => {
+        let ids = self.graph.matching_ids(&selector);
+        for id in &ids {
+          self.graph.cmd_veto(*id);
+        }
+        if let Some(ack) = ack {
+          let _ = ack.send(ids.len());
+        }
       }
       KernelCommand::AddEdge { from, to } => self.graph.add_edge(from, to),
       KernelCommand::RemoveEdge { from, to } => {
@@ -1638,10 +1708,10 @@ mod tests {
     let a = fx.add("a", path_def("/a"));
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
-    fx.pc.send(KernelCommand::Down(a));
+    fx.pc.send(KernelCommand::Down(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
     fx.quit(handle).await;
@@ -1654,11 +1724,11 @@ mod tests {
     let b = fx.add("b", path_def("/x"));
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(b));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(b), None));
     fx.flush().await;
     fx.assert_no_cmd();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     fx.quit(handle).await;
@@ -1670,14 +1740,18 @@ mod tests {
     let _a = fx.add("a", path_def("/x"));
     let handle = fx.run();
 
-    let taken = fx
-      .pc
-      .spawn_async_with_id(fx.pc.alloc_id(), path_def("/x"), |_, _| async {});
+    let taken = fx.pc.spawn_async_with_id(
+      fx.pc.alloc_id(),
+      path_def("/x"),
+      |_, _| async {},
+    );
     assert_eq!(taken.await, Ok(false));
 
-    let free = fx
-      .pc
-      .spawn_async_with_id(fx.pc.alloc_id(), path_def("/y"), |_, _| async {});
+    let free = fx.pc.spawn_async_with_id(
+      fx.pc.alloc_id(),
+      path_def("/y"),
+      |_, _| async {},
+    );
     assert_eq!(free.await, Ok(true));
 
     fx.quit(handle).await;
@@ -1696,7 +1770,8 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -1722,7 +1797,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn keep_down_breaks_dependents_leaf_first() {
+  async fn veto_breaks_dependents_leaf_first() {
     let mut fx = Fixture::new();
     let dep = fx.add("dep", path_def("/dep"));
     let app = fx.add(
@@ -1734,18 +1809,21 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
     // Keeping the dep down takes the dependent down first.
-    fx.pc.send(KernelCommand::KeepDown(dep));
+    fx.pc
+      .send(KernelCommand::Veto(TaskSelector::Id(dep), None));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Stop));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
 
     // The dependent stays wanted but blocked; starting the dep again brings
     // both back.
-    fx.pc.send(KernelCommand::Start(dep));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(dep), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -1753,7 +1831,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn start_of_dependent_releases_kept_down_dep() {
+  async fn start_of_dependent_releases_vetoed_dep() {
     let mut fx = Fixture::new();
     let dep = fx.add("dep", path_def("/dep"));
     let app = fx.add(
@@ -1765,18 +1843,21 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
     // Keep the dep down: dependent breaks first.
-    fx.pc.send(KernelCommand::KeepDown(dep));
+    fx.pc
+      .send(KernelCommand::Veto(TaskSelector::Id(dep), None));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Stop));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
 
     // Starting the dependent demands the dep: it is released and both come
     // back, dep first.
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -1796,7 +1877,8 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -1807,7 +1889,8 @@ mod tests {
     fx.flush().await;
     fx.assert_no_cmd();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -1833,13 +1916,15 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("job", RecordedCmd::Start));
     fx.pc.send_msg(job, Report::Stopped(ExitInfo::code(0)));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
     // Cycling the dependent leaves the completed job alone.
-    fx.pc.send(KernelCommand::Restart(app));
+    fx.pc
+      .send(KernelCommand::Restart(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Stop));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
     fx.flush().await;
@@ -1861,18 +1946,20 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
-    fx.pc.send(KernelCommand::Start(dep));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(dep), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
     // Unpinning the dep is a no-op while the app still wants it.
-    fx.pc.send(KernelCommand::Down(dep));
+    fx.pc.send(KernelCommand::Down(TaskSelector::Id(dep), None));
     fx.flush().await;
     fx.assert_no_cmd();
 
     // Unpinning the app winds both down, dependent first.
-    fx.pc.send(KernelCommand::Down(app));
+    fx.pc.send(KernelCommand::Down(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Stop));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
 
@@ -1898,7 +1985,8 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     fx.flush().await;
     fx.assert_no_cmd();
@@ -1928,7 +2016,8 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("job", RecordedCmd::Start));
     fx.flush().await;
     fx.assert_no_cmd();
@@ -1955,7 +2044,7 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     fx.pc.send_msg(a, Report::Stopped(ExitInfo::code(1)));
@@ -1977,7 +2066,7 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     fx.pc.send_msg(a, Report::Stopped(ExitInfo::code(0)));
@@ -1993,17 +2082,19 @@ mod tests {
     let a = fx.add("a", path_def("/a"));
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
-    fx.pc.send(KernelCommand::Restart(a));
+    fx.pc
+      .send(KernelCommand::Restart(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     // Restart on a stopped, unpinned task starts it.
-    fx.pc.send(KernelCommand::Stop(a));
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
-    fx.pc.send(KernelCommand::Restart(a));
+    fx.pc
+      .send(KernelCommand::Restart(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     fx.quit(handle).await;
@@ -2015,16 +2106,16 @@ mod tests {
     let a = fx.add("a", path_def("/a"));
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     // Nothing wants the task once the stop unpins it.
-    fx.pc.send(KernelCommand::Stop(a));
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
     fx.flush().await;
     fx.assert_no_cmd();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     fx.quit(handle).await;
@@ -2043,7 +2134,8 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -2071,74 +2163,86 @@ mod tests {
 
     // a -> b would close the cycle; rejected, so starting b never deadlocks.
     fx.pc.send(KernelCommand::AddEdge { from: a, to: b });
-    fx.pc.send(KernelCommand::Start(b));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(b), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
 
     fx.quit(handle).await;
   }
 
-  #[tokio::test]
-  async fn dep_may_register_after_dependent() {
+  #[test]
+  fn registration_with_missing_dep_is_refused() {
     let mut fx = Fixture::new();
+    let mut kernel = fx.kernel.take().unwrap();
     let dep_id = fx.pc.alloc_id();
-    let app = fx.add(
-      "app",
+    let app_id = fx.pc.alloc_id();
+
+    // Dep not registered: the whole registration is refused, nothing is
+    // claimed.
+    let tx = fx.tx.clone();
+    let registered = kernel.graph.register_task_with_id(
+      app_id,
       TaskDef {
         deps: vec![dep_id],
         ..path_def("/app")
       },
+      Box::new(move |_| Box::new(RecordingTask { name: "app", tx })),
     );
-    let handle = fx.run();
+    assert!(!registered);
+    assert!(!kernel.graph.tasks.contains_key(&app_id));
+    assert_eq!(kernel.graph.resolve(&TaskPath::new("/app").unwrap()), None);
 
-    // The dep id is allocated but not registered yet: the app must wait.
-    fx.pc.send(KernelCommand::Start(app));
-    fx.flush().await;
-    fx.assert_no_cmd();
-
-    // Registering the dep brings it up, then the app.
+    // Dep first, then the app registers and starts behind it.
     let tx = fx.tx.clone();
-    fx.pc.register_with_id(
+    assert!(kernel.graph.register_task_with_id(
       dep_id,
       path_def("/dep"),
       Box::new(move |_| Box::new(RecordingTask { name: "dep", tx })),
+    ));
+    let tx = fx.tx.clone();
+    assert!(kernel.graph.register_task_with_id(
+      app_id,
+      TaskDef {
+        deps: vec![dep_id],
+        ..path_def("/app")
+      },
+      Box::new(move |_| Box::new(RecordingTask { name: "app", tx })),
+    ));
+    turn(
+      &mut kernel,
+      KernelCommand::Start(TaskSelector::Id(app_id), None),
     );
-    assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
-    assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
-
-    fx.quit(handle).await;
+    assert_eq!(fx.rx.try_recv().unwrap(), ("dep", RecordedCmd::Start));
+    assert_eq!(fx.rx.try_recv().unwrap(), ("app", RecordedCmd::Start));
   }
 
-  #[tokio::test]
-  async fn add_edge_to_unregistered_dep_gates_dependent() {
+  #[test]
+  fn add_edge_to_unregistered_id_is_refused() {
     let mut fx = Fixture::new();
     let a = fx.add("a", path_def("/a"));
-    let handle = fx.run();
+    let mut kernel = fx.kernel.take().unwrap();
 
-    fx.pc.send(KernelCommand::Start(a));
-    assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+    turn(&mut kernel, KernelCommand::Start(TaskSelector::Id(a), None));
+    assert_eq!(fx.rx.try_recv().unwrap(), ("a", RecordedCmd::Start));
 
-    // A new requirement on an unregistered dep takes the dependent down
-    // until the dep appears.
+    // No edge to something that does not exist; `a` stays up.
     let dep_id = fx.pc.alloc_id();
-    fx.pc.send(KernelCommand::AddEdge {
-      from: a,
-      to: dep_id,
-    });
-    assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
-    fx.flush().await;
-    fx.assert_no_cmd();
-
-    let tx = fx.tx.clone();
-    fx.pc.register_with_id(
-      dep_id,
-      path_def("/dep"),
-      Box::new(move |_| Box::new(RecordingTask { name: "dep", tx })),
+    turn(
+      &mut kernel,
+      KernelCommand::AddEdge {
+        from: a,
+        to: dep_id,
+      },
     );
-    assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
-    assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
-
-    fx.quit(handle).await;
+    assert!(
+      !kernel
+        .graph
+        .edges
+        .get(&a)
+        .is_some_and(|s| s.contains(&dep_id)),
+      "edge to an unregistered id was added"
+    );
+    assert!(fx.rx.try_recv().is_err(), "task was disturbed");
   }
 
   async fn label_of(pc: &TaskContext, id: TaskId) -> Option<String> {
@@ -2248,10 +2352,10 @@ mod tests {
     let a = fx.add("a", path_def("/a"));
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
-    fx.pc.send(KernelCommand::Stop(a));
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
     // A started report that was in flight when the stop landed must not
@@ -2261,7 +2365,7 @@ mod tests {
     fx.assert_no_cmd();
 
     // The task still starts normally when demanded again.
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     fx.quit(handle).await;
@@ -2273,16 +2377,16 @@ mod tests {
     let a = fx.add("a", path_def("/a"));
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     // Kill skips the graceful stop; the unpin keeps the task down.
-    fx.pc.send(KernelCommand::Kill(a));
+    fx.pc.send(KernelCommand::Kill(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Kill));
     fx.flush().await;
     fx.assert_no_cmd();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     fx.quit(handle).await;
@@ -2314,7 +2418,7 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("c", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
@@ -2344,7 +2448,7 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     // A new requirement on an unsatisfied dep takes the dependent down
@@ -2367,7 +2471,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn keep_down_of_leaf_dep_tears_down_chain_in_order() {
+  async fn veto_of_leaf_dep_tears_down_chain_in_order() {
     let mut fx = Fixture::new();
     let c = fx.add("c", path_def("/c"));
     let b = fx.add(
@@ -2386,13 +2490,14 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("c", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     // Keeping the deepest dep down unwinds the chain dependents-first.
-    fx.pc.send(KernelCommand::KeepDown(c));
+    fx.pc
+      .send(KernelCommand::Veto(TaskSelector::Id(c), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
     assert_eq!(fx.recv().await, ("b", RecordedCmd::Stop));
     assert_eq!(fx.recv().await, ("c", RecordedCmd::Stop));
@@ -2413,14 +2518,15 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
     // The app still wants the dep, so the stop is a bounce: the dep is
     // stopped directly, the app breaks and recovers along the way. The
     // middle two land in one reconcile pass, so their order is not defined.
-    fx.pc.send(KernelCommand::Stop(dep));
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(dep), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
     let mut cmds = [fx.recv().await, fx.recv().await];
     cmds.sort();
@@ -2446,13 +2552,15 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
     // The dep is stopped directly; the dependent breaks and recovers once
     // the dep is ready again.
-    fx.pc.send(KernelCommand::Restart(dep));
+    fx.pc
+      .send(KernelCommand::Restart(TaskSelector::Id(dep), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
     let mut cmds = [fx.recv().await, fx.recv().await];
     cmds.sort();
@@ -2478,11 +2586,13 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
-    fx.pc.send(KernelCommand::Restart(dep));
+    fx.pc
+      .send(KernelCommand::Restart(TaskSelector::Id(dep), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
     let mut cmds = [fx.recv().await, fx.recv().await];
     cmds.sort();
@@ -2493,7 +2603,7 @@ mod tests {
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
     // The restart pinned the dep, so it survives its dependent going away.
-    fx.pc.send(KernelCommand::Down(app));
+    fx.pc.send(KernelCommand::Down(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("app", RecordedCmd::Stop));
     fx.flush().await;
     fx.assert_no_cmd();
@@ -2515,17 +2625,17 @@ mod tests {
     let handle = fx.run();
 
     // Pin a, then stop it: the stop also unpins.
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
-    fx.pc.send(KernelCommand::Stop(a));
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
     // Starting a dependent revives a, but only while b wants it.
-    fx.pc.send(KernelCommand::Start(b));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(b), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
 
-    fx.pc.send(KernelCommand::Down(b));
+    fx.pc.send(KernelCommand::Down(TaskSelector::Id(b), None));
     assert_eq!(fx.recv().await, ("b", RecordedCmd::Stop));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
@@ -2538,7 +2648,7 @@ mod tests {
     let a = fx.add("a", path_def("/a"));
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     fx.pc.send(KernelCommand::RemoveTask(a));
@@ -2565,7 +2675,7 @@ mod tests {
     let handle = fx.run();
 
     // The driving future is gone; starting must not wedge in Starting.
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     fx.flush().await;
     assert_eq!(
       state_of(&fx.pc, a).await,
@@ -2588,10 +2698,10 @@ mod tests {
       });
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
-    fx.pc.send(KernelCommand::Stop(a));
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
     fx.flush().await;
 
@@ -2622,12 +2732,12 @@ mod tests {
       });
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     // Still Starting: the stop must reach the task, not wait for it to
     // finish starting.
-    fx.pc.send(KernelCommand::Stop(a));
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
     fx.flush().await;
     assert_eq!(state_of(&fx.pc, a).await, Some(TaskState::Idle));
@@ -2648,10 +2758,11 @@ mod tests {
       });
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
-    fx.pc.send(KernelCommand::Restart(a));
+    fx.pc
+      .send(KernelCommand::Restart(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
@@ -2671,14 +2782,14 @@ mod tests {
       });
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
-    fx.pc.send(KernelCommand::Stop(a));
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
     // Change of mind while the stop grace is running.
-    fx.pc.send(KernelCommand::Start(a));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
     fx.flush().await;
     fx.assert_no_cmd();
 
@@ -2721,7 +2832,7 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(j));
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(j), None));
     assert_eq!(fx.recv().await, ("d", RecordedCmd::Start));
     assert_eq!(fx.recv().await, ("j", RecordedCmd::Start));
     fx.flush().await;
@@ -2729,7 +2840,7 @@ mod tests {
     // Stopping the dep breaks j's support in the same step in which j's
     // success report is queued (j exits when it hears the dep stopping).
     // The success must win: j is Done, never commanded to stop.
-    fx.pc.send(KernelCommand::Stop(d));
+    fx.pc.send(KernelCommand::Stop(TaskSelector::Id(d), None));
     assert_eq!(fx.recv().await, ("d", RecordedCmd::Stop));
     assert_eq!(
       state_of(&fx.pc, j).await,
@@ -2758,7 +2869,8 @@ mod tests {
     );
     let handle = fx.run();
 
-    fx.pc.send(KernelCommand::Start(app));
+    fx.pc
+      .send(KernelCommand::Start(TaskSelector::Id(app), None));
     assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
 
     let rx = fx
@@ -2777,12 +2889,183 @@ mod tests {
     // Wanted but blocked: the dep has not reported ready yet.
     assert!(!explain.supported);
     assert!(explain.pinned);
-    assert!(!explain.kept_down);
+    assert!(!explain.vetoed);
     assert_eq!(explain.deps.len(), 1);
     assert_eq!(explain.deps[0].name, "/dep");
     assert_eq!(explain.deps[0].state, TaskState::Running);
     assert!(explain.deps[0].wanted);
     assert!(!explain.deps[0].satisfied);
+
+    fx.quit(handle).await;
+  }
+
+  fn tagged_def(path: &str, tag: &str) -> TaskDef {
+    TaskDef {
+      path: Some(TaskPath::new(path).unwrap()),
+      tags: vec![tag.to_string()],
+      ..Default::default()
+    }
+  }
+
+  /// Dispatch one command synchronously and settle, like the runtime loop.
+  fn turn(kernel: &mut Kernel, command: KernelCommand) {
+    let _ = kernel.dispatch(KernelMessage {
+      from: INIT_TASK_ID,
+      command,
+    });
+    kernel.graph.settle();
+  }
+
+  fn turn_matching(
+    kernel: &mut Kernel,
+    make: impl FnOnce(Option<tokio::sync::oneshot::Sender<usize>>) -> KernelCommand,
+  ) -> usize {
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    turn(kernel, make(Some(tx)));
+    rx.try_recv()
+      .expect("ack not answered in the same dispatch")
+  }
+
+  fn pinned(kernel: &Kernel, id: TaskId) -> bool {
+    kernel
+      .graph
+      .edges
+      .get(&INIT_TASK_ID)
+      .is_some_and(|s| s.contains(&id))
+  }
+
+  #[test]
+  fn glob_selector_pins_exactly_the_matches() {
+    let mut fx = Fixture::new();
+    let a = fx.add("a", path_def("/a"));
+    let ab = fx.add("ab", path_def("/ab"));
+    let b = fx.add("b", path_def("/b"));
+    let mut kernel = fx.kernel.take().unwrap();
+
+    let n = turn_matching(&mut kernel, |ack| {
+      KernelCommand::Start(TaskSelector::Glob("/a".to_string()), ack)
+    });
+    assert_eq!(n, 1);
+    assert!(pinned(&kernel, a));
+    assert!(!pinned(&kernel, ab));
+    assert!(!pinned(&kernel, b));
+
+    let n = turn_matching(&mut kernel, |ack| {
+      KernelCommand::Start(TaskSelector::Glob("/*".to_string()), ack)
+    });
+    assert_eq!(n, 3);
+    assert!(pinned(&kernel, ab));
+    assert!(pinned(&kernel, b));
+  }
+
+  #[test]
+  fn tag_and_all_selectors() {
+    let mut fx = Fixture::new();
+    let a = fx.add("a", tagged_def("/a", "web"));
+    let b = fx.add("b", tagged_def("/b", "web"));
+    let c = fx.add("c", path_def("/c"));
+    let mut kernel = fx.kernel.take().unwrap();
+
+    let n = turn_matching(&mut kernel, |ack| {
+      KernelCommand::Start(TaskSelector::Tag("web".to_string()), ack)
+    });
+    assert_eq!(n, 2);
+    assert!(pinned(&kernel, a));
+    assert!(pinned(&kernel, b));
+    assert!(!pinned(&kernel, c));
+
+    let n = turn_matching(&mut kernel, |ack| {
+      KernelCommand::Down(TaskSelector::All, ack)
+    });
+    assert_eq!(n, 3);
+    assert!(!pinned(&kernel, a));
+    assert!(!pinned(&kernel, b));
+
+    let n = turn_matching(&mut kernel, |ack| {
+      KernelCommand::Start(TaskSelector::Tag("nope".to_string()), ack)
+    });
+    assert_eq!(n, 0);
+    assert!(!pinned(&kernel, a));
+  }
+
+  #[test]
+  fn id_selector_matches_only_a_live_task() {
+    let mut fx = Fixture::new();
+    let a = fx.add("a", path_def("/a"));
+    let never_registered = fx.pc.alloc_id();
+    let mut kernel = fx.kernel.take().unwrap();
+
+    let n = turn_matching(&mut kernel, |ack| {
+      KernelCommand::Start(TaskSelector::Id(a), ack)
+    });
+    assert_eq!(n, 1);
+    assert!(pinned(&kernel, a));
+
+    turn(&mut kernel, KernelCommand::RemoveTask(a));
+    let n = turn_matching(&mut kernel, |ack| {
+      KernelCommand::Start(TaskSelector::Id(a), ack)
+    });
+    assert_eq!(n, 0);
+    assert!(!pinned(&kernel, a));
+
+    // Unlike bare `Start`, the selector never pre-pins an id that has
+    // not registered yet.
+    let n = turn_matching(&mut kernel, |ack| {
+      KernelCommand::Start(TaskSelector::Id(never_registered), ack)
+    });
+    assert_eq!(n, 0);
+    assert!(!pinned(&kernel, never_registered));
+  }
+
+  #[test]
+  fn commands_on_a_removed_id_leave_no_edges() {
+    let mut fx = Fixture::new();
+    let a = fx.add("a", path_def("/a"));
+    let b = fx.add("b", path_def("/b"));
+    let mut kernel = fx.kernel.take().unwrap();
+
+    turn(&mut kernel, KernelCommand::RemoveTask(a));
+
+    turn(&mut kernel, KernelCommand::Start(TaskSelector::Id(a), None));
+    assert!(!pinned(&kernel, a));
+    turn(
+      &mut kernel,
+      KernelCommand::Restart(TaskSelector::Id(a), None),
+    );
+    assert!(!pinned(&kernel, a));
+
+    turn(&mut kernel, KernelCommand::AddEdge { from: b, to: a });
+    assert!(
+      !kernel.graph.edges.get(&b).is_some_and(|s| s.contains(&a)),
+      "edge to a removed id was added"
+    );
+    turn(&mut kernel, KernelCommand::AddEdge { from: a, to: b });
+    assert!(kernel.graph.edges.get(&a).is_none());
+  }
+
+  #[tokio::test]
+  async fn start_matching_tag_starts_the_tagged_tasks() {
+    let mut fx = Fixture::new();
+    fx.add("a", tagged_def("/a", "web"));
+    fx.add("b", tagged_def("/b", "web"));
+    fx.add("c", path_def("/c"));
+    let handle = fx.run();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    fx.pc.send(KernelCommand::Start(
+      TaskSelector::Tag("web".to_string()),
+      Some(tx),
+    ));
+    assert_eq!(rx.await.unwrap(), 2);
+
+    let mut started = vec![fx.recv().await, fx.recv().await];
+    started.sort();
+    assert_eq!(
+      started,
+      vec![("a", RecordedCmd::Start), ("b", RecordedCmd::Start)]
+    );
+    fx.flush().await;
+    fx.assert_no_cmd();
 
     fx.quit(handle).await;
   }

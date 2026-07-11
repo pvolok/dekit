@@ -25,6 +25,9 @@ pub enum RpcRequest {
   /// Start the autostart target.
   Up {},
   /// Pin matching tasks to init and start them.
+  ///
+  /// All pattern verbs resolve the pattern and act on the matches in a
+  /// single kernel dispatch; `no_match` means zero matches at act time.
   Start {
     pattern: String,
   },
@@ -119,6 +122,14 @@ impl RpcRequest {
 
 pub fn ok_result() -> Value {
   json!({})
+}
+
+/// Result of a selector verb: how many tasks it acted on. Zero is a
+/// normal outcome (the pattern matched nothing), not an error, so the
+/// client can decide how to report it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ActResult {
+  pub matched: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

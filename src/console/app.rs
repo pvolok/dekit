@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::bail;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -35,6 +35,7 @@ use crate::{
     copy_mode::CopyMove as KernelCopyMove,
     kernel_message::{
       KernelCommand, KernelQuery, KernelQueryResponse, TaskContext,
+      TaskSelector,
     },
     sub_trie::SubMode,
     task::{
@@ -283,32 +284,27 @@ impl App {
       .collect();
     let deps_by_proc = resolve_proc_deps(&self.config.procs, &task_ids)?;
 
-    let specs: Vec<(ProcConfig, TaskId, Vec<TaskId>)> = self
-      .config
-      .procs
-      .iter()
-      .enumerate()
-      .map(|(i, cfg)| (cfg.clone(), task_ids[i], deps_by_proc[i].clone()))
-      .collect();
-    for (cfg, id, deps) in specs {
-      self.spawn_proc(cfg, id, deps);
-    }
-
-    let autostart_ids = self
-      .config
-      .procs
-      .iter()
-      .zip(&task_ids)
-      .filter(|(cfg, _)| cfg.autostart())
-      .map(|(_, id)| *id);
-    for id in autostart_ids {
-      self.pc.send(KernelCommand::Start(id));
+    // Deps must be registered first (the kernel refuses a registration
+    // with a missing dep), so register in dependency order.
+    let order = dep_order(&task_ids, &deps_by_proc)?;
+    for i in order {
+      let cfg = self.config.procs[i].clone();
+      let pinned = cfg.autostart();
+      self.spawn_proc(cfg, task_ids[i], deps_by_proc[i].clone(), pinned);
     }
 
     Ok(())
   }
 
-  fn spawn_proc(&self, cfg: ProcConfig, task_id: TaskId, deps: Vec<TaskId>) {
+  /// `pinned` makes "registered and started" one kernel step, so a
+  /// refused registration starts nothing.
+  fn spawn_proc(
+    &self,
+    cfg: ProcConfig,
+    task_id: TaskId,
+    deps: Vec<TaskId>,
+    pinned: bool,
+  ) {
     let merged = self.config.proc_defaults.clone().overlay(cfg);
     let path = TaskPath::resolve(TASK_ROOT, &merged.path)
       .or_else(|_| TaskPath::resolve(TASK_ROOT, &task_id.0.to_string()))
@@ -317,7 +313,7 @@ impl App {
       &self.pc,
       task_id,
       path,
-      proc_task_config(&merged, task_id, deps),
+      proc_task_config(&merged, task_id, deps, pinned),
     );
   }
 
@@ -536,7 +532,7 @@ impl App {
         pc.send(KernelCommand::Quit);
         for proc in self.state.procs.iter() {
           if proc.is_up() {
-            pc.send(KernelCommand::Kill(proc.id()));
+            pc.send(KernelCommand::Kill(TaskSelector::Id(proc.id()), None));
           }
         }
         loop_action.force_quit();
@@ -593,44 +589,44 @@ impl App {
 
       Action::StartProc => {
         if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Start(proc.id));
+          pc.send(KernelCommand::Start(TaskSelector::Id(proc.id), None));
         }
       }
       Action::StopProc => {
         if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Stop(proc.id));
+          pc.send(KernelCommand::Stop(TaskSelector::Id(proc.id), None));
         }
       }
       Action::KillProc => {
         if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Kill(proc.id));
+          pc.send(KernelCommand::Kill(TaskSelector::Id(proc.id), None));
         }
       }
       Action::VetoProc => {
         if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::KeepDown(proc.id));
+          pc.send(KernelCommand::Veto(TaskSelector::Id(proc.id), None));
         }
       }
       Action::RestartProc => {
         if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Restart(proc.id));
+          pc.send(KernelCommand::Restart(TaskSelector::Id(proc.id), None));
         }
       }
       Action::RestartAll => {
         for proc in &self.state.procs {
-          pc.send(KernelCommand::Restart(proc.id));
+          pc.send(KernelCommand::Restart(TaskSelector::Id(proc.id), None));
         }
       }
       Action::ForceRestartProc => {
         if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Kill(proc.id));
-          pc.send(KernelCommand::Start(proc.id));
+          pc.send(KernelCommand::Kill(TaskSelector::Id(proc.id), None));
+          pc.send(KernelCommand::Start(TaskSelector::Id(proc.id), None));
         }
       }
       Action::ForceRestartAll => {
         for proc in &self.state.procs {
-          pc.send(KernelCommand::Kill(proc.id));
-          pc.send(KernelCommand::Start(proc.id));
+          pc.send(KernelCommand::Kill(TaskSelector::Id(proc.id), None));
+          pc.send(KernelCommand::Start(TaskSelector::Id(proc.id), None));
         }
       }
 
@@ -668,8 +664,7 @@ impl App {
           ..ProcConfig::default()
         };
         let id = self.pc.alloc_id();
-        self.spawn_proc(proc_config, id, Vec::new());
-        self.pc.send(KernelCommand::Start(id));
+        self.spawn_proc(proc_config, id, Vec::new(), true);
         loop_action.render();
       }
       Action::DuplicateProc => {
@@ -930,6 +925,7 @@ fn proc_task_config(
   cfg: &ProcConfig,
   task_id: TaskId,
   deps: Vec<TaskId>,
+  pinned: bool,
 ) -> ProcTaskConfig {
   let log = cfg.log.clone().map(|log_cfg| {
     let name = cfg.path.clone();
@@ -960,7 +956,7 @@ fn proc_task_config(
     } else {
       Vec::new()
     },
-    pinned: false,
+    pinned,
   }
 }
 
@@ -1016,6 +1012,44 @@ fn resolve_proc_deps(
   validate_proc_dep_cycles(proc_configs, &dep_indexes_by_proc)?;
 
   Ok(deps_by_proc)
+}
+
+/// Order proc indices so every dep comes before its dependent. Deps are
+/// already validated acyclic (`validate_proc_dep_cycles`).
+fn dep_order(
+  task_ids: &[TaskId],
+  deps_by_proc: &[Vec<TaskId>],
+) -> anyhow::Result<Vec<usize>> {
+  let index_of: HashMap<TaskId, usize> = task_ids
+    .iter()
+    .enumerate()
+    .map(|(i, id)| (*id, i))
+    .collect();
+  let n = task_ids.len();
+  let mut missing_deps = vec![0usize; n];
+  let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+  for (i, deps) in deps_by_proc.iter().enumerate() {
+    missing_deps[i] = deps.len();
+    for dep in deps {
+      dependents[index_of[dep]].push(i);
+    }
+  }
+  let mut queue: VecDeque<usize> =
+    (0..n).filter(|i| missing_deps[*i] == 0).collect();
+  let mut order = Vec::with_capacity(n);
+  while let Some(i) = queue.pop_front() {
+    order.push(i);
+    for &k in &dependents[i] {
+      missing_deps[k] -= 1;
+      if missing_deps[k] == 0 {
+        queue.push_back(k);
+      }
+    }
+  }
+  if order.len() != n {
+    bail!("Dependency cycle among config procs.");
+  }
+  Ok(order)
 }
 
 #[derive(Clone, Copy, PartialEq)]

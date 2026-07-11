@@ -12,13 +12,15 @@ use crate::{
     kernel::Kernel,
     kernel_message::{
       KernelCommand, KernelQuery, KernelQueryResponse, TaskContext, TaskInfo,
+      TaskSelector,
     },
     task::TaskState,
     task_path::TaskPath,
   },
   protocol::{
-    ConnReceiver, ConnSender, CtlMsg, RpcError, RpcRequest, RpcTaskInfo,
-    RpcWhy, RpcWhyDep, TaskListResult, codes, ok_result, server_handshake,
+    ActResult, ConnReceiver, ConnSender, CtlMsg, RpcError, RpcRequest,
+    RpcTaskInfo, RpcWhy, RpcWhyDep, TaskListResult, codes, ok_result,
+    server_handshake,
   },
   term::Size,
 };
@@ -194,19 +196,20 @@ async fn list_tasks(
   }
 }
 
-async fn match_tasks(
+/// Send a selector command and return how many tasks it matched. The
+/// count comes from the same kernel dispatch that acted, so it reflects
+/// membership at act time.
+async fn act_matching(
   pc: &TaskContext,
-  pattern: &str,
-) -> Result<Vec<TaskInfo>, RpcError> {
-  let pattern = TaskPath::resolve_spec(TASK_ROOT, pattern);
-  let tasks = list_tasks(pc, Some(pattern.clone())).await?;
-  if tasks.is_empty() {
-    return Err(RpcError::new(
-      codes::NO_MATCH,
-      format!("no tasks match '{}'", pattern),
-    ));
-  }
-  Ok(tasks)
+  make: impl FnOnce(Option<tokio::sync::oneshot::Sender<usize>>) -> KernelCommand,
+) -> Result<usize, RpcError> {
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  pc.send(make(Some(tx)));
+  rx.await.map_err(RpcError::internal)
+}
+
+fn acted(matched: usize) -> Result<Value, RpcError> {
+  serde_json::to_value(ActResult { matched }).map_err(RpcError::internal)
 }
 
 fn parse_path(path: &str) -> Result<TaskPath, RpcError> {
@@ -241,61 +244,63 @@ async fn handle_rpc(
 
     RpcRequest::Up {} => {
       let tag = crate::config::proc::AUTOSTART_TAG.to_string();
-      match query(pc, KernelQuery::TasksWithTag(tag)).await? {
-        KernelQueryResponse::TaggedTasks(ids) => {
-          for id in ids {
-            pc.send(KernelCommand::Start(id));
-          }
-          Ok(ok_result())
-        }
-        _ => Err(RpcError::internal("unexpected query response")),
-      }
+      let matched = act_matching(pc, |ack| {
+        KernelCommand::Start(TaskSelector::Tag(tag), ack)
+      })
+      .await?;
+      acted(matched)
     }
 
     RpcRequest::Start { pattern } => {
-      for t in match_tasks(pc, &pattern).await? {
-        pc.send(KernelCommand::Start(t.id));
-      }
-      Ok(ok_result())
+      let glob =
+        TaskSelector::Glob(TaskPath::resolve_spec(TASK_ROOT, &pattern));
+      let matched =
+        act_matching(pc, |ack| KernelCommand::Start(glob, ack)).await?;
+      acted(matched)
     }
 
     RpcRequest::Stop { pattern } => {
-      for t in match_tasks(pc, &pattern).await? {
-        pc.send(KernelCommand::Stop(t.id));
-      }
-      Ok(ok_result())
+      let glob =
+        TaskSelector::Glob(TaskPath::resolve_spec(TASK_ROOT, &pattern));
+      let matched =
+        act_matching(pc, |ack| KernelCommand::Stop(glob, ack)).await?;
+      acted(matched)
     }
 
     RpcRequest::Veto { pattern } => {
-      for t in match_tasks(pc, &pattern).await? {
-        pc.send(KernelCommand::KeepDown(t.id));
-      }
-      Ok(ok_result())
+      let glob =
+        TaskSelector::Glob(TaskPath::resolve_spec(TASK_ROOT, &pattern));
+      let matched =
+        act_matching(pc, |ack| KernelCommand::Veto(glob, ack)).await?;
+      acted(matched)
     }
 
     RpcRequest::Down { pattern } => {
-      let tasks = match pattern {
-        Some(pattern) => match_tasks(pc, &pattern).await?,
-        None => list_tasks(pc, None).await?,
+      let selector = match pattern {
+        Some(pattern) => {
+          TaskSelector::Glob(TaskPath::resolve_spec(TASK_ROOT, &pattern))
+        }
+        None => TaskSelector::All,
       };
-      for t in tasks {
-        pc.send(KernelCommand::Down(t.id));
-      }
-      Ok(ok_result())
+      let matched =
+        act_matching(pc, |ack| KernelCommand::Down(selector, ack)).await?;
+      acted(matched)
     }
 
     RpcRequest::Kill { pattern } => {
-      for t in match_tasks(pc, &pattern).await? {
-        pc.send(KernelCommand::Kill(t.id));
-      }
-      Ok(ok_result())
+      let glob =
+        TaskSelector::Glob(TaskPath::resolve_spec(TASK_ROOT, &pattern));
+      let matched =
+        act_matching(pc, |ack| KernelCommand::Kill(glob, ack)).await?;
+      acted(matched)
     }
 
     RpcRequest::Restart { pattern } => {
-      for t in match_tasks(pc, &pattern).await? {
-        pc.send(KernelCommand::Restart(t.id));
-      }
-      Ok(ok_result())
+      let glob =
+        TaskSelector::Glob(TaskPath::resolve_spec(TASK_ROOT, &pattern));
+      let matched =
+        act_matching(pc, |ack| KernelCommand::Restart(glob, ack)).await?;
+      acted(matched)
     }
 
     RpcRequest::Why { path } => {
@@ -307,7 +312,7 @@ async fn handle_rpc(
             state: state_str(explain.state),
             wanted: explain.wanted,
             supported: explain.supported,
-            vetoed: explain.kept_down,
+            vetoed: explain.vetoed,
             pinned: explain.pinned,
             required_by: explain.required_by,
             deps: explain

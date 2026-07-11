@@ -260,9 +260,9 @@ pub struct TaskHandle {
   /// Bumped on every state change (and hard kill); state timeouts from an
   /// earlier epoch are ignored.
   pub epoch: u64,
-  /// Kept down: excluded from want-propagation until demanded again
+  /// Vetoed: excluded from want-propagation until demanded again
   /// (a direct start, or a start of a dependent pulling this task).
-  pub kept_down: bool,
+  pub vetoed: bool,
   /// A hard kill was sent; if the task is still stopping when its timeout
   /// runs out again, the kernel gives up waiting.
   pub killed: bool,
@@ -270,7 +270,7 @@ pub struct TaskHandle {
   pub last_start: Option<Instant>,
 
   /// Cached reconciler state, maintained incrementally.
-  /// `wanted`: reachable from a pin through non-kept-down nodes.
+  /// `wanted`: reachable from a pin through non-vetoed nodes.
   pub wanted: bool,
   /// `supported`: wanted, and every dependency is itself supported and
   /// currently satisfied.

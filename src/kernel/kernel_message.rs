@@ -29,14 +29,18 @@ pub enum KernelCommand {
     /// e.g. the path is taken).
     Option<tokio::sync::oneshot::Sender<bool>>,
   ),
+  /// Total: removes a task in any state, killing it if it is running.
   RemoveTask(TaskId),
 
-  Start(TaskId),
-  Stop(TaskId),
-  Kill(TaskId),
-  Restart(TaskId),
-  Down(TaskId),
-  KeepDown(TaskId),
+  /// Intent commands resolve the selector and act on the matches in the
+  /// same dispatch, so no other message can interleave between the two.
+  /// The ack is answered in that dispatch with the matched-task count.
+  Start(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
+  Stop(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
+  Kill(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
+  Restart(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
+  Down(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
+  Veto(TaskSelector, Option<tokio::sync::oneshot::Sender<usize>>),
   /// `from` requires `to`.
   AddEdge {
     from: TaskId,
@@ -69,6 +73,16 @@ pub enum KernelCommand {
   /// backoff delay). The epoch says which state it was set for, so a
   /// timeout from an earlier state is ignored.
   StateTimeout(TaskId, u64),
+}
+
+#[derive(Clone, Debug)]
+pub enum TaskSelector {
+  Id(TaskId),
+  /// Every task with a path.
+  All,
+  Glob(String),
+  /// Tasks carrying the tag.
+  Tag(String),
 }
 
 pub enum KernelQuery {
@@ -109,7 +123,7 @@ pub struct TaskExplain {
   /// Wanted and every dependency transitively supported and satisfied;
   /// false on a wanted task means it is blocked by a dep below.
   pub supported: bool,
-  pub kept_down: bool,
+  pub vetoed: bool,
   pub pinned: bool,
   pub required_by: Vec<String>,
   pub deps: Vec<DepExplain>,

@@ -8,6 +8,6 @@ pub use conn::{
 };
 pub use ctl::{Bye, CtlMsg, Event, Request, RpcError, codes};
 pub use rpc::{
-  RpcRequest, RpcTaskInfo, RpcWhy, RpcWhyDep, ScreenResult, TaskListResult,
-  ok_result,
+  ActResult, RpcRequest, RpcTaskInfo, RpcWhy, RpcWhyDep, ScreenResult,
+  TaskListResult, ok_result,
 };

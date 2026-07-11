@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 use proptest::prelude::*;
 
 use super::{Graph, Kernel, SentCmd, TimerRequest};
-use crate::kernel::kernel_message::{KernelCommand, KernelMessage};
+use crate::kernel::kernel_message::{
+  KernelCommand, KernelMessage, TaskSelector,
+};
 use crate::kernel::sub_trie::SubMode;
 use crate::kernel::task::{
   Effects, ExitInfo, INIT_TASK_ID, ReadyMode, RestartMode, Task, TaskCmd,
@@ -90,14 +92,35 @@ enum ReportKind {
   StoppedErr,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Intent {
+  Start,
+  Stop,
+  Kill,
+  Restart,
+  Down,
+  Veto,
+}
+
+/// Generated selector, resolved against the fixed `/t{i}` paths and
+/// even/odd tags.
+#[derive(Clone, Debug)]
+enum Sel {
+  Id(usize),
+  All,
+  Exact(usize),
+  Wild,
+  Tag(bool),
+}
+
 #[derive(Clone, Debug)]
 enum Cmd {
-  Start(usize),
-  Stop(usize),
-  Kill(usize),
-  Restart(usize),
-  Down(usize),
-  KeepDown(usize),
+  Start(Sel),
+  Stop(Sel),
+  Kill(Sel),
+  Restart(Sel),
+  Down(Sel),
+  Veto(Sel),
   AddEdge(usize, usize),
   RemoveEdge(usize, usize),
   Register(usize),
@@ -163,14 +186,24 @@ fn task_gen(n: usize) -> impl Strategy<Value = TaskGen> {
     })
 }
 
+fn sel(n: usize) -> impl Strategy<Value = Sel> {
+  prop_oneof![
+    4 => (0..n).prop_map(Sel::Id),
+    1 => Just(Sel::All),
+    2 => (0..n).prop_map(Sel::Exact),
+    1 => Just(Sel::Wild),
+    1 => any::<bool>().prop_map(Sel::Tag),
+  ]
+}
+
 fn cmd(n: usize) -> impl Strategy<Value = Cmd> {
   prop_oneof![
-    3 => (0..n).prop_map(Cmd::Start),
-    2 => (0..n).prop_map(Cmd::Stop),
-    1 => (0..n).prop_map(Cmd::Kill),
-    2 => (0..n).prop_map(Cmd::Restart),
-    1 => (0..n).prop_map(Cmd::Down),
-    1 => (0..n).prop_map(Cmd::KeepDown),
+    3 => sel(n).prop_map(Cmd::Start),
+    2 => sel(n).prop_map(Cmd::Stop),
+    1 => sel(n).prop_map(Cmd::Kill),
+    2 => sel(n).prop_map(Cmd::Restart),
+    1 => sel(n).prop_map(Cmd::Down),
+    1 => sel(n).prop_map(Cmd::Veto),
     2 => (0..n, 0..n).prop_map(|(a, b)| Cmd::AddEdge(a, b)),
     1 => (0..n, 0..n).prop_map(|(a, b)| Cmd::RemoveEdge(a, b)),
     2 => (0..n).prop_map(Cmd::Register),
@@ -255,12 +288,13 @@ impl Run {
       .is_some_and(|s| s.contains(&t))
   }
 
-  fn kept_down(&self, t: TaskId) -> Option<bool> {
-    self.kernel.graph.tasks.get(&t).map(|h| h.kept_down)
+  fn vetoed(&self, t: TaskId) -> Option<bool> {
+    self.kernel.graph.tasks.get(&t).map(|h| h.vetoed)
   }
 
   fn register(&mut self, world: &World, i: usize) {
     let task = &world.tasks[i];
+    let task_id = TaskId(i + 1);
     let def = TaskDef {
       kind: if task.job {
         TaskKind::Job
@@ -278,13 +312,21 @@ impl Run {
       path: Some(TaskPath::new(format!("/t{}", i + 1)).unwrap()),
       label: None,
       vt: None,
-      tags: Vec::new(),
+      tags: vec![tag_name(i).to_string()],
     };
     let script = task.script;
-    self.kernel.graph.register_task_with_id(
-      TaskId(i + 1),
+    // Predicted outcome: refused on a duplicate id or a missing dep.
+    let live = |t: &TaskId| self.kernel.graph.tasks.contains_key(t);
+    let expect_ok = !live(&task_id) && def.deps.iter().all(live);
+    let registered = self.kernel.graph.register_task_with_id(
+      task_id,
       def,
       Box::new(move |_| Box::new(ScriptedTask { script })),
+    );
+    assert_eq!(
+      registered, expect_ok,
+      "registration outcome for {:?} (dup or missing dep misjudged)",
+      task_id
     );
     self.kernel.graph.settle();
     self.timers.extend(self.kernel.graph.take_timers());
@@ -292,119 +334,145 @@ impl Run {
     self.kernel.graph.sent.clear();
   }
 
+  /// The expected match set, resolved before the turn from the live task
+  /// set and the fixed per-index paths/tags. The selector command must
+  /// act on exactly this set (membership at act time).
+  fn expect_matched(&self, world: &World, sel: &Sel) -> Vec<TaskId> {
+    let n = world.tasks.len();
+    let live = |k: usize| {
+      let t = TaskId((k % n) + 1);
+      self.kernel.graph.tasks.contains_key(&t).then_some(t)
+    };
+    match sel {
+      Sel::Id(k) | Sel::Exact(k) => live(*k).into_iter().collect(),
+      Sel::All | Sel::Wild => (0..n).filter_map(live).collect(),
+      Sel::Tag(even) => (0..n)
+        .filter(|i| (i % 2 == 0) == *even)
+        .filter_map(live)
+        .collect(),
+    }
+  }
+
+  fn to_selector(&self, world: &World, sel: &Sel) -> TaskSelector {
+    let n = world.tasks.len();
+    match sel {
+      Sel::Id(k) => TaskSelector::Id(TaskId((k % n) + 1)),
+      Sel::All => TaskSelector::All,
+      Sel::Exact(k) => TaskSelector::Glob(format!("/t{}", (k % n) + 1)),
+      Sel::Wild => TaskSelector::Glob("/*".to_string()),
+      Sel::Tag(even) => {
+        TaskSelector::Tag(if *even { "even" } else { "odd" }.to_string())
+      }
+    }
+  }
+
+  /// Run an intent command and check the ack count and per-id effects
+  /// against the pre-turn expectation.
+  fn exec_intent(&mut self, world: &World, sel: &Sel, intent: Intent) {
+    let expected = self.expect_matched(world, sel);
+    let pre: Vec<(TaskId, Option<TaskState>)> =
+      expected.iter().map(|t| (*t, self.state_of(*t))).collect();
+    let selector = self.to_selector(world, sel);
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let command = match intent {
+      Intent::Start => KernelCommand::Start(selector, Some(tx)),
+      Intent::Stop => KernelCommand::Stop(selector, Some(tx)),
+      Intent::Kill => KernelCommand::Kill(selector, Some(tx)),
+      Intent::Restart => KernelCommand::Restart(selector, Some(tx)),
+      Intent::Down => KernelCommand::Down(selector, Some(tx)),
+      Intent::Veto => KernelCommand::Veto(selector, Some(tx)),
+    };
+    let sent = self.turn(INIT_TASK_ID, command);
+    assert_eq!(
+      rx.try_recv().expect("ack not answered in dispatch"),
+      expected.len(),
+      "ack count differs from act-time membership for {:?}",
+      sel
+    );
+
+    // A command on a task in a matching state is never silently
+    // swallowed; pins and vetoes follow the verb.
+    for (t, pre_state) in pre {
+      let must_bounce = match pre_state {
+        Some(TaskState::Starting | TaskState::Running | TaskState::Ready) => {
+          true
+        }
+        Some(
+          TaskState::Idle
+          | TaskState::Stopping
+          | TaskState::Backoff
+          | TaskState::Done(_)
+          | TaskState::Exited(_),
+        )
+        | None => false,
+      };
+      match intent {
+        Intent::Start => {
+          assert!(self.pinned(t), "start did not pin {:?}", t);
+          if let Some(v) = self.vetoed(t) {
+            assert!(!v, "start left {:?} vetoed", t);
+          }
+        }
+        Intent::Stop => {
+          assert!(!self.pinned(t), "stop left the pin on {:?}", t);
+          if must_bounce {
+            assert!(
+              sent.contains(&(t, SentCmd::Stop)),
+              "stop command swallowed for {:?} in {:?}",
+              t,
+              pre_state
+            );
+          }
+        }
+        Intent::Kill => {
+          assert!(!self.pinned(t), "kill left the pin on {:?}", t);
+          let must_kill = must_bounce || pre_state == Some(TaskState::Stopping);
+          if must_kill {
+            assert!(
+              sent.contains(&(t, SentCmd::Kill)),
+              "kill command swallowed for {:?} in {:?}",
+              t,
+              pre_state
+            );
+          }
+        }
+        Intent::Restart => {
+          assert!(self.pinned(t), "restart did not pin {:?}", t);
+          if let Some(v) = self.vetoed(t) {
+            assert!(!v, "restart left {:?} vetoed", t);
+          }
+          if must_bounce {
+            assert!(
+              sent.contains(&(t, SentCmd::Stop)),
+              "restart did not bounce {:?} in {:?}",
+              t,
+              pre_state
+            );
+          }
+        }
+        Intent::Down => {
+          assert!(!self.pinned(t), "down left the pin on {:?}", t);
+        }
+        Intent::Veto => {
+          assert!(!self.pinned(t), "veto left the pin on {:?}", t);
+          if let Some(v) = self.vetoed(t) {
+            assert!(v, "veto did not veto {:?}", t);
+          }
+        }
+      }
+    }
+  }
+
   fn exec(&mut self, world: &World, cmd: &Cmd) {
     let n = world.tasks.len();
     let id = |k: usize| TaskId((k % n) + 1);
     match cmd {
-      // The intent-bearing commands assert their response: a command on a
-      // task in a matching state is never silently swallowed.
-      Cmd::Start(t) => {
-        let t = id(*t);
-        self.turn(INIT_TASK_ID, KernelCommand::Start(t));
-        assert!(self.pinned(t), "start did not pin {:?}", t);
-        if let Some(kd) = self.kept_down(t) {
-          assert!(!kd, "start left {:?} kept down", t);
-        }
-      }
-      Cmd::Stop(t) => {
-        let t = id(*t);
-        let pre = self.state_of(t);
-        let sent = self.turn(INIT_TASK_ID, KernelCommand::Stop(t));
-        assert!(!self.pinned(t), "stop left the pin on {:?}", t);
-        let must_stop = match pre {
-          Some(TaskState::Starting | TaskState::Running | TaskState::Ready) => {
-            true
-          }
-          Some(
-            TaskState::Idle
-            | TaskState::Stopping
-            | TaskState::Backoff
-            | TaskState::Done(_)
-            | TaskState::Exited(_),
-          )
-          | None => false,
-        };
-        if must_stop {
-          assert!(
-            sent.contains(&(t, SentCmd::Stop)),
-            "stop command swallowed for {:?} in {:?}",
-            t,
-            pre
-          );
-        }
-      }
-      Cmd::Kill(t) => {
-        let t = id(*t);
-        let pre = self.state_of(t);
-        let sent = self.turn(INIT_TASK_ID, KernelCommand::Kill(t));
-        assert!(!self.pinned(t), "kill left the pin on {:?}", t);
-        let must_kill = match pre {
-          Some(
-            TaskState::Starting
-            | TaskState::Running
-            | TaskState::Ready
-            | TaskState::Stopping,
-          ) => true,
-          Some(
-            TaskState::Idle
-            | TaskState::Backoff
-            | TaskState::Done(_)
-            | TaskState::Exited(_),
-          )
-          | None => false,
-        };
-        if must_kill {
-          assert!(
-            sent.contains(&(t, SentCmd::Kill)),
-            "kill command swallowed for {:?} in {:?}",
-            t,
-            pre
-          );
-        }
-      }
-      Cmd::Restart(t) => {
-        let t = id(*t);
-        let pre = self.state_of(t);
-        let sent = self.turn(INIT_TASK_ID, KernelCommand::Restart(t));
-        assert!(self.pinned(t), "restart did not pin {:?}", t);
-        if let Some(kd) = self.kept_down(t) {
-          assert!(!kd, "restart left {:?} kept down", t);
-        }
-        let must_stop = match pre {
-          Some(TaskState::Starting | TaskState::Running | TaskState::Ready) => {
-            true
-          }
-          Some(
-            TaskState::Idle
-            | TaskState::Stopping
-            | TaskState::Backoff
-            | TaskState::Done(_)
-            | TaskState::Exited(_),
-          )
-          | None => false,
-        };
-        if must_stop {
-          assert!(
-            sent.contains(&(t, SentCmd::Stop)),
-            "restart did not bounce {:?} in {:?}",
-            t,
-            pre
-          );
-        }
-      }
-      Cmd::Down(t) => {
-        let t = id(*t);
-        self.turn(INIT_TASK_ID, KernelCommand::Down(t));
-        assert!(!self.pinned(t), "down left the pin on {:?}", t);
-      }
-      Cmd::KeepDown(t) => {
-        let t = id(*t);
-        self.turn(INIT_TASK_ID, KernelCommand::KeepDown(t));
-        assert!(!self.pinned(t), "keep-down left the pin on {:?}", t);
-        if let Some(kd) = self.kept_down(t) {
-          assert!(kd, "keep-down did not keep {:?} down", t);
-        }
-      }
+      Cmd::Start(sel) => self.exec_intent(world, sel, Intent::Start),
+      Cmd::Stop(sel) => self.exec_intent(world, sel, Intent::Stop),
+      Cmd::Kill(sel) => self.exec_intent(world, sel, Intent::Kill),
+      Cmd::Restart(sel) => self.exec_intent(world, sel, Intent::Restart),
+      Cmd::Down(sel) => self.exec_intent(world, sel, Intent::Down),
+      Cmd::Veto(sel) => self.exec_intent(world, sel, Intent::Veto),
       Cmd::AddEdge(a, b) => {
         self.turn(
           INIT_TASK_ID,
@@ -425,8 +493,9 @@ impl Run {
       }
       Cmd::Register(k) => self.register(world, k % n),
       Cmd::Remove(t) => {
-        self.epochs.remove(&id(*t));
-        self.turn(INIT_TASK_ID, KernelCommand::RemoveTask(id(*t)));
+        let t = id(*t);
+        self.epochs.remove(&t);
+        self.turn(INIT_TASK_ID, KernelCommand::RemoveTask(t));
       }
       Cmd::Subscribe(a, b) => {
         let path = TaskPath::new(format!("/t{}", (b % n) + 1)).unwrap();
@@ -493,10 +562,23 @@ impl Run {
 
     // Graph shape: edges/redges are exact inverses, no self edges, no
     // edges into init, and no cycle survives insertion checks.
+    // Every edge endpoint is a registered task (INIT may only be a
+    // source): dangling edges cannot exist.
     for (from, tos) in &g.edges {
+      assert!(
+        *from == INIT_TASK_ID || g.tasks.contains_key(from),
+        "edge from unregistered {:?}",
+        from
+      );
       for to in tos {
         assert_ne!(from, to, "self edge");
         assert_ne!(*to, INIT_TASK_ID, "edge into init");
+        assert!(
+          g.tasks.contains_key(to),
+          "edge {:?}->{:?} points at an unregistered id",
+          from,
+          to
+        );
         assert!(
           g.redges.get(to).is_some_and(|s| s.contains(from)),
           "edge {:?}->{:?} missing from redges",
@@ -557,6 +639,10 @@ impl Run {
       *last = task.epoch;
     }
   }
+}
+
+fn tag_name(i: usize) -> &'static str {
+  if i % 2 == 0 { "even" } else { "odd" }
 }
 
 fn legal_transition(from: TaskState, to: TaskState) -> bool {
