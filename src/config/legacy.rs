@@ -25,6 +25,7 @@ impl From<crate::mprocs::config::Config> for Config {
         tips: TipsConfig {
           show: !legacy.hide_keymap_window,
         },
+        zoom_tip: true,
       },
       keymap: KeymapConfig::default(),
       on_init: legacy.on_init.map(Hook::Action),

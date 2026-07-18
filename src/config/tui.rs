@@ -8,6 +8,7 @@ const DEFAULT_PROC_LIST_TITLE: &str = "Processes";
 pub struct TuiConfig {
   pub procs: ProcListConfig,
   pub tips: TipsConfig,
+  pub zoom_tip: bool,
 }
 
 pub struct ProcListConfig {
@@ -27,6 +28,7 @@ impl TuiConfig {
         width: DEFAULT_PROC_LIST_WIDTH,
       },
       tips: TipsConfig { show: true },
+      zoom_tip: true,
     }
   }
 
@@ -45,6 +47,8 @@ impl TuiConfig {
     if let Some(tips) = tui_obj.get("tips") {
       self.tips.show = tips.as_obj()?.default("show", self.tips.show, cx)?;
     }
+
+    self.zoom_tip = tui_obj.default("zoom_tip", self.zoom_tip, cx)?;
 
     Ok(())
   }

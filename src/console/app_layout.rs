@@ -20,7 +20,7 @@ impl AppLayout {
     } else {
       config.tui.procs.width as u16
     };
-    let zoom_banner_h = if zoom { 1 } else { 0 };
+    let zoom_banner_h = if zoom && config.tui.zoom_tip { 1 } else { 0 };
     let (top, keymap) = area.split_h(area.height.saturating_sub(keymap_h));
     let (procs, term) = top.split_v(procs_w);
     let (zoom_banner, term) = term.split_h(zoom_banner_h);
