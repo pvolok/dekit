@@ -89,6 +89,13 @@ impl Config {
         settings.proc_list_title.clone()
       };
 
+    let on_init = if let Some(val) = config.get(&Value::from("on_init")) {
+      let event: AppEvent = serde_yaml::from_value(val.raw().clone())?;
+      Some(event.to_action())
+    } else {
+      None
+    };
+
     let on_all_finished =
       if let Some(val) = config.get(&Value::from("on_all_finished")) {
         let event: AppEvent = serde_yaml::from_value(val.raw().clone())?;
@@ -116,7 +123,7 @@ impl Config {
       scrollback_len: settings.scrollback_len,
       proc_list_width: settings.proc_list_width,
       proc_list_title,
-      on_init: None,
+      on_init,
       on_all_finished,
       proc_log,
     };

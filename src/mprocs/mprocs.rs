@@ -15,6 +15,7 @@ use crate::mprocs::config::{
   CmdConfig, Config, ConfigContext, ProcConfig, ServerConfig, default_stop,
 };
 use crate::mprocs::ctl::run_ctl;
+use crate::mprocs::event::AppEvent;
 use crate::mprocs::just::load_just_procs;
 use crate::mprocs::package_json::load_npm_procs;
 use crate::mprocs::proc_log_config::{LogConfig, LogMode};
@@ -95,11 +96,13 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
 
     if let Some(on_all_finished) = matches.get_one::<String>("on-all-finished")
     {
-      config.on_all_finished = Some(serde_yaml::from_str(on_all_finished)?);
+      let event: AppEvent = serde_yaml::from_str(on_all_finished)?;
+      config.on_all_finished = Some(event.to_action());
     }
 
     if let Some(on_init) = matches.get_one::<String>("on-init") {
-      config.on_init = Some(serde_yaml::from_str(on_init)?);
+      let event: AppEvent = serde_yaml::from_str(on_init)?;
+      config.on_init = Some(event.to_action());
     }
 
     if let Some(log_dir) = matches.get_one::<String>("log-dir") {
