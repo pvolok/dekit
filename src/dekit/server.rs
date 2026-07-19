@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::{
-  config::config::TASK_ROOT,
   console::{
     app::create_app_task, app_client::client_session, server_message::ClientId,
   },
@@ -184,11 +183,19 @@ fn task_state(state: TaskState) -> RpcState {
   }
 }
 
-fn parse_selector(pattern: &str) -> TaskSelector {
+fn parse_selector(pattern: &str) -> Result<TaskSelector, RpcError> {
   match pattern.strip_prefix('#') {
-    Some(tag) => TaskSelector::Tag(tag.to_string()),
-    None => TaskSelector::Glob(TaskPath::resolve_spec(TASK_ROOT, pattern)),
+    Some(tag) => Ok(TaskSelector::Tag(tag.to_string())),
+    None => {
+      parse_glob(pattern)?;
+      Ok(TaskSelector::Glob(pattern.to_string()))
+    }
   }
+}
+
+fn parse_glob(pattern: &str) -> Result<(), RpcError> {
+  TaskPath::check_glob(pattern)
+    .map_err(|err| RpcError::new(codes::BAD_PATH, err.to_string()))
 }
 
 async fn query(
@@ -225,7 +232,7 @@ fn acted(matched: usize) -> Result<Value, RpcError> {
 }
 
 fn parse_path(path: &str) -> Result<TaskPath, RpcError> {
-  TaskPath::resolve(TASK_ROOT, path)
+  TaskPath::new(path)
     .map_err(|err| RpcError::new(codes::BAD_PATH, err.to_string()))
 }
 
@@ -239,8 +246,10 @@ async fn handle_rpc(
     )),
 
     RpcRequest::Ls { pattern } => {
-      let glob = pattern.map(|p| TaskPath::resolve_spec(TASK_ROOT, &p));
-      let tasks = list_tasks(pc, glob)
+      if let Some(pattern) = &pattern {
+        parse_glob(pattern)?;
+      }
+      let tasks = list_tasks(pc, pattern)
         .await?
         .into_iter()
         .map(|t| RpcTaskInfo {
@@ -257,7 +266,7 @@ async fn handle_rpc(
 
     RpcRequest::Up { pattern } => {
       let selector = match pattern {
-        Some(pattern) => parse_selector(&pattern),
+        Some(pattern) => parse_selector(&pattern)?,
         None => {
           TaskSelector::Tag(crate::config::proc::AUTOSTART_TAG.to_string())
         }
@@ -268,21 +277,21 @@ async fn handle_rpc(
     }
 
     RpcRequest::Start { pattern } => {
-      let selector = parse_selector(&pattern);
+      let selector = parse_selector(&pattern)?;
       let matched =
         act_matching(pc, |ack| KernelCommand::Start(selector, ack)).await?;
       acted(matched)
     }
 
     RpcRequest::Stop { pattern } => {
-      let selector = parse_selector(&pattern);
+      let selector = parse_selector(&pattern)?;
       let matched =
         act_matching(pc, |ack| KernelCommand::Stop(selector, ack)).await?;
       acted(matched)
     }
 
     RpcRequest::Veto { pattern } => {
-      let selector = parse_selector(&pattern);
+      let selector = parse_selector(&pattern)?;
       let matched =
         act_matching(pc, |ack| KernelCommand::Veto(selector, ack)).await?;
       acted(matched)
@@ -290,7 +299,7 @@ async fn handle_rpc(
 
     RpcRequest::Down { pattern } => {
       let selector = match pattern {
-        Some(pattern) => parse_selector(&pattern),
+        Some(pattern) => parse_selector(&pattern)?,
         None => TaskSelector::All,
       };
       let matched =
@@ -299,14 +308,14 @@ async fn handle_rpc(
     }
 
     RpcRequest::Kill { pattern } => {
-      let selector = parse_selector(&pattern);
+      let selector = parse_selector(&pattern)?;
       let matched =
         act_matching(pc, |ack| KernelCommand::Kill(selector, ack)).await?;
       acted(matched)
     }
 
     RpcRequest::Restart { pattern } => {
-      let selector = parse_selector(&pattern);
+      let selector = parse_selector(&pattern)?;
       let matched =
         act_matching(pc, |ack| KernelCommand::Restart(selector, ack)).await?;
       acted(matched)

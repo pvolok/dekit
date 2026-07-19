@@ -309,7 +309,7 @@ impl Run {
       restart: task.restart,
       deps: task.deps.iter().map(|d| TaskId(d + 1)).collect(),
       pinned: task.pinned,
-      path: Some(TaskPath::new(format!("/t{}", i + 1)).unwrap()),
+      path: Some(TaskPath::new(format!("t{}", i + 1)).unwrap()),
       label: None,
       vt: None,
       tags: vec![tag_name(i).to_string()],
@@ -358,8 +358,8 @@ impl Run {
     match sel {
       Sel::Id(k) => TaskSelector::Id(TaskId((k % n) + 1)),
       Sel::All => TaskSelector::All,
-      Sel::Exact(k) => TaskSelector::Glob(format!("/t{}", (k % n) + 1)),
-      Sel::Wild => TaskSelector::Glob("/*".to_string()),
+      Sel::Exact(k) => TaskSelector::Glob(format!("t{}", (k % n) + 1)),
+      Sel::Wild => TaskSelector::Glob("*".to_string()),
       Sel::Tag(even) => {
         TaskSelector::Tag(if *even { "even" } else { "odd" }.to_string())
       }
@@ -498,7 +498,7 @@ impl Run {
         self.turn(INIT_TASK_ID, KernelCommand::RemoveTask(t));
       }
       Cmd::Subscribe(a, b) => {
-        let path = TaskPath::new(format!("/t{}", (b % n) + 1)).unwrap();
+        let path = TaskPath::new(format!("t{}", (b % n) + 1)).unwrap();
         self.turn(id(*a), KernelCommand::SubscribePath(path, SubMode::Subtree));
       }
       Cmd::Report(t, kind) => {

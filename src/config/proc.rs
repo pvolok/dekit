@@ -119,6 +119,9 @@ pub(crate) fn proc_from_cfg(
 ) -> Result<ProcConfig> {
   let obj = node.as_obj()?;
   let mut p = parse_proc_settings(&obj, cx)?;
+  if let Err(err) = crate::kernel::task_path::TaskPath::new(path.as_str()) {
+    bail!("proc '{}': {}", path, err);
+  }
   p.path = path;
   p.cmd = Some(cmd_from_cfg(node)?);
   p.deps = obj.default("deps", Vec::new(), cx)?;

@@ -201,7 +201,7 @@ pub fn spawn_proc_task_with_id(
       ready,
       restart,
       deps,
-      path: task_path,
+      path: task_path.clone(),
       label,
       vt: Some(vt),
       tags,
@@ -212,6 +212,7 @@ pub fn spawn_proc_task_with_id(
       proc_main(
         ctx,
         receiver,
+        task_path,
         spec,
         task_vt,
         log,
@@ -229,6 +230,7 @@ pub fn spawn_proc_task_with_id(
 async fn proc_main(
   ctx: TaskContext,
   mut receiver: UnboundedReceiver<TaskCmd>,
+  task_path: Option<TaskPath>,
   spec: ProcessSpec,
   vt: SharedVt,
   mut log: Option<LogResolver>,
@@ -339,7 +341,11 @@ async fn proc_main(
           let msg = match msg.downcast::<DuplicateProc>() {
             Ok(dup) => {
               let new_id = ctx.alloc_id();
-              let path = TaskPath::new(format!("/{}", new_id.0)).ok();
+              let path = match &task_path {
+                Some(p) => TaskPath::new(format!("{}_{}", p, new_id.0)),
+                None => TaskPath::new(new_id.0.to_string()),
+              }
+              .ok();
               let _ = spawn_proc_task_with_id(
                 &ctx,
                 new_id,
@@ -647,7 +653,7 @@ mod tests {
     let kernel = Kernel::new();
     let pc = kernel.context();
 
-    let path = TaskPath::new("/logged").unwrap();
+    let path = TaskPath::new("logged").unwrap();
     let spec = ProcessSpec::from_argv(vec![
       "sh".to_string(),
       "-c".to_string(),
@@ -684,7 +690,7 @@ mod tests {
 
     // The SIGCHLD waiter isn't running in unit tests, so the proc never
     // transitions to Exited on its own; remove it explicitly to unblock quit.
-    let id = resolve(&pc, "/logged").await;
+    let id = resolve(&pc, "logged").await;
     pc.send(KernelCommand::RemoveTask(id));
     pc.send(KernelCommand::Quit);
     tokio::time::timeout(Duration::from_secs(2), kernel_task)
@@ -720,7 +726,7 @@ mod tests {
     let log_dir = dir.clone();
     let (id, _) = spawn_proc_task(
       &pc,
-      Some(TaskPath::new("/pidlog").unwrap()),
+      Some(TaskPath::new("pidlog").unwrap()),
       ProcTaskConfig {
         log: Some(Box::new(move |pid| {
           *cap.lock().unwrap() = Some(pid);
@@ -749,7 +755,7 @@ mod tests {
     };
     assert_ne!(pid, 0, "resolver should receive a real pid");
 
-    let id = resolve(&pc, "/pidlog").await;
+    let id = resolve(&pc, "pidlog").await;
     pc.send(KernelCommand::RemoveTask(id));
     pc.send(KernelCommand::Quit);
     tokio::time::timeout(Duration::from_secs(2), kernel_task)
@@ -772,7 +778,7 @@ mod tests {
     let kernel = Kernel::new();
     let pc = kernel.context();
 
-    let path = TaskPath::new("/sleeper").unwrap();
+    let path = TaskPath::new("sleeper").unwrap();
     let spec = ProcessSpec::from_argv(vec![
       "sh".to_string(),
       "-c".to_string(),
@@ -790,7 +796,7 @@ mod tests {
 
     let kernel_task = tokio::spawn(kernel.run());
 
-    let id = resolve(&pc, "/sleeper").await;
+    let id = resolve(&pc, "sleeper").await;
     pc.send(KernelCommand::Stop(TaskSelector::Id(id), None));
 
     let deadline = Instant::now() + Duration::from_secs(2);

@@ -1705,7 +1705,7 @@ mod tests {
   #[tokio::test]
   async fn start_starts_and_down_stops() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let handle = fx.run();
 
     fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
@@ -1720,8 +1720,8 @@ mod tests {
   #[tokio::test]
   async fn second_task_at_same_path_is_refused() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/x"));
-    let b = fx.add("b", path_def("/x"));
+    let a = fx.add("a", path_def("x"));
+    let b = fx.add("b", path_def("x"));
     let handle = fx.run();
 
     fx.pc.send(KernelCommand::Start(TaskSelector::Id(b), None));
@@ -1737,19 +1737,19 @@ mod tests {
   #[tokio::test]
   async fn registration_ack_reports_the_outcome() {
     let mut fx = Fixture::new();
-    let _a = fx.add("a", path_def("/x"));
+    let _a = fx.add("a", path_def("x"));
     let handle = fx.run();
 
     let taken = fx.pc.spawn_async_with_id(
       fx.pc.alloc_id(),
-      path_def("/x"),
+      path_def("x"),
       |_, _| async {},
     );
     assert_eq!(taken.await, Ok(false));
 
     let free = fx.pc.spawn_async_with_id(
       fx.pc.alloc_id(),
-      path_def("/y"),
+      path_def("y"),
       |_, _| async {},
     );
     assert_eq!(free.await, Ok(true));
@@ -1760,12 +1760,12 @@ mod tests {
   #[tokio::test]
   async fn start_pulls_dependencies_up_in_order() {
     let mut fx = Fixture::new();
-    let dep = fx.add("dep", path_def("/dep"));
+    let dep = fx.add("dep", path_def("dep"));
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -1785,7 +1785,7 @@ mod tests {
       "a",
       TaskDef {
         pinned: true,
-        ..path_def("/a")
+        ..path_def("a")
       },
     );
     let handle = fx.run();
@@ -1799,12 +1799,12 @@ mod tests {
   #[tokio::test]
   async fn veto_breaks_dependents_leaf_first() {
     let mut fx = Fixture::new();
-    let dep = fx.add("dep", path_def("/dep"));
+    let dep = fx.add("dep", path_def("dep"));
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -1832,12 +1832,12 @@ mod tests {
   #[tokio::test]
   async fn start_of_dependent_releases_vetoed_dep() {
     let mut fx = Fixture::new();
-    let dep = fx.add("dep", path_def("/dep"));
+    let dep = fx.add("dep", path_def("dep"));
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -1865,12 +1865,12 @@ mod tests {
   #[tokio::test]
   async fn start_of_dependent_revives_exited_dep() {
     let mut fx = Fixture::new();
-    let dep = fx.add("dep", path_def("/dep"));
+    let dep = fx.add("dep", path_def("dep"));
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -1902,14 +1902,14 @@ mod tests {
       "job",
       TaskDef {
         kind: TaskKind::Job,
-        ..path_def("/job")
+        ..path_def("job")
       },
     );
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![job],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -1934,12 +1934,12 @@ mod tests {
   #[tokio::test]
   async fn down_keeps_task_wanted_by_another() {
     let mut fx = Fixture::new();
-    let dep = fx.add("dep", path_def("/dep"));
+    let dep = fx.add("dep", path_def("dep"));
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -1971,14 +1971,14 @@ mod tests {
       "dep",
       TaskDef {
         ready: ReadyMode::Reported,
-        ..path_def("/dep")
+        ..path_def("dep")
       },
     );
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -2002,14 +2002,14 @@ mod tests {
       "job",
       TaskDef {
         kind: TaskKind::Job,
-        ..path_def("/job")
+        ..path_def("job")
       },
     );
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![job],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -2037,7 +2037,7 @@ mod tests {
       "a",
       TaskDef {
         restart: RestartMode::OnFailure,
-        ..path_def("/a")
+        ..path_def("a")
       },
     );
     let handle = fx.run();
@@ -2059,7 +2059,7 @@ mod tests {
       "a",
       TaskDef {
         restart: RestartMode::OnFailure,
-        ..path_def("/a")
+        ..path_def("a")
       },
     );
     let handle = fx.run();
@@ -2077,7 +2077,7 @@ mod tests {
   #[tokio::test]
   async fn restart_cycles_task() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let handle = fx.run();
 
     fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
@@ -2101,7 +2101,7 @@ mod tests {
   #[tokio::test]
   async fn stop_of_leaf_keeps_it_down_until_started() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let handle = fx.run();
 
     fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
@@ -2122,12 +2122,12 @@ mod tests {
   #[tokio::test]
   async fn quit_stops_tasks_in_reverse_dependency_order() {
     let mut fx = Fixture::new();
-    let dep = fx.add("dep", path_def("/dep"));
+    let dep = fx.add("dep", path_def("dep"));
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -2149,12 +2149,12 @@ mod tests {
   #[tokio::test]
   async fn add_edge_rejects_cycles() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let b = fx.add(
       "b",
       TaskDef {
         deps: vec![a],
-        ..path_def("/b")
+        ..path_def("b")
       },
     );
     let handle = fx.run();
@@ -2182,19 +2182,19 @@ mod tests {
       app_id,
       TaskDef {
         deps: vec![dep_id],
-        ..path_def("/app")
+        ..path_def("app")
       },
       Box::new(move |_| Box::new(RecordingTask { name: "app", tx })),
     );
     assert!(!registered);
     assert!(!kernel.graph.tasks.contains_key(&app_id));
-    assert_eq!(kernel.graph.resolve(&TaskPath::new("/app").unwrap()), None);
+    assert_eq!(kernel.graph.resolve(&TaskPath::new("app").unwrap()), None);
 
     // Dep first, then the app registers and starts behind it.
     let tx = fx.tx.clone();
     assert!(kernel.graph.register_task_with_id(
       dep_id,
-      path_def("/dep"),
+      path_def("dep"),
       Box::new(move |_| Box::new(RecordingTask { name: "dep", tx })),
     ));
     let tx = fx.tx.clone();
@@ -2202,7 +2202,7 @@ mod tests {
       app_id,
       TaskDef {
         deps: vec![dep_id],
-        ..path_def("/app")
+        ..path_def("app")
       },
       Box::new(move |_| Box::new(RecordingTask { name: "app", tx })),
     ));
@@ -2217,7 +2217,7 @@ mod tests {
   #[test]
   fn add_edge_to_unregistered_id_is_refused() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let mut kernel = fx.kernel.take().unwrap();
 
     turn(&mut kernel, KernelCommand::Start(TaskSelector::Id(a), None));
@@ -2265,7 +2265,7 @@ mod tests {
       "a",
       TaskDef {
         label: Some("web server".to_string()),
-        ..path_def("/1")
+        ..path_def("1")
       },
     );
     let handle = fx.run();
@@ -2308,21 +2308,21 @@ mod tests {
   #[tokio::test]
   async fn set_task_path_rejects_conflict_and_keeps_old_path() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
-    let b = fx.add("b", path_def("/b"));
+    let a = fx.add("a", path_def("a"));
+    let b = fx.add("b", path_def("b"));
     let handle = fx.run();
 
     // Target taken by another task: rejected, both paths intact.
     fx.pc
-      .send(KernelCommand::SetTaskPath(a, TaskPath::new("/b").unwrap()));
-    assert_eq!(resolve(&fx.pc, "/a").await, Some(a));
-    assert_eq!(resolve(&fx.pc, "/b").await, Some(b));
+      .send(KernelCommand::SetTaskPath(a, TaskPath::new("b").unwrap()));
+    assert_eq!(resolve(&fx.pc, "a").await, Some(a));
+    assert_eq!(resolve(&fx.pc, "b").await, Some(b));
 
     // Free target: moves cleanly, old path released.
     fx.pc
-      .send(KernelCommand::SetTaskPath(a, TaskPath::new("/c").unwrap()));
-    assert_eq!(resolve(&fx.pc, "/c").await, Some(a));
-    assert_eq!(resolve(&fx.pc, "/a").await, None);
+      .send(KernelCommand::SetTaskPath(a, TaskPath::new("c").unwrap()));
+    assert_eq!(resolve(&fx.pc, "c").await, Some(a));
+    assert_eq!(resolve(&fx.pc, "a").await, None);
 
     fx.quit(handle).await;
   }
@@ -2330,16 +2330,16 @@ mod tests {
   #[tokio::test]
   async fn register_path_conflict_keeps_owner() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/x"));
-    let b = fx.add("b", path_def("/x"));
+    let a = fx.add("a", path_def("x"));
+    let b = fx.add("b", path_def("x"));
     let handle = fx.run();
 
     // The loser is registered without a path.
-    assert_eq!(resolve(&fx.pc, "/x").await, Some(a));
+    assert_eq!(resolve(&fx.pc, "x").await, Some(a));
 
     // Removing the loser must not free the owner's path.
     fx.pc.send(KernelCommand::RemoveTask(b));
-    assert_eq!(resolve(&fx.pc, "/x").await, Some(a));
+    assert_eq!(resolve(&fx.pc, "x").await, Some(a));
 
     fx.quit(handle).await;
   }
@@ -2347,7 +2347,7 @@ mod tests {
   #[tokio::test]
   async fn stale_started_report_is_ignored() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let handle = fx.run();
 
     fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
@@ -2372,7 +2372,7 @@ mod tests {
   #[tokio::test]
   async fn kill_hard_kills_and_unpins() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let handle = fx.run();
 
     fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
@@ -2397,21 +2397,21 @@ mod tests {
       "c",
       TaskDef {
         restart: RestartMode::OnFailure,
-        ..path_def("/c")
+        ..path_def("c")
       },
     );
     let b = fx.add(
       "b",
       TaskDef {
         deps: vec![c],
-        ..path_def("/b")
+        ..path_def("b")
       },
     );
     let a = fx.add(
       "a",
       TaskDef {
         deps: vec![b],
-        ..path_def("/a")
+        ..path_def("a")
       },
     );
     let handle = fx.run();
@@ -2436,12 +2436,12 @@ mod tests {
   #[tokio::test]
   async fn add_edge_to_running_dependent_gates_it() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let dep = fx.add(
       "dep",
       TaskDef {
         ready: ReadyMode::Reported,
-        ..path_def("/dep")
+        ..path_def("dep")
       },
     );
     let handle = fx.run();
@@ -2471,19 +2471,19 @@ mod tests {
   #[tokio::test]
   async fn veto_of_leaf_dep_tears_down_chain_in_order() {
     let mut fx = Fixture::new();
-    let c = fx.add("c", path_def("/c"));
+    let c = fx.add("c", path_def("c"));
     let b = fx.add(
       "b",
       TaskDef {
         deps: vec![c],
-        ..path_def("/b")
+        ..path_def("b")
       },
     );
     let a = fx.add(
       "a",
       TaskDef {
         deps: vec![b],
-        ..path_def("/a")
+        ..path_def("a")
       },
     );
     let handle = fx.run();
@@ -2505,12 +2505,12 @@ mod tests {
   #[tokio::test]
   async fn stop_of_required_task_bounces_it() {
     let mut fx = Fixture::new();
-    let dep = fx.add("dep", path_def("/dep"));
+    let dep = fx.add("dep", path_def("dep"));
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -2539,12 +2539,12 @@ mod tests {
   #[tokio::test]
   async fn restart_of_dep_bounces_it_and_its_dependent() {
     let mut fx = Fixture::new();
-    let dep = fx.add("dep", path_def("/dep"));
+    let dep = fx.add("dep", path_def("dep"));
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -2573,12 +2573,12 @@ mod tests {
   #[tokio::test]
   async fn restart_pins_like_start() {
     let mut fx = Fixture::new();
-    let dep = fx.add("dep", path_def("/dep"));
+    let dep = fx.add("dep", path_def("dep"));
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -2611,12 +2611,12 @@ mod tests {
   #[tokio::test]
   async fn stop_unpins_so_revival_is_temporary() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let b = fx.add(
       "b",
       TaskDef {
         deps: vec![a],
-        ..path_def("/b")
+        ..path_def("b")
       },
     );
     let handle = fx.run();
@@ -2642,7 +2642,7 @@ mod tests {
   #[tokio::test]
   async fn remove_of_running_task_hard_kills_it() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let handle = fx.run();
 
     fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
@@ -2664,7 +2664,7 @@ mod tests {
       .kernel
       .as_mut()
       .unwrap()
-      .register_task(path_def("/a"), |_| {
+      .register_task(path_def("a"), |_| {
         let (tx, rx) = unbounded_channel();
         drop(rx);
         Box::new(ChannelTask::new(tx))
@@ -2690,7 +2690,7 @@ mod tests {
       .kernel
       .as_mut()
       .unwrap()
-      .register_task(path_def("/a"), move |_| {
+      .register_task(path_def("a"), move |_| {
         Box::new(StubbornTask { name: "a", tx })
       });
     let handle = fx.run();
@@ -2724,7 +2724,7 @@ mod tests {
       .kernel
       .as_mut()
       .unwrap()
-      .register_task(path_def("/a"), move |_| {
+      .register_task(path_def("a"), move |_| {
         Box::new(SilentTask { name: "a", tx })
       });
     let handle = fx.run();
@@ -2750,7 +2750,7 @@ mod tests {
       .kernel
       .as_mut()
       .unwrap()
-      .register_task(path_def("/a"), move |_| {
+      .register_task(path_def("a"), move |_| {
         Box::new(SilentTask { name: "a", tx })
       });
     let handle = fx.run();
@@ -2774,7 +2774,7 @@ mod tests {
       .kernel
       .as_mut()
       .unwrap()
-      .register_task(path_def("/a"), move |_| {
+      .register_task(path_def("a"), move |_| {
         Box::new(StubbornTask { name: "a", tx })
       });
     let handle = fx.run();
@@ -2814,16 +2814,16 @@ mod tests {
   #[tokio::test]
   async fn job_success_beats_stop_decided_in_same_step() {
     let mut fx = Fixture::new();
-    let d = fx.add("d", path_def("/d"));
+    let d = fx.add("d", path_def("d"));
     let tx = fx.tx.clone();
     let j = fx.kernel.as_mut().unwrap().register_task(
       TaskDef {
         kind: TaskKind::Job,
         deps: vec![d],
-        ..path_def("/j")
+        ..path_def("j")
       },
       move |ctx| {
-        ctx.subscribe_path(TaskPath::new("/d").unwrap(), SubMode::Subtree);
+        ctx.subscribe_path(TaskPath::new("d").unwrap(), SubMode::Subtree);
         Box::new(ExitOnNotify { name: "j", tx })
       },
     );
@@ -2854,14 +2854,14 @@ mod tests {
       "dep",
       TaskDef {
         ready: ReadyMode::Reported,
-        ..path_def("/dep")
+        ..path_def("dep")
       },
     );
     let app = fx.add(
       "app",
       TaskDef {
         deps: vec![dep],
-        ..path_def("/app")
+        ..path_def("app")
       },
     );
     let handle = fx.run();
@@ -2872,7 +2872,7 @@ mod tests {
 
     let rx = fx
       .pc
-      .query(KernelQuery::Explain(TaskPath::new("/app").unwrap()));
+      .query(KernelQuery::Explain(TaskPath::new("app").unwrap()));
     let resp = tokio::time::timeout(Duration::from_secs(1), rx)
       .await
       .unwrap()
@@ -2888,7 +2888,7 @@ mod tests {
     assert!(explain.pinned);
     assert!(!explain.vetoed);
     assert_eq!(explain.deps.len(), 1);
-    assert_eq!(explain.deps[0].name, "/dep");
+    assert_eq!(explain.deps[0].name, "dep");
     assert_eq!(explain.deps[0].state, TaskState::Running);
     assert!(explain.deps[0].wanted);
     assert!(!explain.deps[0].satisfied);
@@ -2934,13 +2934,13 @@ mod tests {
   #[test]
   fn glob_selector_pins_exactly_the_matches() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
-    let ab = fx.add("ab", path_def("/ab"));
-    let b = fx.add("b", path_def("/b"));
+    let a = fx.add("a", path_def("a"));
+    let ab = fx.add("ab", path_def("ab"));
+    let b = fx.add("b", path_def("b"));
     let mut kernel = fx.kernel.take().unwrap();
 
     let n = turn_matching(&mut kernel, |ack| {
-      KernelCommand::Start(TaskSelector::Glob("/a".to_string()), ack)
+      KernelCommand::Start(TaskSelector::Glob("a".to_string()), ack)
     });
     assert_eq!(n, 1);
     assert!(pinned(&kernel, a));
@@ -2948,7 +2948,7 @@ mod tests {
     assert!(!pinned(&kernel, b));
 
     let n = turn_matching(&mut kernel, |ack| {
-      KernelCommand::Start(TaskSelector::Glob("/*".to_string()), ack)
+      KernelCommand::Start(TaskSelector::Glob("*".to_string()), ack)
     });
     assert_eq!(n, 3);
     assert!(pinned(&kernel, ab));
@@ -2958,9 +2958,9 @@ mod tests {
   #[test]
   fn tag_and_all_selectors() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", tagged_def("/a", "web"));
-    let b = fx.add("b", tagged_def("/b", "web"));
-    let c = fx.add("c", path_def("/c"));
+    let a = fx.add("a", tagged_def("a", "web"));
+    let b = fx.add("b", tagged_def("b", "web"));
+    let c = fx.add("c", path_def("c"));
     let mut kernel = fx.kernel.take().unwrap();
 
     let n = turn_matching(&mut kernel, |ack| {
@@ -2988,7 +2988,7 @@ mod tests {
   #[test]
   fn id_selector_matches_only_a_live_task() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
+    let a = fx.add("a", path_def("a"));
     let never_registered = fx.pc.alloc_id();
     let mut kernel = fx.kernel.take().unwrap();
 
@@ -3017,8 +3017,8 @@ mod tests {
   #[test]
   fn commands_on_a_removed_id_leave_no_edges() {
     let mut fx = Fixture::new();
-    let a = fx.add("a", path_def("/a"));
-    let b = fx.add("b", path_def("/b"));
+    let a = fx.add("a", path_def("a"));
+    let b = fx.add("b", path_def("b"));
     let mut kernel = fx.kernel.take().unwrap();
 
     turn(&mut kernel, KernelCommand::RemoveTask(a));
@@ -3043,9 +3043,9 @@ mod tests {
   #[tokio::test]
   async fn start_matching_tag_starts_the_tagged_tasks() {
     let mut fx = Fixture::new();
-    fx.add("a", tagged_def("/a", "web"));
-    fx.add("b", tagged_def("/b", "web"));
-    fx.add("c", path_def("/c"));
+    fx.add("a", tagged_def("a", "web"));
+    fx.add("b", tagged_def("b", "web"));
+    fx.add("c", path_def("c"));
     let handle = fx.run();
 
     let (tx, rx) = tokio::sync::oneshot::channel();

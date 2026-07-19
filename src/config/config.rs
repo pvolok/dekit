@@ -9,9 +9,6 @@ use crate::config::log::LogConfig;
 use crate::config::proc::{ProcConfig, parse_proc_settings, proc_from_cfg};
 use crate::config::tui::TuiConfig;
 
-/// Container that non-absolute task names resolve under.
-pub const TASK_ROOT: &str = "/home";
-
 pub struct Config {
   pub log: LogConfig,
   pub procs: Vec<ProcConfig>,

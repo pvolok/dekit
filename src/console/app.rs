@@ -5,7 +5,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
   config::{
-    config::{Config, TASK_ROOT},
+    config::Config,
     proc::{AUTOSTART_TAG, CmdConfig, ProcConfig},
     proc_log::LogMode,
   },
@@ -126,9 +126,7 @@ impl App {
   }
 
   async fn main_loop(mut self) -> anyhow::Result<()> {
-    self
-      .pc
-      .subscribe_path(TaskPath::new("/").unwrap(), SubMode::Subtree);
+    self.pc.subscribe_path(TaskPath::root(), SubMode::Subtree);
     self.refresh_procs().await;
 
     self.start_procs()?;
@@ -232,9 +230,7 @@ impl App {
         },
       );
     }
-    self
-      .pc
-      .unsubscribe_path(TaskPath::new("/").unwrap(), SubMode::Subtree);
+    self.pc.unsubscribe_path(TaskPath::root(), SubMode::Subtree);
 
     Ok(())
   }
@@ -308,8 +304,11 @@ impl App {
     pinned: bool,
   ) {
     let merged = self.config.proc_defaults.clone().overlay(cfg);
-    let path = TaskPath::resolve(TASK_ROOT, &merged.path)
-      .or_else(|_| TaskPath::resolve(TASK_ROOT, &task_id.0.to_string()))
+    // Legacy mprocs proc names are arbitrary strings, so fall back to the
+    // task id when the name is not a valid path. Dekit configs validate
+    // paths at parse time, so the fallback never fires for them.
+    let path = TaskPath::new(&merged.path)
+      .or_else(|_| TaskPath::new(task_id.0.to_string()))
       .ok();
     let _ = spawn_proc_task_with_id(
       &self.pc,
@@ -509,7 +508,9 @@ impl App {
     unit: KernelScrollUnit,
   ) {
     if let Some(proc) = self.state.get_current_proc() {
-      self.pc.send_msg(proc.id, TaskScreenCmd::Scroll { delta, unit });
+      self
+        .pc
+        .send_msg(proc.id, TaskScreenCmd::Scroll { delta, unit });
       loop_action.render();
     }
   }

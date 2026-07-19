@@ -107,8 +107,8 @@ fn assert_dir_has_no_lock(runtime: &Path) {
 fn spawn_race_has_exactly_one_winner() {
   let daemon = Daemon::start("sr");
 
-  let a = daemon.spawn(&["spawn", "/same", "--", "sleep", "30"]);
-  let b = daemon.spawn(&["spawn", "/same", "--", "sleep", "30"]);
+  let a = daemon.spawn(&["spawn", "same", "--", "sleep", "30"]);
+  let b = daemon.spawn(&["spawn", "same", "--", "sleep", "30"]);
   let outs = [a.wait_with_output().unwrap(), b.wait_with_output().unwrap()];
 
   let winners = outs.iter().filter(|o| o.status.success()).count();
@@ -136,9 +136,9 @@ fn start_races_spawn_and_down_without_internal_errors() {
   let daemon = Daemon::start("ch");
 
   for i in 0..10 {
-    let path = format!("/x/{}", i);
+    let path = format!("x/{}", i);
     let spawner = daemon.spawn(&["spawn", &path, "--", "sleep", "30"]);
-    let starter = daemon.spawn(&["start", "/x/*"]);
+    let starter = daemon.spawn(&["start", "x/*"]);
 
     let spawn_out = spawner.wait_with_output().unwrap();
     assert!(
@@ -157,7 +157,7 @@ fn start_races_spawn_and_down_without_internal_errors() {
       stderr_of(&start_out)
     );
 
-    let stop_out = daemon.run(&["stop", "/x/*"]);
+    let stop_out = daemon.run(&["stop", "x/*"]);
     assert!(
       stop_out.status.success(),
       "stop failed: {}",

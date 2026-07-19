@@ -10,6 +10,14 @@ struct TrieNode {
   children: BTreeMap<String, TrieNode>,
 }
 
+fn join(prefix: &str, component: &str) -> String {
+  if prefix.is_empty() {
+    component.to_string()
+  } else {
+    format!("{}/{}", prefix, component)
+  }
+}
+
 impl TrieNode {
   fn new() -> Self {
     Self {
@@ -30,12 +38,7 @@ impl TrieNode {
       }
     }
     for (component, child) in &self.children {
-      let child_path = if prefix == "/" {
-        format!("/{}", component)
-      } else {
-        format!("{}/{}", prefix, component)
-      };
-      child.collect_all(&child_path, result);
+      child.collect_all(&join(prefix, component), result);
     }
   }
 
@@ -64,33 +67,18 @@ impl TrieNode {
       self.glob_walk(prefix, rest, result);
       // Match one or more components
       for (component, child) in &self.children {
-        let child_path = if prefix == "/" {
-          format!("/{}", component)
-        } else {
-          format!("{}/{}", prefix, component)
-        };
         // Continue with ** (match more) and with rest (done matching **)
-        child.glob_walk(&child_path, pattern, result);
+        child.glob_walk(&join(prefix, component), pattern, result);
       }
     } else if pat == "*" {
       // Match exactly one component
       for (component, child) in &self.children {
-        let child_path = if prefix == "/" {
-          format!("/{}", component)
-        } else {
-          format!("{}/{}", prefix, component)
-        };
-        child.glob_walk(&child_path, rest, result);
+        child.glob_walk(&join(prefix, component), rest, result);
       }
     } else {
       // Literal match
       if let Some(child) = self.children.get(pat) {
-        let child_path = if prefix == "/" {
-          format!("/{}", pat)
-        } else {
-          format!("{}/{}", prefix, pat)
-        };
-        child.glob_walk(&child_path, rest, result);
+        child.glob_walk(&join(prefix, pat), rest, result);
       }
     }
   }
@@ -214,27 +202,18 @@ impl PathTrie {
     let mut result = Vec::new();
     // Collect from children, not the node itself
     for (component, child) in &node.children {
-      let child_path = if path.as_str() == "/" {
-        format!("/{}", component)
-      } else {
-        format!("{}/{}", path.as_str(), component)
-      };
-      child.collect_all(&child_path, &mut result);
+      child.collect_all(&join(path.as_str(), component), &mut result);
     }
     result
   }
 
   /// Find all tasks whose paths match a glob pattern, sorted by path.
-  /// Pattern must start with `/`.
   /// Supports `*` (single component) and `**` (recursive).
   pub fn glob(&self, pattern: &str) -> Vec<(TaskPath, TaskId)> {
-    if !pattern.starts_with('/') {
-      return Vec::new();
-    }
     let parts: Vec<&str> =
-      pattern[1..].split('/').filter(|c| !c.is_empty()).collect();
+      pattern.split('/').filter(|c| !c.is_empty()).collect();
     let mut result = Vec::new();
-    self.root.glob_walk("/", &parts, &mut result);
+    self.root.glob_walk("", &parts, &mut result);
     // A path can match through several `**` derivations.
     result.sort();
     result.dedup();
@@ -244,7 +223,7 @@ impl PathTrie {
   /// Iterate all (path, task_id) pairs in sorted order (DFS over BTreeMap).
   pub fn iter(&self) -> Vec<(TaskPath, TaskId)> {
     let mut result = Vec::new();
-    self.root.collect_all("/", &mut result);
+    self.root.collect_all("", &mut result);
     result
   }
 
@@ -268,63 +247,63 @@ mod tests {
   #[test]
   fn test_insert_and_resolve() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("/web"), TaskId(1)).unwrap();
-    trie.insert(&path("/services/api"), TaskId(2)).unwrap();
-    trie.insert(&path("/services/worker"), TaskId(3)).unwrap();
+    trie.insert(&path("web"), TaskId(1)).unwrap();
+    trie.insert(&path("services/api"), TaskId(2)).unwrap();
+    trie.insert(&path("services/worker"), TaskId(3)).unwrap();
 
-    assert_eq!(trie.resolve(&path("/web")), Some(TaskId(1)));
-    assert_eq!(trie.resolve(&path("/services/api")), Some(TaskId(2)));
-    assert_eq!(trie.resolve(&path("/services/worker")), Some(TaskId(3)));
-    assert_eq!(trie.resolve(&path("/missing")), None);
-    assert_eq!(trie.resolve(&path("/services")), None); // intermediate node
+    assert_eq!(trie.resolve(&path("web")), Some(TaskId(1)));
+    assert_eq!(trie.resolve(&path("services/api")), Some(TaskId(2)));
+    assert_eq!(trie.resolve(&path("services/worker")), Some(TaskId(3)));
+    assert_eq!(trie.resolve(&path("missing")), None);
+    assert_eq!(trie.resolve(&path("services")), None); // intermediate node
   }
 
   #[test]
   fn test_insert_conflict() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("/web"), TaskId(1)).unwrap();
-    let err = trie.insert(&path("/web"), TaskId(2)).unwrap_err();
+    trie.insert(&path("web"), TaskId(1)).unwrap();
+    let err = trie.insert(&path("web"), TaskId(2)).unwrap_err();
     assert_eq!(err.existing_id, TaskId(1));
   }
 
   #[test]
   fn test_remove() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("/a/b"), TaskId(1)).unwrap();
-    trie.insert(&path("/a/c"), TaskId(2)).unwrap();
+    trie.insert(&path("a/b"), TaskId(1)).unwrap();
+    trie.insert(&path("a/c"), TaskId(2)).unwrap();
 
-    assert_eq!(trie.remove(&path("/a/b")), Some(TaskId(1)));
-    assert_eq!(trie.resolve(&path("/a/b")), None);
+    assert_eq!(trie.remove(&path("a/b")), Some(TaskId(1)));
+    assert_eq!(trie.resolve(&path("a/b")), None);
     // /a/c still exists
-    assert_eq!(trie.resolve(&path("/a/c")), Some(TaskId(2)));
+    assert_eq!(trie.resolve(&path("a/c")), Some(TaskId(2)));
 
     // Remove remaining child; /a should be pruned
-    assert_eq!(trie.remove(&path("/a/c")), Some(TaskId(2)));
-    assert_eq!(trie.resolve(&path("/a/c")), None);
+    assert_eq!(trie.remove(&path("a/c")), Some(TaskId(2)));
+    assert_eq!(trie.resolve(&path("a/c")), None);
   }
 
   #[test]
   fn test_remove_nonexistent() {
     let mut trie = PathTrie::new();
-    assert_eq!(trie.remove(&path("/nope")), None);
+    assert_eq!(trie.remove(&path("nope")), None);
   }
 
   #[test]
   fn test_children() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("/services/api"), TaskId(1)).unwrap();
-    trie.insert(&path("/services/web"), TaskId(2)).unwrap();
-    trie.insert(&path("/services/web/v2"), TaskId(3)).unwrap();
-    trie.insert(&path("/tools/lint"), TaskId(4)).unwrap();
+    trie.insert(&path("services/api"), TaskId(1)).unwrap();
+    trie.insert(&path("services/web"), TaskId(2)).unwrap();
+    trie.insert(&path("services/web/v2"), TaskId(3)).unwrap();
+    trie.insert(&path("tools/lint"), TaskId(4)).unwrap();
 
-    let root_children = trie.children(&path("/"));
+    let root_children = trie.children(&TaskPath::root());
     assert_eq!(root_children.len(), 2); // services, tools
     assert_eq!(root_children[0].0, "services");
     assert_eq!(root_children[0].1, None); // intermediate
     assert_eq!(root_children[1].0, "tools");
     assert_eq!(root_children[1].1, None);
 
-    let svc_children = trie.children(&path("/services"));
+    let svc_children = trie.children(&path("services"));
     assert_eq!(svc_children.len(), 2); // api, web
     assert_eq!(svc_children[0], ("api".to_string(), Some(TaskId(1))));
     assert_eq!(svc_children[1], ("web".to_string(), Some(TaskId(2))));
@@ -333,74 +312,74 @@ mod tests {
   #[test]
   fn test_descendants() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("/services/api"), TaskId(1)).unwrap();
-    trie.insert(&path("/services/web"), TaskId(2)).unwrap();
-    trie.insert(&path("/services/web/v2"), TaskId(3)).unwrap();
-    trie.insert(&path("/tools/lint"), TaskId(4)).unwrap();
+    trie.insert(&path("services/api"), TaskId(1)).unwrap();
+    trie.insert(&path("services/web"), TaskId(2)).unwrap();
+    trie.insert(&path("services/web/v2"), TaskId(3)).unwrap();
+    trie.insert(&path("tools/lint"), TaskId(4)).unwrap();
 
-    let desc = trie.descendants(&path("/services"));
+    let desc = trie.descendants(&path("services"));
     assert_eq!(desc.len(), 3);
-    assert_eq!(desc[0], (path("/services/api"), TaskId(1)));
-    assert_eq!(desc[1], (path("/services/web"), TaskId(2)));
-    assert_eq!(desc[2], (path("/services/web/v2"), TaskId(3)));
+    assert_eq!(desc[0], (path("services/api"), TaskId(1)));
+    assert_eq!(desc[1], (path("services/web"), TaskId(2)));
+    assert_eq!(desc[2], (path("services/web/v2"), TaskId(3)));
   }
 
   #[test]
   fn test_glob_star() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("/services/api"), TaskId(1)).unwrap();
-    trie.insert(&path("/services/web"), TaskId(2)).unwrap();
-    trie.insert(&path("/services/web/v2"), TaskId(3)).unwrap();
-    trie.insert(&path("/tools/lint"), TaskId(4)).unwrap();
+    trie.insert(&path("services/api"), TaskId(1)).unwrap();
+    trie.insert(&path("services/web"), TaskId(2)).unwrap();
+    trie.insert(&path("services/web/v2"), TaskId(3)).unwrap();
+    trie.insert(&path("tools/lint"), TaskId(4)).unwrap();
 
-    let results = trie.glob("/services/*");
+    let results = trie.glob("services/*");
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0], (path("/services/api"), TaskId(1)));
-    assert_eq!(results[1], (path("/services/web"), TaskId(2)));
+    assert_eq!(results[0], (path("services/api"), TaskId(1)));
+    assert_eq!(results[1], (path("services/web"), TaskId(2)));
   }
 
   #[test]
   fn test_glob_double_star() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("/services/api"), TaskId(1)).unwrap();
-    trie.insert(&path("/services/web"), TaskId(2)).unwrap();
-    trie.insert(&path("/services/web/v2"), TaskId(3)).unwrap();
-    trie.insert(&path("/tools/lint"), TaskId(4)).unwrap();
+    trie.insert(&path("services/api"), TaskId(1)).unwrap();
+    trie.insert(&path("services/web"), TaskId(2)).unwrap();
+    trie.insert(&path("services/web/v2"), TaskId(3)).unwrap();
+    trie.insert(&path("tools/lint"), TaskId(4)).unwrap();
 
-    let results = trie.glob("/services/**");
+    let results = trie.glob("services/**");
     assert_eq!(results.len(), 3);
 
-    let results = trie.glob("/**");
+    let results = trie.glob("**");
     assert_eq!(results.len(), 4);
 
     // Several `**` derivations can match the same path; no duplicates.
-    let results = trie.glob("/**/**");
+    let results = trie.glob("**/**");
     assert_eq!(results.len(), 4);
   }
 
   #[test]
   fn test_glob_mixed() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("/a/b/c"), TaskId(1)).unwrap();
-    trie.insert(&path("/a/x/c"), TaskId(2)).unwrap();
-    trie.insert(&path("/a/b/d"), TaskId(3)).unwrap();
+    trie.insert(&path("a/b/c"), TaskId(1)).unwrap();
+    trie.insert(&path("a/x/c"), TaskId(2)).unwrap();
+    trie.insert(&path("a/b/d"), TaskId(3)).unwrap();
 
-    let results = trie.glob("/a/*/c");
+    let results = trie.glob("a/*/c");
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0], (path("/a/b/c"), TaskId(1)));
-    assert_eq!(results[1], (path("/a/x/c"), TaskId(2)));
+    assert_eq!(results[0], (path("a/b/c"), TaskId(1)));
+    assert_eq!(results[1], (path("a/x/c"), TaskId(2)));
   }
 
   #[test]
   fn test_iter_sorted() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("/z"), TaskId(1)).unwrap();
-    trie.insert(&path("/a/b"), TaskId(2)).unwrap();
-    trie.insert(&path("/a/a"), TaskId(3)).unwrap();
-    trie.insert(&path("/m"), TaskId(4)).unwrap();
+    trie.insert(&path("z"), TaskId(1)).unwrap();
+    trie.insert(&path("a/b"), TaskId(2)).unwrap();
+    trie.insert(&path("a/a"), TaskId(3)).unwrap();
+    trie.insert(&path("m"), TaskId(4)).unwrap();
 
     let items = trie.iter();
     let paths: Vec<&str> = items.iter().map(|(p, _)| p.as_str()).collect();
-    assert_eq!(paths, vec!["/a/a", "/a/b", "/m", "/z"]);
+    assert_eq!(paths, vec!["a/a", "a/b", "m", "z"]);
   }
 }

@@ -201,7 +201,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         .arg(
           Arg::new("path")
             .required(true)
-            .help("Task path (e.g. /services/web)"),
+            .help("Task path (e.g. services/web)"),
         )
         .arg(
           Arg::new("cwd")
@@ -313,7 +313,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
     )
     .after_help(
       "SELECTORS\n  \
-       A pattern is a task path (/services/web), a glob (/services/*), or\n  \
+       A pattern is a task path (services/web), a glob (services/*), or\n  \
        a #tag (#backend). The surgical verbs (start, stop, kill, veto,\n  \
        restart) require a pattern; the workday verbs (up, down) default to\n  \
        the autostart set / everything.\n\
