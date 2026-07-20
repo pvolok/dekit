@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde_yaml::Value;
 
-pub use crate::config::proc_log::{LogMode, ProcLogConfig as LogConfig};
+pub use crate::config::task_log::{LogMode, TaskLogConfig as LogConfig};
 use crate::mprocs::yaml_val::Val;
 
 pub fn parse_log_config<F>(

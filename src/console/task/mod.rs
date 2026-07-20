@@ -4,7 +4,7 @@ use anyhow::bail;
 
 use crate::cfg::{CfgCx, CfgNode, FromCfg};
 use crate::mprocs::yaml_val::Val;
-pub use crate::task::proc_task::{Sig, StopSignal};
+pub use crate::task::process_task::{Sig, StopSignal};
 use crate::term::key::KeySpec;
 
 impl StopSignal {

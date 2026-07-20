@@ -4,21 +4,21 @@ use anyhow::{Result, bail};
 use indexmap::IndexMap;
 
 use crate::cfg::{CfgCx, CfgNode, CfgObj};
-use crate::config::proc_log::ProcLogConfig;
-use crate::console::proc::StopSignal;
+use crate::config::task_log::TaskLogConfig;
+use crate::console::task::StopSignal;
 use crate::parse_shell::split_argv;
 use crate::process::process_spec::ProcessSpec;
 
 const DEFAULT_SCROLLBACK_LEN: usize = 1000;
 const DEFAULT_MOUSE_SCROLL_SPEED: usize = 5;
 
-/// Tag for procs started on `dekit up` / at launch.
+/// Tag for tasks started on `dekit up` / at launch.
 pub const AUTOSTART_TAG: &str = "autostart";
 /// Tag for tasks spawned over RPC.
 pub const USER_TAG: &str = "user";
 
 #[derive(Clone, Default)]
-pub struct ProcConfig {
+pub struct TaskConfig {
   pub path: String,
   pub cmd: Option<CmdConfig>,
   pub deps: Vec<String>,
@@ -29,18 +29,18 @@ pub struct ProcConfig {
   pub add_path: Option<Vec<PathBuf>>,
   pub autostart: Option<bool>,
   pub autorestart: Option<bool>,
-  /// Readiness probe: the proc is ready once an output line contains this
+  /// Readiness probe: the task is ready once an output line contains this
   /// string; until then dependents wait.
   pub ready_log: Option<String>,
   pub stop: Option<StopSignal>,
-  pub log: Option<ProcLogConfig>,
+  pub log: Option<TaskLogConfig>,
   pub scrollback_len: Option<usize>,
   pub mouse_scroll_speed: Option<usize>,
 }
 
-impl ProcConfig {
-  pub fn overlay(self, over: ProcConfig) -> ProcConfig {
-    ProcConfig {
+impl TaskConfig {
+  pub fn overlay(self, over: TaskConfig) -> TaskConfig {
+    TaskConfig {
       path: if over.path.is_empty() {
         self.path
       } else {
@@ -92,11 +92,11 @@ impl ProcConfig {
   }
 }
 
-pub(crate) fn parse_proc_settings(
+pub(crate) fn parse_task_settings(
   obj: &CfgObj<'_>,
   cx: &CfgCx,
-) -> Result<ProcConfig> {
-  let mut p = ProcConfig::default();
+) -> Result<TaskConfig> {
+  let mut p = TaskConfig::default();
   if let Some(cwd) = obj.get("cwd") {
     p.cwd = Some(cx.resolve_path(cwd.as_str()?).into_os_string());
   }
@@ -112,15 +112,15 @@ pub(crate) fn parse_proc_settings(
   Ok(p)
 }
 
-pub(crate) fn proc_from_cfg(
+pub(crate) fn task_from_cfg(
   path: String,
   node: &CfgNode<'_>,
   cx: &CfgCx,
-) -> Result<ProcConfig> {
+) -> Result<TaskConfig> {
   let obj = node.as_obj()?;
-  let mut p = parse_proc_settings(&obj, cx)?;
+  let mut p = parse_task_settings(&obj, cx)?;
   if let Err(err) = crate::kernel::task_path::TaskPath::new(path.as_str()) {
-    bail!("proc '{}': {}", path, err);
+    bail!("task '{}': {}", path, err);
   }
   p.path = path;
   p.cmd = Some(cmd_from_cfg(node)?);
@@ -147,9 +147,9 @@ fn cmd_from_cfg(node: &CfgNode<'_>) -> Result<CmdConfig> {
       };
       Ok(CmdConfig::Cmd { cmd: argv })
     }
-    (None, None) => bail!(obj.error("process must define 'cmd' or 'shell'")),
+    (None, None) => bail!(obj.error("task must define 'cmd' or 'shell'")),
     (Some(_), Some(_)) => {
-      bail!(obj.error("process must define only one of 'cmd' or 'shell'"))
+      bail!(obj.error("task must define only one of 'cmd' or 'shell'"))
     }
   }
 }
@@ -160,8 +160,8 @@ pub enum CmdConfig {
   Shell { shell: String },
 }
 
-impl From<&ProcConfig> for ProcessSpec {
-  fn from(cfg: &ProcConfig) -> Self {
+impl From<&TaskConfig> for ProcessSpec {
+  fn from(cfg: &TaskConfig) -> Self {
     let mut cmd = match &cfg.cmd {
       Some(CmdConfig::Cmd { cmd }) => ProcessSpec::from_argv(cmd.clone()),
       Some(CmdConfig::Shell { shell }) => cmd_from_shell(shell),
@@ -179,7 +179,7 @@ impl From<&ProcConfig> for ProcessSpec {
     }
 
     if let Some(add_path) = cfg.add_path.as_ref().filter(|p| !p.is_empty()) {
-      // Base PATH is the proc's own `env` override if it sets one, otherwise
+      // Base PATH is the task's own `env` override if it sets one, otherwise
       // the ambient PATH resolved at spawn time.
       let base = cfg
         .env
@@ -228,7 +228,7 @@ mod tests {
     let mut env = IndexMap::new();
     env.insert("PATH".to_string(), Some("/base/bin".to_string()));
 
-    let cfg = ProcConfig {
+    let cfg = TaskConfig {
       cmd: Some(CmdConfig::Cmd {
         cmd: vec!["true".to_string()],
       }),

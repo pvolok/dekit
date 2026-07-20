@@ -2,23 +2,23 @@ use crate::config::config::Config;
 use crate::config::hook::Hook;
 use crate::config::keymap::KeymapConfig;
 use crate::config::log::LogConfig;
-use crate::config::proc::{CmdConfig, ProcConfig};
-use crate::config::tui::{ProcListConfig, TipsConfig, TuiConfig};
+use crate::config::task::{CmdConfig, TaskConfig};
+use crate::config::tui::{SidebarConfig, TipsConfig, TuiConfig};
 
 impl From<crate::mprocs::config::Config> for Config {
   fn from(legacy: crate::mprocs::config::Config) -> Self {
-    let proc_defaults = ProcConfig {
+    let defaults = TaskConfig {
       log: legacy.proc_log,
       scrollback_len: Some(legacy.scrollback_len),
       mouse_scroll_speed: Some(legacy.mouse_scroll_speed),
-      ..ProcConfig::default()
+      ..TaskConfig::default()
     };
     Config {
       log: LogConfig::default(),
-      procs: legacy.procs.into_iter().map(ProcConfig::from).collect(),
-      proc_defaults,
+      tasks: legacy.procs.into_iter().map(TaskConfig::from).collect(),
+      defaults,
       tui: TuiConfig {
-        procs: ProcListConfig {
+        sidebar: SidebarConfig {
           title: legacy.proc_list_title,
           width: legacy.proc_list_width,
         },
@@ -34,9 +34,9 @@ impl From<crate::mprocs::config::Config> for Config {
   }
 }
 
-impl From<crate::mprocs::config::ProcConfig> for ProcConfig {
+impl From<crate::mprocs::config::ProcConfig> for TaskConfig {
   fn from(legacy: crate::mprocs::config::ProcConfig) -> Self {
-    ProcConfig {
+    TaskConfig {
       path: legacy.name,
       cmd: Some(legacy.cmd.into()),
       deps: legacy.deps,

@@ -3,7 +3,7 @@ use crate::kernel::{
   task::{TaskId, TaskState},
 };
 
-pub struct ProcView {
+pub struct TaskView {
   pub id: TaskId,
   pub name: String,
 
@@ -16,7 +16,7 @@ pub struct ProcView {
   pub changed: bool,
 }
 
-impl ProcView {
+impl TaskView {
   pub fn new(
     id: TaskId,
     name: String,

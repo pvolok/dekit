@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 use serde_yaml::Value;
 
 use crate::console::action::Action;
-use crate::console::proc::{Sig, StopSignal};
+use crate::console::task::{Sig, StopSignal};
 use crate::mprocs::{
   event::AppEvent,
   proc_log_config::LogConfig,

@@ -19,9 +19,9 @@ use crate::term::{Parser, Winsize};
 
 struct ProcExited(ExitInfo);
 
-pub struct ProcInput(pub Key);
+pub struct ProcessInput(pub Key);
 
-pub struct DuplicateProc(pub Option<String>);
+pub struct DuplicateTask(pub Option<String>);
 
 /// An OS signal a `Signal` stop can deliver. The name table and the libc
 /// mapping are generated from one list so they can't drift. On Windows only
@@ -124,7 +124,7 @@ impl StopSignal {
   }
 }
 
-pub struct ProcTaskConfig {
+pub struct ProcessTaskConfig {
   pub spec: ProcessSpec,
   pub label: Option<String>,
   pub stop: StopSignal,
@@ -142,7 +142,7 @@ pub struct ProcTaskConfig {
   pub pinned: bool,
 }
 
-impl ProcTaskConfig {
+impl ProcessTaskConfig {
   pub fn new(spec: ProcessSpec) -> Self {
     Self {
       spec,
@@ -160,23 +160,23 @@ impl ProcTaskConfig {
   }
 }
 
-pub fn spawn_proc_task(
+pub fn spawn_process_task(
   parent: &TaskContext,
   task_path: Option<TaskPath>,
-  config: ProcTaskConfig,
+  config: ProcessTaskConfig,
 ) -> (TaskId, tokio::sync::oneshot::Receiver<bool>) {
   let task_id = parent.alloc_id();
-  let ack = spawn_proc_task_with_id(parent, task_id, task_path, config);
+  let ack = spawn_process_task_with_id(parent, task_id, task_path, config);
   (task_id, ack)
 }
 
-pub fn spawn_proc_task_with_id(
+pub fn spawn_process_task_with_id(
   parent: &TaskContext,
   task_id: TaskId,
   task_path: Option<TaskPath>,
-  config: ProcTaskConfig,
+  config: ProcessTaskConfig,
 ) -> tokio::sync::oneshot::Receiver<bool> {
-  let ProcTaskConfig {
+  let ProcessTaskConfig {
     spec,
     stop,
     log,
@@ -209,7 +209,7 @@ pub fn spawn_proc_task_with_id(
       ..Default::default()
     },
     move |ctx, receiver| async move {
-      proc_main(
+      process_main(
         ctx,
         receiver,
         task_path,
@@ -227,7 +227,7 @@ pub fn spawn_proc_task_with_id(
   )
 }
 
-async fn proc_main(
+async fn process_main(
   ctx: TaskContext,
   mut receiver: UnboundedReceiver<TaskCmd>,
   task_path: Option<TaskPath>,
@@ -329,7 +329,7 @@ async fn proc_main(
             }
             Err(msg) => msg,
           };
-          let msg = match msg.downcast::<ProcInput>() {
+          let msg = match msg.downcast::<ProcessInput>() {
             Ok(input) => {
               if let Some(p) = process.as_mut() {
                 send_key(p, task_screen.vt(), input.0).await;
@@ -338,7 +338,7 @@ async fn proc_main(
             }
             Err(msg) => msg,
           };
-          let msg = match msg.downcast::<DuplicateProc>() {
+          let msg = match msg.downcast::<DuplicateTask>() {
             Ok(dup) => {
               let new_id = ctx.alloc_id();
               let path = match &task_path {
@@ -346,11 +346,11 @@ async fn proc_main(
                 None => TaskPath::new(new_id.0.to_string()),
               }
               .ok();
-              let _ = spawn_proc_task_with_id(
+              let _ = spawn_process_task_with_id(
                 &ctx,
                 new_id,
                 path,
-                ProcTaskConfig {
+                ProcessTaskConfig {
                   spec: spec.clone(),
                   stop: stop.clone(),
                   log: None,
@@ -369,7 +369,7 @@ async fn proc_main(
             Err(msg) => msg,
           };
           let _ = msg;
-          log::error!("ProcTask received unknown Msg");
+          log::error!("ProcessTask received unknown Msg");
         }
       },
 
@@ -660,17 +660,17 @@ mod tests {
       "printf hello-log".to_string(),
     ]);
     let sink_path = log_path.clone();
-    let (id, _) = spawn_proc_task(
+    let (id, _) = spawn_process_task(
       &pc,
       Some(path),
-      ProcTaskConfig {
+      ProcessTaskConfig {
         log: Some(Box::new(move |_pid| {
           Some(LogSink {
             path: sink_path.clone(),
             append: false,
           })
         })),
-        ..ProcTaskConfig::new(spec)
+        ..ProcessTaskConfig::new(spec)
       },
     );
     pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
@@ -688,7 +688,7 @@ mod tests {
       tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // The SIGCHLD waiter isn't running in unit tests, so the proc never
+    // The SIGCHLD waiter isn't running in unit tests, so the task never
     // transitions to Exited on its own; remove it explicitly to unblock quit.
     let id = resolve(&pc, "logged").await;
     pc.send(KernelCommand::RemoveTask(id));
@@ -724,10 +724,10 @@ mod tests {
     let seen_pid = Arc::new(Mutex::new(None::<u32>));
     let cap = seen_pid.clone();
     let log_dir = dir.clone();
-    let (id, _) = spawn_proc_task(
+    let (id, _) = spawn_process_task(
       &pc,
       Some(TaskPath::new("pidlog").unwrap()),
-      ProcTaskConfig {
+      ProcessTaskConfig {
         log: Some(Box::new(move |pid| {
           *cap.lock().unwrap() = Some(pid);
           Some(LogSink {
@@ -735,7 +735,7 @@ mod tests {
             append: false,
           })
         })),
-        ..ProcTaskConfig::new(spec)
+        ..ProcessTaskConfig::new(spec)
       },
     );
     pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
@@ -784,12 +784,12 @@ mod tests {
       "-c".to_string(),
       "sleep 100".to_string(),
     ]);
-    let (id, _) = spawn_proc_task(
+    let (id, _) = spawn_process_task(
       &pc,
       Some(path),
-      ProcTaskConfig {
+      ProcessTaskConfig {
         stop: StopSignal::Cmd(format!("printf done > {}", marker.display())),
-        ..ProcTaskConfig::new(spec)
+        ..ProcessTaskConfig::new(spec)
       },
     );
     pc.send(KernelCommand::Start(TaskSelector::Id(id), None));

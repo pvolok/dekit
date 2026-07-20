@@ -1,12 +1,12 @@
 use crate::console::server_message::ClientId;
 use crate::console::{
-  keymap::KeymapGroup, proc::view::ProcView, widgets::list::ListState,
+  keymap::KeymapGroup, task::view::TaskView, widgets::list::ListState,
 };
 use crate::kernel::task::TaskId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Scope {
-  Procs,
+  Tasks,
   Term,
   TermZoom,
 }
@@ -14,15 +14,15 @@ pub enum Scope {
 impl Scope {
   pub fn toggle(&self) -> Self {
     match self {
-      Scope::Procs => Scope::Term,
-      Scope::Term => Scope::Procs,
-      Scope::TermZoom => Scope::Procs,
+      Scope::Tasks => Scope::Term,
+      Scope::Term => Scope::Tasks,
+      Scope::TermZoom => Scope::Tasks,
     }
   }
 
   pub fn is_zoomed(&self) -> bool {
     match self {
-      Scope::Procs => false,
+      Scope::Tasks => false,
       Scope::Term => false,
       Scope::TermZoom => true,
     }
@@ -33,8 +33,8 @@ pub struct State {
   pub current_client_id: Option<ClientId>,
 
   pub scope: Scope,
-  pub procs: Vec<ProcView>,
-  pub procs_list: ListState,
+  pub tasks: Vec<TaskView>,
+  pub tasks_list: ListState,
   pub hide_keymap_window: bool,
 
   pub quitting: bool,
@@ -42,36 +42,36 @@ pub struct State {
 
 impl State {
   pub fn selected(&self) -> usize {
-    self.procs_list.selected()
+    self.tasks_list.selected()
   }
 
-  pub fn get_current_proc(&self) -> Option<&ProcView> {
-    self.procs.get(self.procs_list.selected())
+  pub fn get_current_task(&self) -> Option<&TaskView> {
+    self.tasks.get(self.tasks_list.selected())
   }
 
-  pub fn select_proc(&mut self, index: usize) {
-    self.procs_list.select(index);
-    if let Some(proc_handle) = self.procs.get_mut(index) {
-      proc_handle.focus();
+  pub fn select_task(&mut self, index: usize) {
+    self.tasks_list.select(index);
+    if let Some(task_handle) = self.tasks.get_mut(index) {
+      task_handle.focus();
     }
   }
 
-  pub fn get_proc_mut(&mut self, id: TaskId) -> Option<&mut ProcView> {
-    self.procs.iter_mut().find(|p| p.id() == id)
+  pub fn get_task_mut(&mut self, id: TaskId) -> Option<&mut TaskView> {
+    self.tasks.iter_mut().find(|p| p.id() == id)
   }
 
   pub fn get_keymap_group(&self) -> KeymapGroup {
     match self.scope {
-      Scope::Procs => KeymapGroup::Procs,
-      Scope::Term | Scope::TermZoom => match self.get_current_proc() {
-        Some(proc) if proc.copy_active() => KeymapGroup::Copy,
+      Scope::Tasks => KeymapGroup::Tasks,
+      Scope::Term | Scope::TermZoom => match self.get_current_task() {
+        Some(task) if task.copy_active() => KeymapGroup::Copy,
         _ => KeymapGroup::Term,
       },
     }
   }
 
-  pub fn all_procs_down(&self) -> bool {
-    self.procs.iter().all(|p| !p.is_up())
+  pub fn all_tasks_down(&self) -> bool {
+    self.tasks.iter().all(|p| !p.is_up())
   }
 
   pub fn toggle_keymap_window(&mut self) {

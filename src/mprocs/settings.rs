@@ -190,53 +190,53 @@ impl Settings {
     s.keymap_add_p(KeyCode::Char('q').into(), Action::Quit);
     s.keymap_add_p(KeyCode::Char('Q').into(), Action::ForceQuit);
     s.keymap_add_p(KeyCode::Char('p').into(), Action::ShowCommandsMenu);
-    s.keymap_add_p(Key::new(KeyCode::Down, KeyMods::NONE), Action::NextProc);
+    s.keymap_add_p(Key::new(KeyCode::Down, KeyMods::NONE), Action::NextTask);
     s.keymap_add_p(
       Key::new(KeyCode::Char('j'), KeyMods::NONE),
-      Action::NextProc,
+      Action::NextTask,
     );
-    s.keymap_add_p(Key::new(KeyCode::Up, KeyMods::NONE), Action::PrevProc);
+    s.keymap_add_p(Key::new(KeyCode::Up, KeyMods::NONE), Action::PrevTask);
     s.keymap_add_p(
       Key::new(KeyCode::Char('k'), KeyMods::NONE),
-      Action::PrevProc,
+      Action::PrevTask,
     );
     s.keymap_add_p(
       Key::new(KeyCode::Char('s'), KeyMods::NONE),
-      Action::StartProc,
+      Action::StartTask,
     );
     s.keymap_add_p(
       Key::new(KeyCode::Char('x'), KeyMods::NONE),
-      Action::StopProc,
+      Action::StopTask,
     );
     s.keymap_add_p(
       Key::new(KeyCode::Char('X'), KeyMods::NONE),
-      Action::KillProc,
+      Action::KillTask,
     );
     s.keymap_add_p(
       Key::new(KeyCode::Char('r'), KeyMods::NONE),
-      Action::RestartProc,
+      Action::RestartTask,
     );
     s.keymap_add_p(
       Key::new(KeyCode::Char('R'), KeyMods::NONE),
-      Action::ForceRestartProc,
+      Action::ForceRestartTask,
     );
     s.keymap_add_p(
       Key::new(KeyCode::Char('e'), KeyMods::NONE),
-      Action::ShowRenameProc,
+      Action::ShowRenameTask,
     );
     let ctrlc = Key::new(KeyCode::Char('c'), KeyMods::CONTROL);
     s.keymap_add_p(ctrlc, Action::SendKey { key: ctrlc });
     s.keymap_add_p(
       Key::new(KeyCode::Char('a'), KeyMods::NONE),
-      Action::ShowAddProc,
+      Action::ShowAddTask,
     );
     s.keymap_add_p(
       Key::new(KeyCode::Char('C'), KeyMods::NONE),
-      Action::DuplicateProc,
+      Action::DuplicateTask,
     );
     s.keymap_add_p(
       Key::new(KeyCode::Char('d'), KeyMods::NONE),
-      Action::ShowRemoveProc,
+      Action::ShowRemoveTask,
     );
 
     // Scrolling in TERM and COPY modes
@@ -294,7 +294,7 @@ impl Settings {
       let char = char::from_digit(i + 1, 10).unwrap();
       s.keymap_add_p(
         Key::new(KeyCode::Char(char), KeyMods::ALT),
-        Action::SelectProc { index: i as usize },
+        Action::SelectTask { index: i as usize },
       );
     }
 

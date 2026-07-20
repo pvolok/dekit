@@ -206,7 +206,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         .arg(
           Arg::new("cwd")
             .long("cwd")
-            .help("Working directory for the process"),
+            .help("Working directory for the task"),
         )
         .arg(
           Arg::new("env")

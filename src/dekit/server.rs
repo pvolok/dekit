@@ -268,7 +268,7 @@ async fn handle_rpc(
       let selector = match pattern {
         Some(pattern) => parse_selector(&pattern)?,
         None => {
-          TaskSelector::Tag(crate::config::proc::AUTOSTART_TAG.to_string())
+          TaskSelector::Tag(crate::config::task::AUTOSTART_TAG.to_string())
         }
       };
       let matched =
@@ -420,14 +420,14 @@ async fn handle_rpc(
           None => spec.env_remove(k),
         }
       }
-      let mut cfg = crate::task::proc_task::ProcTaskConfig::new(spec);
+      let mut cfg = crate::task::process_task::ProcessTaskConfig::new(spec);
       cfg.deps = dep_ids;
-      cfg.tags = std::iter::once(crate::config::proc::USER_TAG.to_string())
+      cfg.tags = std::iter::once(crate::config::task::USER_TAG.to_string())
         .chain(tags)
         .collect();
       cfg.pinned = true;
       let (_id, ack) =
-        crate::task::proc_task::spawn_proc_task(pc, Some(task_path), cfg);
+        crate::task::process_task::spawn_process_task(pc, Some(task_path), cfg);
       match ack.await {
         Ok(true) => {
           serde_json::to_value(SpawnResult { path }).map_err(RpcError::internal)

@@ -1,36 +1,27 @@
-use tui_input::Input;
-
 use crate::console::action::Action;
-use crate::console::{
-  app::LoopAction,
-  state::State,
-  widgets::text_input::{render_text_input, to_input_request},
-};
-use crate::kernel::kernel_message::TaskContext;
+use crate::console::{app::LoopAction, state::State};
+use crate::kernel::{kernel_message::TaskContext, task::TaskId};
 use crate::term::{
   Grid, TermEvent,
   attrs::Attrs,
-  grid::{BorderType, Pos, Rect},
+  grid::{BorderType, Rect},
   key::{Key, KeyCode},
 };
 
 use super::modal::Modal;
 
-pub struct RenameProcModal {
+pub struct RemoveTaskModal {
   pc: TaskContext,
-  input: Input,
+  id: TaskId,
 }
 
-impl RenameProcModal {
-  pub fn new(pc: TaskContext) -> Self {
-    RenameProcModal {
-      pc,
-      input: Input::default(),
-    }
+impl RemoveTaskModal {
+  pub fn new(id: TaskId, pc: TaskContext) -> Self {
+    RemoveTaskModal { pc, id }
   }
 }
 
-impl Modal for RenameProcModal {
+impl Modal for RemoveTaskModal {
   fn handle_input(
     &mut self,
     _state: &mut State,
@@ -39,19 +30,22 @@ impl Modal for RenameProcModal {
   ) -> bool {
     match event {
       TermEvent::Key(Key {
-        code: KeyCode::Enter,
+        code: KeyCode::Char('y'),
         mods,
         ..
       }) if mods.is_empty() => {
         self.pc.send_self_custom(Action::CloseCurrentModal);
-        self.pc.send_self_custom(Action::RenameProc {
-          name: self.input.value().to_string(),
-        });
-        // Skip because RenameProc event will immediately rerender.
+        self.pc.send_self_custom(Action::RemoveTask { id: self.id });
+        // Skip because RemoveTask event will immediately rerender.
         return true;
       }
       TermEvent::Key(Key {
         code: KeyCode::Esc,
+        mods,
+        ..
+      })
+      | TermEvent::Key(Key {
+        code: KeyCode::Char('n'),
         mods,
         ..
       }) if mods.is_empty() => {
@@ -60,13 +54,6 @@ impl Modal for RenameProcModal {
         return true;
       }
       _ => (),
-    }
-
-    let req = to_input_request(event);
-    if let Some(req) = req {
-      self.input.handle(req);
-      loop_action.render();
-      return true;
     }
 
     match event {
@@ -83,32 +70,23 @@ impl Modal for RenameProcModal {
   }
 
   fn get_size(&mut self, _: Rect) -> (u16, u16) {
-    (42, 3)
+    (36, 3)
   }
 
   fn render(&mut self, grid: &mut Grid) {
     let area = self.area(grid.area());
 
     grid.draw_block(area, &BorderType::Thick.chars(), Attrs::default());
-    grid.draw_text(
-      Rect {
-        x: area.x + 1,
-        y: area.y,
-        width: area.width.saturating_sub(2),
-        height: 1,
-      },
-      "Rename process",
-      Attrs::default(),
-    );
 
     let inner = area.inner(1);
 
-    let mut cursor = (0u16, 0u16);
-    render_text_input(&mut self.input, inner, grid, &mut cursor);
-
-    grid.cursor_pos = Some(Pos {
-      col: cursor.0,
-      row: cursor.1,
-    });
+    let txt_area = Rect {
+      x: inner.x,
+      y: inner.y,
+      width: inner.width,
+      height: 1,
+    };
+    grid.fill_area(txt_area, ' ', Attrs::default());
+    grid.draw_text(txt_area, "Remove task? (y/n)", Attrs::default());
   }
 }

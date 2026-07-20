@@ -7,11 +7,11 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &mut State) {
   }
 
   let active = match state.scope {
-    Scope::Procs => false,
+    Scope::Tasks => false,
     Scope::Term | Scope::TermZoom => true,
   };
 
-  let Some(proc) = state.get_current_proc() else {
+  let Some(task) = state.get_current_task() else {
     return;
   };
 
@@ -22,7 +22,7 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &mut State) {
   .chars();
   grid.draw_block(area, &chars, Attrs::default());
 
-  let handle = proc.present.as_ref().unwrap_or(&proc.vt);
+  let handle = task.present.as_ref().unwrap_or(&task.vt);
   let Ok(parser) = handle.read() else {
     return;
   };

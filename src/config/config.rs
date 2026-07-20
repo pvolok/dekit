@@ -6,13 +6,13 @@ use crate::cfg::{CfgCx, CfgDoc, CfgObj};
 use crate::config::hook::{Hook, event_from_cfg};
 use crate::config::keymap::KeymapConfig;
 use crate::config::log::LogConfig;
-use crate::config::proc::{ProcConfig, parse_proc_settings, proc_from_cfg};
+use crate::config::task::{TaskConfig, parse_task_settings, task_from_cfg};
 use crate::config::tui::TuiConfig;
 
 pub struct Config {
   pub log: LogConfig,
-  pub procs: Vec<ProcConfig>,
-  pub proc_defaults: ProcConfig,
+  pub tasks: Vec<TaskConfig>,
+  pub defaults: TaskConfig,
   pub tui: TuiConfig,
   pub keymap: KeymapConfig,
   pub on_init: Option<Hook>,
@@ -23,8 +23,8 @@ impl Config {
   pub fn make_default() -> Self {
     Self {
       log: LogConfig::default(),
-      procs: Vec::new(),
-      proc_defaults: ProcConfig::default(),
+      tasks: Vec::new(),
+      defaults: TaskConfig::default(),
       tui: TuiConfig::builtin(),
       keymap: KeymapConfig::default(),
       on_init: None,
@@ -42,10 +42,10 @@ impl Config {
         let cx = CfgCx::new(dir);
         let doc = CfgDoc::load(&global, &cx)?;
         let obj = doc.root().as_obj()?;
-        if obj.get("procs").is_some() {
+        if obj.get("tasks").is_some() {
           bail!(
-            "'procs' is not allowed in the global config ({}); \
-             define processes in the workspace dekit.yaml",
+            "'tasks' is not allowed in the global config ({}); \
+             define tasks in the workspace dekit.yaml",
             global.display()
           );
         }
@@ -60,11 +60,11 @@ impl Config {
       let doc = CfgDoc::load(&ws, &cx)?;
       let obj = doc.root().as_obj()?;
       config.apply(&obj, &cx)?;
-      if let Some(node) = obj.get("procs") {
-        config.procs = node
+      if let Some(node) = obj.get("tasks") {
+        config.tasks = node
           .as_obj()?
           .iter()
-          .map(|(path, proc)| proc_from_cfg(path.to_string(), &proc, &cx))
+          .map(|(path, task)| task_from_cfg(path.to_string(), &task, &cx))
           .collect::<Result<Vec<_>>>()?;
       }
     }
@@ -74,10 +74,9 @@ impl Config {
 
   fn apply(&mut self, obj: &CfgObj<'_>, cx: &CfgCx) -> Result<()> {
     self.log.merge(obj, cx)?;
-    if let Some(pd) = obj.get("proc_defaults") {
-      let over = parse_proc_settings(&pd.as_obj()?, cx)?;
-      self.proc_defaults =
-        std::mem::take(&mut self.proc_defaults).overlay(over);
+    if let Some(pd) = obj.get("defaults") {
+      let over = parse_task_settings(&pd.as_obj()?, cx)?;
+      self.defaults = std::mem::take(&mut self.defaults).overlay(over);
     }
     self.tui.merge(obj, cx)?;
     self.keymap.merge(obj)?;

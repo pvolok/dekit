@@ -6,8 +6,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::{
   config::{
     config::Config,
-    proc::{AUTOSTART_TAG, CmdConfig, ProcConfig},
-    proc_log::LogMode,
+    task::{AUTOSTART_TAG, CmdConfig, TaskConfig},
+    task_log::LogMode,
   },
   console::{
     action::{Action, CopyMove, ScrollUnit},
@@ -15,14 +15,14 @@ use crate::{
     app_layout::AppLayout,
     keymap::Keymap,
     modal::{
-      add_proc::AddProcModal, commands_menu::CommandsMenuModal, modal::Modal,
-      quit::QuitModal, remove_proc::RemoveProcModal,
-      rename_proc::RenameProcModal,
+      add_task::AddTaskModal, commands_menu::CommandsMenuModal, modal::Modal,
+      quit::QuitModal, remove_task::RemoveTaskModal,
+      rename_task::RenameTaskModal,
     },
-    proc::view::ProcView,
     state::{Scope, State},
+    task::view::TaskView,
     ui_keymap::render_keymap,
-    ui_procs::{procs_check_hit, procs_get_clicked_index, render_procs},
+    ui_tasks::{render_tasks, tasks_check_hit, tasks_get_clicked_index},
     ui_term::{render_term, term_check_hit},
     ui_zoom_tip::render_zoom_tip,
     widgets::list::ListState,
@@ -50,8 +50,9 @@ use crate::{
   protocol::{Bye, CtlMsg, codes},
   task::{
     logger::{LogResolver, LogSink},
-    proc_task::{
-      DuplicateProc, ProcInput, ProcTaskConfig, spawn_proc_task_with_id,
+    process_task::{
+      DuplicateTask, ProcessInput, ProcessTaskConfig,
+      spawn_process_task_with_id,
     },
   },
   term::{
@@ -127,9 +128,9 @@ impl App {
 
   async fn main_loop(mut self) -> anyhow::Result<()> {
     self.pc.subscribe_path(TaskPath::root(), SubMode::Subtree);
-    self.refresh_procs().await;
+    self.refresh_tasks().await;
 
-    self.start_procs()?;
+    self.start_tasks()?;
 
     let mut render_needed = true;
     let mut last_term_size = self.get_layout().term_area().size();
@@ -142,9 +143,9 @@ impl App {
       let term_size = layout.term_area().size();
       if term_size != last_term_size {
         let observer_id = self.pc.task_id;
-        for proc_handle in &mut self.state.procs {
+        for task_handle in &mut self.state.tasks {
           self.pc.send_msg(
-            proc_handle.id(),
+            task_handle.id(),
             TaskScreenCmd::Resize {
               size: Winsize {
                 x: term_size.width,
@@ -169,7 +170,7 @@ impl App {
         let state = &mut self.state;
         let config = &mut self.config;
         let keymap = &self.keymap;
-        render_procs(layout.procs.into(), grid, state, config);
+        render_tasks(layout.sidebar.into(), grid, state, config);
         render_term(layout.term, grid, state);
         render_keymap(layout.keymap.into(), grid, state, keymap);
         render_zoom_tip(layout.zoom_banner.into(), grid, keymap);
@@ -193,10 +194,10 @@ impl App {
       let mut loop_action = LoopAction::default();
       self.pr.recv_many(&mut command_buf, 512).await;
       for command in command_buf.drain(..) {
-        self.handle_proc_command(&mut loop_action, command);
+        self.handle_task_command(&mut loop_action, command);
       }
 
-      if self.state.quitting && self.state.all_procs_down() {
+      if self.state.quitting && self.state.all_tasks_down() {
         break;
       }
 
@@ -222,9 +223,9 @@ impl App {
         .log_ignore();
     }
 
-    for proc in &self.state.procs {
+    for task in &self.state.tasks {
       self.pc.send_msg(
-        proc.id(),
+        task.id(),
         TaskScreenCmd::Unobserve {
           observer_id: self.pc.task_id,
         },
@@ -235,10 +236,10 @@ impl App {
     Ok(())
   }
 
-  fn observe_proc(&self, proc_id: TaskId, size: Rect) {
+  fn observe_task(&self, task_id: TaskId, size: Rect) {
     let sender = self.pc.get_task_sender(self.pc.task_id);
     self.pc.send_msg(
-      proc_id,
+      task_id,
       TaskScreenCmd::Observe {
         size: Winsize {
           x: size.width,
@@ -251,7 +252,7 @@ impl App {
     );
   }
 
-  async fn refresh_procs(&mut self) {
+  async fn refresh_tasks(&mut self) {
     let resp = self.pc.query(KernelQuery::ListTasks(None)).await;
     let Ok(KernelQueryResponse::TaskList(list)) = resp else {
       return;
@@ -261,34 +262,34 @@ impl App {
       let Some(vt) = task.vt else {
         continue;
       };
-      if self.state.procs.iter().any(|p| p.id() == task.id) {
+      if self.state.tasks.iter().any(|p| p.id() == task.id) {
         continue;
       }
-      let name = proc_display_name(task.label, task.path.as_ref(), task.id);
+      let name = task_display_name(task.label, task.path.as_ref(), task.id);
       self
         .state
-        .procs
-        .push(ProcView::new(task.id, name, task.state, vt));
-      self.observe_proc(task.id, size);
+        .tasks
+        .push(TaskView::new(task.id, name, task.state, vt));
+      self.observe_task(task.id, size);
     }
   }
 
-  fn start_procs(&mut self) -> anyhow::Result<()> {
+  fn start_tasks(&mut self) -> anyhow::Result<()> {
     let task_ids: Vec<TaskId> = self
       .config
-      .procs
+      .tasks
       .iter()
       .map(|_| self.pc.alloc_id())
       .collect();
-    let deps_by_proc = resolve_proc_deps(&self.config.procs, &task_ids)?;
+    let deps_by_task = resolve_task_deps(&self.config.tasks, &task_ids)?;
 
     // Deps must be registered first (the kernel refuses a registration
     // with a missing dep), so register in dependency order.
-    let order = dep_order(&task_ids, &deps_by_proc)?;
+    let order = dep_order(&task_ids, &deps_by_task)?;
     for i in order {
-      let cfg = self.config.procs[i].clone();
+      let cfg = self.config.tasks[i].clone();
       let pinned = cfg.autostart();
-      self.spawn_proc(cfg, task_ids[i], deps_by_proc[i].clone(), pinned);
+      self.spawn_task(cfg, task_ids[i], deps_by_task[i].clone(), pinned);
     }
 
     Ok(())
@@ -296,33 +297,33 @@ impl App {
 
   /// `pinned` makes "registered and started" one kernel step, so a
   /// refused registration starts nothing.
-  fn spawn_proc(
+  fn spawn_task(
     &self,
-    cfg: ProcConfig,
+    cfg: TaskConfig,
     task_id: TaskId,
     deps: Vec<TaskId>,
     pinned: bool,
   ) {
-    let merged = self.config.proc_defaults.clone().overlay(cfg);
-    // Legacy mprocs proc names are arbitrary strings, so fall back to the
+    let merged = self.config.defaults.clone().overlay(cfg);
+    // Legacy mprocs task names are arbitrary strings, so fall back to the
     // task id when the name is not a valid path. Dekit configs validate
     // paths at parse time, so the fallback never fires for them.
     let path = TaskPath::new(&merged.path)
       .or_else(|_| TaskPath::new(task_id.0.to_string()))
       .ok();
-    let _ = spawn_proc_task_with_id(
+    let _ = spawn_process_task_with_id(
       &self.pc,
       task_id,
       path,
-      proc_task_config(&merged, task_id, deps, pinned),
+      process_task_config(&merged, task_id, deps, pinned),
     );
   }
 
-  fn unique_proc_name(&self, base: &str, exclude: Option<TaskId>) -> String {
+  fn unique_task_name(&self, base: &str, exclude: Option<TaskId>) -> String {
     let taken = |name: &str| {
       self
         .state
-        .procs
+        .tasks
         .iter()
         .any(|p| Some(p.id()) != exclude && p.name() == name)
     };
@@ -402,7 +403,7 @@ impl App {
           self.handle_event(loop_action, &bound)
         } else {
           match self.state.scope {
-            Scope::Procs => (),
+            Scope::Tasks => (),
             Scope::Term | Scope::TermZoom => {
               self.handle_event(loop_action, &Action::SendKey { key })
             }
@@ -420,37 +421,37 @@ impl App {
           mouse_event.x as u16,
           mouse_event.y as u16,
         ) {
-          if let (Scope::Procs, MouseEventKind::Down(_)) =
+          if let (Scope::Tasks, MouseEventKind::Down(_)) =
             (self.state.scope, mouse_event.kind)
           {
             self.state.scope = Scope::Term
           }
-          if let Some(proc) = self.state.get_current_proc() {
+          if let Some(task) = self.state.get_current_task() {
             let local_event = mouse_event.translate(layout.term_area());
             self
               .pc
-              .send_msg(proc.id, TaskScreenCmd::Mouse { event: local_event });
+              .send_msg(task.id, TaskScreenCmd::Mouse { event: local_event });
           }
-        } else if procs_check_hit(
-          layout.procs.into(),
+        } else if tasks_check_hit(
+          layout.sidebar.into(),
           mouse_event.x as u16,
           mouse_event.y as u16,
         ) {
           if let (Scope::Term, MouseEventKind::Down(_)) =
             (self.state.scope, mouse_event.kind)
           {
-            self.state.scope = Scope::Procs
+            self.state.scope = Scope::Tasks
           }
           match mouse_event.kind {
             MouseEventKind::Down(btn) => match btn {
               MouseButton::Left => {
-                if let Some(index) = procs_get_clicked_index(
-                  layout.procs.into(),
+                if let Some(index) = tasks_get_clicked_index(
+                  layout.sidebar.into(),
                   mouse_event.x as u16,
                   mouse_event.y as u16,
                   &self.state,
                 ) {
-                  self.state.select_proc(index);
+                  self.state.select_task(index);
                 }
               }
               MouseButton::Right | MouseButton::Middle => (),
@@ -460,16 +461,16 @@ impl App {
             MouseEventKind::Moved => (),
             MouseEventKind::ScrollDown => {
               if self.state.selected()
-                < self.state.procs.len().saturating_sub(1)
+                < self.state.tasks.len().saturating_sub(1)
               {
                 let index = self.state.selected() + 1;
-                self.state.select_proc(index);
+                self.state.select_task(index);
               }
             }
             MouseEventKind::ScrollUp => {
               if self.state.selected() > 0 {
                 let index = self.state.selected() - 1;
-                self.state.select_proc(index);
+                self.state.select_task(index);
               }
             }
             MouseEventKind::ScrollLeft => (),
@@ -507,10 +508,10 @@ impl App {
     delta: i32,
     unit: KernelScrollUnit,
   ) {
-    if let Some(proc) = self.state.get_current_proc() {
+    if let Some(task) = self.state.get_current_task() {
       self
         .pc
-        .send_msg(proc.id, TaskScreenCmd::Scroll { delta, unit });
+        .send_msg(task.id, TaskScreenCmd::Scroll { delta, unit });
       loop_action.render();
     }
   }
@@ -538,9 +539,9 @@ impl App {
       }
       Action::ForceQuit => {
         pc.send(KernelCommand::Quit);
-        for proc in self.state.procs.iter() {
-          if proc.is_up() {
-            pc.send(KernelCommand::Kill(TaskSelector::Id(proc.id()), None));
+        for task in self.state.tasks.iter() {
+          if task.is_up() {
+            pc.send(KernelCommand::Kill(TaskSelector::Id(task.id()), None));
           }
         }
         loop_action.force_quit();
@@ -555,8 +556,8 @@ impl App {
         self.state.scope = self.state.scope.toggle();
         loop_action.render();
       }
-      Action::FocusProcs => {
-        self.state.scope = Scope::Procs;
+      Action::FocusTasks => {
+        self.state.scope = Scope::Tasks;
         loop_action.render();
       }
       Action::FocusTerm => {
@@ -573,68 +574,68 @@ impl App {
           Some(CommandsMenuModal::new(self.pc.clone(), &self.keymap).boxed());
         loop_action.render();
       }
-      Action::NextProc => {
+      Action::NextTask => {
         let mut next = self.state.selected() + 1;
-        if next >= self.state.procs.len() {
+        if next >= self.state.tasks.len() {
           next = 0;
         }
-        self.state.select_proc(next);
+        self.state.select_task(next);
         loop_action.render();
       }
-      Action::PrevProc => {
+      Action::PrevTask => {
         let next = if self.state.selected() > 0 {
           self.state.selected() - 1
         } else {
-          self.state.procs.len().saturating_sub(1)
+          self.state.tasks.len().saturating_sub(1)
         };
-        self.state.select_proc(next);
+        self.state.select_task(next);
         loop_action.render();
       }
-      Action::SelectProc { index } => {
-        self.state.select_proc(*index);
+      Action::SelectTask { index } => {
+        self.state.select_task(*index);
         loop_action.render();
       }
 
-      Action::StartProc => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Start(TaskSelector::Id(proc.id), None));
+      Action::StartTask => {
+        if let Some(task) = self.state.get_current_task() {
+          pc.send(KernelCommand::Start(TaskSelector::Id(task.id), None));
         }
       }
-      Action::StopProc => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Stop(TaskSelector::Id(proc.id), None));
+      Action::StopTask => {
+        if let Some(task) = self.state.get_current_task() {
+          pc.send(KernelCommand::Stop(TaskSelector::Id(task.id), None));
         }
       }
-      Action::KillProc => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Kill(TaskSelector::Id(proc.id), None));
+      Action::KillTask => {
+        if let Some(task) = self.state.get_current_task() {
+          pc.send(KernelCommand::Kill(TaskSelector::Id(task.id), None));
         }
       }
-      Action::VetoProc => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Veto(TaskSelector::Id(proc.id), None));
+      Action::VetoTask => {
+        if let Some(task) = self.state.get_current_task() {
+          pc.send(KernelCommand::Veto(TaskSelector::Id(task.id), None));
         }
       }
-      Action::RestartProc => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Restart(TaskSelector::Id(proc.id), None));
+      Action::RestartTask => {
+        if let Some(task) = self.state.get_current_task() {
+          pc.send(KernelCommand::Restart(TaskSelector::Id(task.id), None));
         }
       }
       Action::RestartAll => {
-        for proc in &self.state.procs {
-          pc.send(KernelCommand::Restart(TaskSelector::Id(proc.id), None));
+        for task in &self.state.tasks {
+          pc.send(KernelCommand::Restart(TaskSelector::Id(task.id), None));
         }
       }
-      Action::ForceRestartProc => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send(KernelCommand::Kill(TaskSelector::Id(proc.id), None));
-          pc.send(KernelCommand::Start(TaskSelector::Id(proc.id), None));
+      Action::ForceRestartTask => {
+        if let Some(task) = self.state.get_current_task() {
+          pc.send(KernelCommand::Kill(TaskSelector::Id(task.id), None));
+          pc.send(KernelCommand::Start(TaskSelector::Id(task.id), None));
         }
       }
       Action::ForceRestartAll => {
-        for proc in &self.state.procs {
-          pc.send(KernelCommand::Kill(TaskSelector::Id(proc.id), None));
-          pc.send(KernelCommand::Start(TaskSelector::Id(proc.id), None));
+        for task in &self.state.tasks {
+          pc.send(KernelCommand::Kill(TaskSelector::Id(task.id), None));
+          pc.send(KernelCommand::Start(TaskSelector::Id(task.id), None));
         }
       }
 
@@ -646,41 +647,41 @@ impl App {
         let n = (*n).min(i32::MAX as usize) as i32;
         self.scroll(loop_action, -n, kernel_scroll_unit(*unit));
       }
-      Action::ShowAddProc => {
-        self.modal = Some(AddProcModal::new(self.pc.clone()).boxed());
+      Action::ShowAddTask => {
+        self.modal = Some(AddTaskModal::new(self.pc.clone()).boxed());
         loop_action.render();
       }
-      Action::AddProc { cmd, name } => {
+      Action::AddTask { cmd, name } => {
         let name = name.clone().unwrap_or_else(|| cmd.clone());
-        let proc_config = ProcConfig {
-          path: self.unique_proc_name(&name, None),
+        let task_config = TaskConfig {
+          path: self.unique_task_name(&name, None),
           cmd: Some(CmdConfig::Shell {
             shell: cmd.to_string(),
           }),
-          ..ProcConfig::default()
+          ..TaskConfig::default()
         };
         let id = self.pc.alloc_id();
-        self.spawn_proc(proc_config, id, Vec::new(), true);
+        self.spawn_task(task_config, id, Vec::new(), true);
         loop_action.render();
       }
-      Action::DuplicateProc => {
-        if let Some(proc) = self.state.get_current_proc() {
-          let name = self.unique_proc_name(proc.name(), None);
-          pc.send_msg(proc.id(), DuplicateProc(Some(name)));
+      Action::DuplicateTask => {
+        if let Some(task) = self.state.get_current_task() {
+          let name = self.unique_task_name(task.name(), None);
+          pc.send_msg(task.id(), DuplicateTask(Some(name)));
           loop_action.render();
         }
       }
-      Action::ShowRemoveProc => {
-        let id = match self.state.get_current_proc() {
-          Some(proc) if !proc.is_up() => Some(proc.id()),
+      Action::ShowRemoveTask => {
+        let id = match self.state.get_current_task() {
+          Some(task) if !task.is_up() => Some(task.id()),
           _ => None,
         };
         if let Some(id) = id {
-          self.modal = Some(RemoveProcModal::new(id, self.pc.clone()).boxed());
+          self.modal = Some(RemoveTaskModal::new(id, self.pc.clone()).boxed());
           loop_action.render();
         }
       }
-      Action::RemoveProc { id } => {
+      Action::RemoveTask { id } => {
         self.pc.send(KernelCommand::RemoveTask(*id));
         loop_action.render();
       }
@@ -690,35 +691,35 @@ impl App {
         loop_action.render();
       }
 
-      Action::ShowRenameProc => {
-        self.modal = Some(RenameProcModal::new(self.pc.clone()).boxed());
+      Action::ShowRenameTask => {
+        self.modal = Some(RenameTaskModal::new(self.pc.clone()).boxed());
         loop_action.render();
       }
-      Action::RenameProc { name } => {
-        if let Some(proc) = self.state.get_current_proc() {
-          let id = proc.id();
-          let name = self.unique_proc_name(name, Some(id));
+      Action::RenameTask { name } => {
+        if let Some(task) = self.state.get_current_task() {
+          let id = task.id();
+          let name = self.unique_task_name(name, Some(id));
           self.pc.set_task_label(id, Some(name));
           loop_action.render();
         }
       }
 
       Action::CopyModeEnter => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send_msg(proc.id, TaskScreenCmd::CopyEnter);
+        if let Some(task) = self.state.get_current_task() {
+          pc.send_msg(task.id, TaskScreenCmd::CopyEnter);
           self.state.scope = Scope::Term;
           loop_action.render();
         };
       }
       Action::CopyModeLeave => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send_msg(proc.id, TaskScreenCmd::CopyLeave);
+        if let Some(task) = self.state.get_current_task() {
+          pc.send_msg(task.id, TaskScreenCmd::CopyLeave);
         }
       }
       Action::CopyModeMove { dir } => {
-        if let Some(proc) = self.state.get_current_proc() {
+        if let Some(task) = self.state.get_current_task() {
           pc.send_msg(
-            proc.id,
+            task.id,
             TaskScreenCmd::CopyMove {
               dir: kernel_copy_move(*dir),
             },
@@ -726,13 +727,13 @@ impl App {
         }
       }
       Action::CopyModeEnd => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send_msg(proc.id, TaskScreenCmd::CopyBeginSelection);
+        if let Some(task) = self.state.get_current_task() {
+          pc.send_msg(task.id, TaskScreenCmd::CopyBeginSelection);
         }
       }
       Action::CopyModeCopy => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send_msg(proc.id, TaskScreenCmd::CopyYank);
+        if let Some(task) = self.state.get_current_task() {
+          pc.send_msg(task.id, TaskScreenCmd::CopyYank);
         }
       }
 
@@ -742,14 +743,14 @@ impl App {
       }
 
       Action::SendKey { key } => {
-        if let Some(proc) = self.state.get_current_proc() {
-          pc.send_msg(proc.id, ProcInput(*key));
+        if let Some(task) = self.state.get_current_task() {
+          pc.send_msg(task.id, ProcessInput(*key));
         }
       }
     }
   }
 
-  fn handle_proc_command(
+  fn handle_task_command(
     &mut self,
     loop_action: &mut LoopAction,
     command: TaskCmd,
@@ -800,7 +801,7 @@ impl App {
       FramedScreenNotify::ObserveStarted { task_id } => {
         let is_current = self
           .state
-          .get_current_proc()
+          .get_current_task()
           .is_some_and(|p| p.id() == task_id);
         if is_current {
           loop_action.render();
@@ -809,19 +810,19 @@ impl App {
       FramedScreenNotify::Render { task_id } => {
         let is_current = self
           .state
-          .get_current_proc()
+          .get_current_task()
           .is_some_and(|p| p.id() == task_id);
-        if let Some(proc) = self.state.get_proc_mut(task_id) {
+        if let Some(task) = self.state.get_task_mut(task_id) {
           if !is_current {
-            proc.changed = true;
+            task.changed = true;
           }
           loop_action.render();
         }
       }
       FramedScreenNotify::Bell { .. } => (),
       FramedScreenNotify::CopyPresent { task_id, vt } => {
-        if let Some(proc) = self.state.get_proc_mut(task_id) {
-          proc.present = vt;
+        if let Some(task) = self.state.get_task_mut(task_id) {
+          task.present = vt;
           loop_action.render();
         }
       }
@@ -847,27 +848,27 @@ impl App {
         let Some(vt) = vt else {
           return;
         };
-        if self.state.procs.iter().any(|p| p.id() == task_id) {
+        if self.state.tasks.iter().any(|p| p.id() == task_id) {
           return;
         }
-        let name = proc_display_name(label, path.as_ref(), task_id);
+        let name = task_display_name(label, path.as_ref(), task_id);
         self
           .state
-          .procs
-          .push(ProcView::new(task_id, name, state, vt));
+          .tasks
+          .push(TaskView::new(task_id, name, state, vt));
         let size = self.get_layout().term_area();
-        self.observe_proc(task_id, size);
+        self.observe_task(task_id, size);
         loop_action.render();
       }
       TaskNotify::StateChanged(state) => {
-        let known = if let Some(proc) = self.state.get_proc_mut(task_id) {
-          proc.status = state;
+        let known = if let Some(task) = self.state.get_task_mut(task_id) {
+          task.status = state;
           true
         } else {
           false
         };
         if known {
-          if !state.is_active() && self.state.all_procs_down() {
+          if !state.is_active() && self.state.all_tasks_down() {
             if let Some(hook) = &self.config.on_all_finished {
               let event = hook.as_action().clone();
               self.handle_event(loop_action, &event);
@@ -877,19 +878,19 @@ impl App {
         }
       }
       TaskNotify::Removed => {
-        self.state.procs.retain(|p| p.id() != task_id);
+        self.state.tasks.retain(|p| p.id() != task_id);
         loop_action.render();
       }
       TaskNotify::PathChanged(_, new) => {
         if let Some(new) = new
-          && let Some(proc) = self.state.get_proc_mut(task_id)
+          && let Some(task) = self.state.get_task_mut(task_id)
         {
-          proc.set_name(new.name().to_string());
+          task.set_name(new.name().to_string());
         }
       }
       TaskNotify::LabelChanged(label) => {
-        if let Some(proc) = self.state.get_proc_mut(task_id) {
-          proc.set_name(proc_display_name(label, None, task_id));
+        if let Some(task) = self.state.get_task_mut(task_id) {
+          task.set_name(task_display_name(label, None, task_id));
           loop_action.render();
         }
       }
@@ -907,22 +908,22 @@ impl App {
   }
 }
 
-fn proc_display_name(
+fn task_display_name(
   label: Option<String>,
   path: Option<&TaskPath>,
   id: TaskId,
 ) -> String {
   label
     .or_else(|| path.map(|p| p.name().to_string()))
-    .unwrap_or_else(|| format!("proc-{}", id.0))
+    .unwrap_or_else(|| format!("task-{}", id.0))
 }
 
-fn proc_task_config(
-  cfg: &ProcConfig,
+fn process_task_config(
+  cfg: &TaskConfig,
   task_id: TaskId,
   deps: Vec<TaskId>,
   pinned: bool,
-) -> ProcTaskConfig {
+) -> ProcessTaskConfig {
   let log = cfg.log.clone().map(|log_cfg| {
     let name = cfg.path.clone();
     let id = task_id.0;
@@ -933,7 +934,7 @@ fn proc_task_config(
       })
     }) as LogResolver
   });
-  ProcTaskConfig {
+  ProcessTaskConfig {
     spec: ProcessSpec::from(cfg),
     stop: cfg.stop(),
     log,
@@ -958,65 +959,65 @@ fn proc_task_config(
   }
 }
 
-fn resolve_proc_deps(
-  proc_configs: &[ProcConfig],
+fn resolve_task_deps(
+  task_configs: &[TaskConfig],
   task_ids: &[TaskId],
 ) -> anyhow::Result<Vec<Vec<TaskId>>> {
-  if proc_configs.len() != task_ids.len() {
-    bail!("Internal error: proc and task id counts differ.");
+  if task_configs.len() != task_ids.len() {
+    bail!("Internal error: task and task id counts differ.");
   }
 
   let mut name_to_id = HashMap::new();
   let mut name_to_index = HashMap::new();
-  for (index, (proc_config, task_id)) in
-    proc_configs.iter().zip(task_ids.iter()).enumerate()
+  for (index, (task_config, task_id)) in
+    task_configs.iter().zip(task_ids.iter()).enumerate()
   {
     if name_to_id
-      .insert(proc_config.path.as_str(), *task_id)
+      .insert(task_config.path.as_str(), *task_id)
       .is_some()
     {
-      bail!("Duplicate process name '{}'.", proc_config.path);
+      bail!("Duplicate task name '{}'.", task_config.path);
     }
-    name_to_index.insert(proc_config.path.as_str(), index);
+    name_to_index.insert(task_config.path.as_str(), index);
   }
 
-  let mut deps_by_proc = Vec::with_capacity(proc_configs.len());
-  let mut dep_indexes_by_proc = Vec::with_capacity(proc_configs.len());
-  for proc_config in proc_configs {
-    let mut deps = Vec::with_capacity(proc_config.deps.len());
-    let mut dep_indexes = Vec::with_capacity(proc_config.deps.len());
-    for dep_name in &proc_config.deps {
+  let mut deps_by_task = Vec::with_capacity(task_configs.len());
+  let mut dep_indexes_by_task = Vec::with_capacity(task_configs.len());
+  for task_config in task_configs {
+    let mut deps = Vec::with_capacity(task_config.deps.len());
+    let mut dep_indexes = Vec::with_capacity(task_config.deps.len());
+    for dep_name in &task_config.deps {
       let Some(dep_id) = name_to_id.get(dep_name.as_str()) else {
         bail!(
           "Process '{}' depends on unknown process '{}'.",
-          proc_config.path,
+          task_config.path,
           dep_name
         );
       };
       let Some(dep_index) = name_to_index.get(dep_name.as_str()) else {
         bail!(
           "Process '{}' depends on unknown process '{}'.",
-          proc_config.path,
+          task_config.path,
           dep_name
         );
       };
       deps.push(*dep_id);
       dep_indexes.push(*dep_index);
     }
-    deps_by_proc.push(deps);
-    dep_indexes_by_proc.push(dep_indexes);
+    deps_by_task.push(deps);
+    dep_indexes_by_task.push(dep_indexes);
   }
 
-  validate_proc_dep_cycles(proc_configs, &dep_indexes_by_proc)?;
+  validate_task_dep_cycles(task_configs, &dep_indexes_by_task)?;
 
-  Ok(deps_by_proc)
+  Ok(deps_by_task)
 }
 
-/// Order proc indices so every dep comes before its dependent. Deps are
-/// already validated acyclic (`validate_proc_dep_cycles`).
+/// Order task indices so every dep comes before its dependent. Deps are
+/// already validated acyclic (`validate_task_dep_cycles`).
 fn dep_order(
   task_ids: &[TaskId],
-  deps_by_proc: &[Vec<TaskId>],
+  deps_by_task: &[Vec<TaskId>],
 ) -> anyhow::Result<Vec<usize>> {
   let index_of: HashMap<TaskId, usize> = task_ids
     .iter()
@@ -1026,7 +1027,7 @@ fn dep_order(
   let n = task_ids.len();
   let mut missing_deps = vec![0usize; n];
   let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
-  for (i, deps) in deps_by_proc.iter().enumerate() {
+  for (i, deps) in deps_by_task.iter().enumerate() {
     missing_deps[i] = deps.len();
     for dep in deps {
       dependents[index_of[dep]].push(i);
@@ -1045,7 +1046,7 @@ fn dep_order(
     }
   }
   if order.len() != n {
-    bail!("Dependency cycle among config procs.");
+    bail!("Dependency cycle among config tasks.");
   }
   Ok(order)
 }
@@ -1057,18 +1058,18 @@ enum VisitState {
   Visited,
 }
 
-fn validate_proc_dep_cycles(
-  proc_configs: &[ProcConfig],
-  deps_by_proc: &[Vec<usize>],
+fn validate_task_dep_cycles(
+  task_configs: &[TaskConfig],
+  deps_by_task: &[Vec<usize>],
 ) -> anyhow::Result<()> {
-  let mut states = vec![VisitState::Unvisited; proc_configs.len()];
+  let mut states = vec![VisitState::Unvisited; task_configs.len()];
   let mut stack = Vec::new();
 
-  for index in 0..proc_configs.len() {
-    visit_proc_deps(
+  for index in 0..task_configs.len() {
+    visit_task_deps(
       index,
-      proc_configs,
-      deps_by_proc,
+      task_configs,
+      deps_by_task,
       &mut states,
       &mut stack,
     )?;
@@ -1077,10 +1078,10 @@ fn validate_proc_dep_cycles(
   Ok(())
 }
 
-fn visit_proc_deps(
+fn visit_task_deps(
   index: usize,
-  proc_configs: &[ProcConfig],
-  deps_by_proc: &[Vec<usize>],
+  task_configs: &[TaskConfig],
+  deps_by_task: &[Vec<usize>],
   states: &mut [VisitState],
   stack: &mut Vec<usize>,
 ) -> anyhow::Result<()> {
@@ -1090,9 +1091,9 @@ fn visit_proc_deps(
       let cycle_start = stack.iter().position(|&i| i == index).unwrap_or(0);
       let mut cycle = stack[cycle_start..]
         .iter()
-        .map(|&i| proc_configs[i].path.as_str())
+        .map(|&i| task_configs[i].path.as_str())
         .collect::<Vec<_>>();
-      cycle.push(proc_configs[index].path.as_str());
+      cycle.push(task_configs[index].path.as_str());
       bail!("Process dependency cycle detected: {}.", cycle.join(" -> "));
     }
     VisitState::Unvisited => {}
@@ -1100,8 +1101,8 @@ fn visit_proc_deps(
 
   states[index] = VisitState::Visiting;
   stack.push(index);
-  for dep_index in &deps_by_proc[index] {
-    visit_proc_deps(*dep_index, proc_configs, deps_by_proc, states, stack)?;
+  for dep_index in &deps_by_task[index] {
+    visit_task_deps(*dep_index, task_configs, deps_by_task, states, stack)?;
   }
   stack.pop();
   states[index] = VisitState::Visited;
@@ -1134,9 +1135,9 @@ pub async fn server_main(
   let state = State {
     current_client_id: None,
 
-    scope: Scope::Procs,
-    procs: Vec::new(),
-    procs_list: ListState::default(),
+    scope: Scope::Tasks,
+    tasks: Vec::new(),
+    tasks_list: ListState::default(),
     hide_keymap_window: !config.tui.tips.show,
 
     quitting: false,
@@ -1146,7 +1147,7 @@ pub async fn server_main(
     width: 160,
     height: 50,
   };
-  let scrollback_len = config.proc_defaults.scrollback_len();
+  let scrollback_len = config.defaults.scrollback_len();
 
   let app = App {
     config,
@@ -1174,27 +1175,27 @@ pub async fn server_main(
 mod tests {
   use super::*;
 
-  fn proc_config(name: &str, deps: &[&str]) -> ProcConfig {
-    ProcConfig {
+  fn task_config(name: &str, deps: &[&str]) -> TaskConfig {
+    TaskConfig {
       path: name.to_string(),
       cmd: Some(CmdConfig::Shell {
         shell: "true".to_string(),
       }),
       deps: deps.iter().map(|dep| dep.to_string()).collect(),
-      ..ProcConfig::default()
+      ..TaskConfig::default()
     }
   }
 
   #[test]
-  fn resolve_proc_deps_maps_names_to_task_ids() {
-    let proc_configs = vec![
-      proc_config("db", &[]),
-      proc_config("api", &["db"]),
-      proc_config("web", &["api", "db"]),
+  fn resolve_task_deps_maps_names_to_task_ids() {
+    let task_configs = vec![
+      task_config("db", &[]),
+      task_config("api", &["db"]),
+      task_config("web", &["api", "db"]),
     ];
     let task_ids = vec![TaskId(1), TaskId(2), TaskId(3)];
 
-    let deps = resolve_proc_deps(&proc_configs, &task_ids).unwrap();
+    let deps = resolve_task_deps(&task_configs, &task_ids).unwrap();
 
     assert_eq!(
       deps,
@@ -1203,11 +1204,11 @@ mod tests {
   }
 
   #[test]
-  fn resolve_proc_deps_rejects_unknown_dependency() {
-    let proc_configs = vec![proc_config("api", &["db"])];
+  fn resolve_task_deps_rejects_unknown_dependency() {
+    let task_configs = vec![task_config("api", &["db"])];
     let task_ids = vec![TaskId(1)];
 
-    let err = resolve_proc_deps(&proc_configs, &task_ids).unwrap_err();
+    let err = resolve_task_deps(&task_configs, &task_ids).unwrap_err();
 
     assert_eq!(
       err.to_string(),
@@ -1216,15 +1217,15 @@ mod tests {
   }
 
   #[test]
-  fn resolve_proc_deps_rejects_dependency_cycles() {
-    let proc_configs = vec![
-      proc_config("api", &["worker"]),
-      proc_config("worker", &["db"]),
-      proc_config("db", &["api"]),
+  fn resolve_task_deps_rejects_dependency_cycles() {
+    let task_configs = vec![
+      task_config("api", &["worker"]),
+      task_config("worker", &["db"]),
+      task_config("db", &["api"]),
     ];
     let task_ids = vec![TaskId(1), TaskId(2), TaskId(3)];
 
-    let err = resolve_proc_deps(&proc_configs, &task_ids).unwrap_err();
+    let err = resolve_task_deps(&task_configs, &task_ids).unwrap_err();
 
     assert_eq!(
       err.to_string(),

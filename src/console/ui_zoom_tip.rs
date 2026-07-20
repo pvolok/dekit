@@ -7,7 +7,7 @@ pub fn render_zoom_tip(area: Rect, grid: &mut Grid, keymap: &Keymap) {
     return;
   }
 
-  let events = vec![Action::FocusTerm, Action::ToggleFocus, Action::FocusProcs];
+  let events = vec![Action::FocusTerm, Action::ToggleFocus, Action::FocusTasks];
   let key = events
     .into_iter()
     .find_map(|event| keymap.resolve_key(KeymapGroup::Term, &event));

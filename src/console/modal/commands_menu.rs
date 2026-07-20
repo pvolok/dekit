@@ -35,7 +35,7 @@ pub struct CommandsMenuModal {
 impl CommandsMenuModal {
   pub fn new(pc: TaskContext, keymap: &Keymap) -> Self {
     let mut key_bindings = HashMap::new();
-    for (event, key) in &keymap.rev_procs {
+    for (event, key) in &keymap.rev_tasks {
       key_bindings
         .entry(event.clone())
         .or_insert_with(|| print_key(key));
@@ -68,7 +68,7 @@ impl Modal for CommandsMenuModal {
         if let Some(item) = self.items.get(self.list_state.selected()) {
           self.pc.send_self_custom(item.event.clone());
         }
-        // Skip because AddProc event will immediately rerender.
+        // Skip because AddTask event will immediately rerender.
         return true;
       }
       TermEvent::Key(Key {
@@ -393,20 +393,20 @@ fn get_commands(search: &str) -> Vec<CommandInfo> {
     ("focus-term", Action::FocusTerm),
     ("zoom", Action::Zoom),
     ("show-commands-menu", Action::ShowCommandsMenu),
-    ("next-proc", Action::NextProc),
-    ("prev-proc", Action::PrevProc),
-    ("start-proc", Action::StartProc),
-    ("stop-proc", Action::StopProc),
-    ("kill-proc", Action::KillProc),
-    ("veto-proc", Action::VetoProc),
-    ("restart-proc", Action::RestartProc),
+    ("next-task", Action::NextTask),
+    ("prev-task", Action::PrevTask),
+    ("start-task", Action::StartTask),
+    ("stop-task", Action::StopTask),
+    ("kill-task", Action::KillTask),
+    ("veto-task", Action::VetoTask),
+    ("restart-task", Action::RestartTask),
     ("restart-all", Action::RestartAll),
-    ("duplicate-proc", Action::DuplicateProc),
-    ("force-restart-proc", Action::ForceRestartProc),
+    ("duplicate-task", Action::DuplicateTask),
+    ("force-restart-task", Action::ForceRestartTask),
     ("force-restart-all", Action::ForceRestartAll),
-    ("show-add-proc", Action::ShowAddProc),
-    ("show-rename-proc", Action::ShowRenameProc),
-    ("show-remove-proc", Action::ShowRemoveProc),
+    ("show-add-task", Action::ShowAddTask),
+    ("show-rename-task", Action::ShowRenameTask),
+    ("show-remove-task", Action::ShowRemoveTask),
     ("close-current-modal", Action::CloseCurrentModal),
     (
       "scroll-down",

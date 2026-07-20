@@ -16,21 +16,21 @@ use crate::term::{
 
 use super::modal::Modal;
 
-pub struct AddProcModal {
+pub struct AddTaskModal {
   pc: TaskContext,
   input: Input,
 }
 
-impl AddProcModal {
+impl AddTaskModal {
   pub fn new(pc: TaskContext) -> Self {
-    AddProcModal {
+    AddTaskModal {
       pc,
       input: Input::default(),
     }
   }
 }
 
-impl Modal for AddProcModal {
+impl Modal for AddTaskModal {
   fn handle_input(
     &mut self,
     _state: &mut State,
@@ -44,11 +44,11 @@ impl Modal for AddProcModal {
         ..
       }) if mods.is_empty() => {
         self.pc.send_self_custom(Action::CloseCurrentModal);
-        self.pc.send_self_custom(Action::AddProc {
+        self.pc.send_self_custom(Action::AddTask {
           cmd: self.input.value().to_string(),
           name: None,
         });
-        // Skip because AddProc event will immediately rerender.
+        // Skip because AddTask event will immediately rerender.
         return true;
       }
       TermEvent::Key(Key {
@@ -106,7 +106,7 @@ impl Modal for AddProcModal {
         width: area.width.saturating_sub(2),
         height: 1,
       },
-      "Add process",
+      "Add task",
       Attrs::default(),
     );
 

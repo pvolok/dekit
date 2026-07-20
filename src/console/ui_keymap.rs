@@ -28,14 +28,14 @@ pub fn render_keymap(
 
   let group = state.get_keymap_group();
   let items = match group {
-    KeymapGroup::Procs => &[
+    KeymapGroup::Tasks => &[
       Action::ToggleFocus,
       Action::Quit,
-      Action::NextProc,
-      Action::PrevProc,
-      Action::StartProc,
-      Action::StopProc,
-      Action::RestartProc,
+      Action::NextTask,
+      Action::PrevTask,
+      Action::StartTask,
+      Action::StopTask,
+      Action::RestartTask,
       Action::Zoom,
       Action::ShowCommandsMenu,
       Action::ToggleKeymapWindow,
