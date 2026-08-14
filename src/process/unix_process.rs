@@ -15,6 +15,15 @@ use crate::{
 
 use super::process_spec::ProcessSpec;
 
+/// Serializes the unsafe descriptor window inside `forkpty`.
+///
+/// `forkpty` temporarily opens both sides of a PTY without `FD_CLOEXEC`. If
+/// two calls overlap, either child can inherit the other call's descriptors.
+/// The lock starts before `forkpty` opens them and remains held until the
+/// returned master is close-on-exec; the helper has already closed the
+/// parent's temporary slave by then.
+static FORKPTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct UnixProcess {
   pub pid: Pid,
   master: AsyncFd<OwnedFd>,
@@ -56,6 +65,15 @@ impl UnixProcess {
       })
       .collect();
 
+    // Acquire the lock before entering libc. Locking only after `forkpty`
+    // returns would be too late: another child may already have inherited one
+    // of the descriptors that `forkpty` opened internally.
+    let forkpty_guard = FORKPTY_LOCK.lock().unwrap_or_else(|poisoned| {
+      // There is no protected data invariant to repair. A previous panic can
+      // only have interrupted one spawn, so future spawns may reuse the lock.
+      poisoned.into_inner()
+    });
+
     unsafe {
       let mut block_set: libc::sigset_t = std::mem::zeroed();
       let mut old_set: libc::sigset_t = std::mem::zeroed();
@@ -76,6 +94,10 @@ impl UnixProcess {
       }
 
       if pid == 0 {
+        // This child owns a copied, permanently locked mutex state. It must
+        // reach `exec` or `_exit` without dropping the inherited guard; either
+        // operation discards the child's private copy without affecting the
+        // mutex still owned by the parent.
         for signo in &[
           libc::SIGCHLD,
           libc::SIGHUP,
@@ -110,6 +132,11 @@ impl UnixProcess {
         libc::_exit(1);
       }
 
+      // Take ownership immediately. Every later error path will now close the
+      // master instead of leaking the raw descriptor in the daemon.
+      let master = OwnedFd::from_raw_fd(master_fd);
+      let master_fd = std::os::fd::AsRawFd::as_raw_fd(&master);
+
       libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, null_mut());
 
       let flags = libc::fcntl(master_fd, libc::F_GETFD, 0);
@@ -120,6 +147,13 @@ impl UnixProcess {
         return Err(std::io::Error::last_os_error());
       }
 
+      // This is the end of the inheritance race. `forkpty` has closed its
+      // temporary slave in the parent and the remaining master will close in
+      // every child at `exec`, so the next spawn may safely enter `forkpty`.
+      drop(forkpty_guard);
+
+      // Nonblocking I/O is local runtime setup and does not affect descriptor
+      // inheritance, so keep it outside the serialized section.
       let flags = libc::fcntl(master_fd, libc::F_GETFL, 0);
       if flags < 0 {
         return Err(std::io::Error::last_os_error());
@@ -129,7 +163,6 @@ impl UnixProcess {
       }
 
       let pid = Pid::from_raw_unchecked(pid);
-      let master = OwnedFd::from_raw_fd(master_fd);
 
       UnixProcessesWaiter::wait_for(pid, on_wait_returned);
 
@@ -217,6 +250,170 @@ mod tests {
   use crate::term::Winsize;
 
   use super::*;
+
+  #[cfg(target_os = "linux")]
+  /// Creates enough contention inside `forkpty` while remaining safe for CI.
+  const CONCURRENT_SPAWNS: usize = 64;
+
+  #[cfg(target_os = "linux")]
+  /// Reduces randomness in the race between opening a PTY and setting CLOEXEC.
+  const SPAWN_ROUNDS: usize = 3;
+
+  #[cfg(target_os = "linux")]
+  /// Keeps a regression failure readable even when every child leaks many FDs.
+  const MAX_REPORTED_LEAKS_PER_ROUND: usize = 32;
+
+  #[cfg(target_os = "linux")]
+  /// Finds PTY descriptors a process must not own after `exec`; its own
+  /// terminal may only occupy standard file descriptors 0, 1, and 2.
+  fn inherited_pty_descriptors(processes: &[UnixProcess]) -> Vec<String> {
+    let mut inherited = Vec::new();
+    for process in processes {
+      let pid = process.pid();
+      let fd_dir = format!("/proc/{pid}/fd");
+      let entries = match std::fs::read_dir(&fd_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+          inherited.push(format!("pid {pid}: cannot read {fd_dir}: {error}"));
+          continue;
+        }
+      };
+      for entry in entries.flatten() {
+        let Some(fd) = entry
+          .file_name()
+          .to_str()
+          .and_then(|value| value.parse::<i32>().ok())
+        else {
+          continue;
+        };
+        if fd <= libc::STDERR_FILENO {
+          // A process is expected to own its PTY on stdin, stdout, and stderr.
+          continue;
+        }
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+          continue;
+        };
+        let target = target.to_string_lossy();
+        if target == "/dev/ptmx" || target.starts_with("/dev/pts/") {
+          inherited.push(format!("pid {pid}: fd {fd} -> {target}"));
+        }
+      }
+    }
+    inherited
+  }
+
+  #[cfg(target_os = "linux")]
+  /// Terminates test process groups and synchronously reaps their leaders so
+  /// even a failing test leaves no children or zombies behind.
+  fn terminate_and_reap(processes: &mut [UnixProcess]) {
+    for process in processes.iter_mut() {
+      let _ = process.send_signal(libc::SIGKILL, true);
+    }
+    for process in processes {
+      let pid = process.pid() as libc::pid_t;
+      loop {
+        let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        if result == pid {
+          break;
+        }
+        if result < 0
+          && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        {
+          continue;
+        }
+        break;
+      }
+    }
+  }
+
+  #[cfg(target_os = "linux")]
+  /// Ensures concurrently spawned processes inherit neither side of another
+  /// process's PTY after `exec`.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn concurrent_spawns_do_not_inherit_pty_descriptors() {
+    let mut failures = Vec::new();
+    for round in 0..SPAWN_ROUNDS {
+      // Release every blocking worker at once. This reliably overlaps the
+      // internal open/fork/close phases on the unfixed implementation.
+      let barrier =
+        std::sync::Arc::new(std::sync::Barrier::new(CONCURRENT_SPAWNS));
+      let mut handles = Vec::with_capacity(CONCURRENT_SPAWNS);
+      for index in 0..CONCURRENT_SPAWNS {
+        let barrier = barrier.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+          let spec = ProcessSpec::from_argv(vec!["sleep".into(), "30".into()]);
+          let size = Winsize {
+            x: 80,
+            y: 24,
+            x_px: 0,
+            y_px: 0,
+          };
+          barrier.wait();
+          UnixProcess::spawn(TaskId(index), &spec, size, Box::new(|_| {}))
+        }));
+      }
+
+      let mut processes = Vec::with_capacity(CONCURRENT_SPAWNS);
+      for handle in handles {
+        match handle.await {
+          Ok(Ok(process)) => processes.push(process),
+          Ok(Err(error)) => {
+            failures.push(format!("round {round}: spawn failed: {error}"));
+          }
+          Err(error) => {
+            failures.push(format!("round {round}: spawn task failed: {error}"));
+          }
+        }
+      }
+
+      // CLOEXEC descriptors remain visible until the child actually calls
+      // exec. Wait for `/proc/<pid>/exe` to become `sleep` before inspecting
+      // the descriptor table, otherwise the test would report valid temporary
+      // state as a leak.
+      let exec_deadline = Instant::now() + Duration::from_secs(5);
+      loop {
+        let all_executed = processes.iter().all(|process| {
+          std::fs::read_link(format!("/proc/{}/exe", process.pid()))
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name.to_owned()))
+            .is_some_and(|name| name == "sleep")
+        });
+        if all_executed || Instant::now() >= exec_deadline {
+          if !all_executed {
+            failures
+              .push(format!("round {round}: not every child executed sleep"));
+          }
+          break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+
+      let inherited = inherited_pty_descriptors(&processes);
+      let inherited_count = inherited.len();
+      failures.extend(
+        inherited
+          .into_iter()
+          .take(MAX_REPORTED_LEAKS_PER_ROUND)
+          .map(|failure| format!("round {round}: {failure}")),
+      );
+      if inherited_count > MAX_REPORTED_LEAKS_PER_ROUND {
+        failures.push(format!(
+          "round {round}: ... and {} more leaked PTY descriptors",
+          inherited_count - MAX_REPORTED_LEAKS_PER_ROUND
+        ));
+      }
+
+      // Record failures first, but clean up before asserting so a failed test
+      // cannot leave dozens of sleeping process groups behind.
+      terminate_and_reap(&mut processes);
+    }
+
+    assert!(
+      failures.is_empty(),
+      "concurrent children inherited PTY descriptors:\n{}",
+      failures.join("\n")
+    );
+  }
 
   // The shell forks `sleep` as a child that inherits the pty. A group SIGTERM
   // must reap the child too; otherwise the orphan keeps the slave open and the
