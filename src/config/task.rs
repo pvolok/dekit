@@ -257,8 +257,14 @@ impl From<&TaskConfig> for ProcessSpec {
 
 #[cfg(windows)]
 pub fn cmd_from_shell(shell: &str) -> ProcessSpec {
+  // Prefer PowerShell 7, but fall back to Windows PowerShell if not installed.
+  let shell_exe = if which::which("pwsh.exe").is_ok() {
+    "pwsh.exe"
+  } else {
+    "powershell.exe"
+  };
   ProcessSpec::from_argv(vec![
-    "pwsh.exe".into(),
+    shell_exe.into(),
     "-Command".into(),
     shell.into(),
   ])
