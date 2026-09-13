@@ -92,7 +92,7 @@ impl RunnerSpec {
     match find_project_root(from) {
       Some(root) => Self::project(&root),
       None => bail!(
-        "no dekit.yaml found above `{}`; run inside a project, pass --chdir, or use a 'host::' target for the host runner",
+        "no project found above `{}` (looked for dekit.yaml, a git repo, or package.json); pass --chdir, or use a 'host::' target for the host runner",
         from.display()
       ),
     }
@@ -122,11 +122,25 @@ fn validate_root(root: &Path) -> anyhow::Result<()> {
   Ok(())
 }
 
+/// Walks up from `from` looking for a project root. `dekit.yaml` wins
+/// even when a git repo or `package.json` is closer; otherwise the
+/// nearest git repo, then the nearest `package.json`.
 pub fn find_project_root(from: &Path) -> Option<PathBuf> {
+  find_marker(from, |dir| dir.join("dekit.yaml").is_file())
+    .or_else(|| find_marker(from, is_git_root))
+    .or_else(|| find_marker(from, |dir| dir.join("package.json").is_file()))
+}
+
+fn find_marker(from: &Path, pred: impl Fn(&Path) -> bool) -> Option<PathBuf> {
   from
     .ancestors()
-    .find(|dir| dir.join("dekit.yaml").is_file())
+    .find(|dir| pred(dir))
     .map(Path::to_path_buf)
+}
+
+fn is_git_root(dir: &Path) -> bool {
+  let git = dir.join(".git");
+  git.is_dir() || git.is_file()
 }
 
 pub fn user_config_dir() -> anyhow::Result<PathBuf> {
@@ -306,6 +320,69 @@ mod tests {
   }
 
   #[test]
+  fn git_repo_is_a_project() {
+    let root = std::env::temp_dir()
+      .join(format!("dekit-git-project-{}", std::process::id()));
+    let nested = root.join("a/b");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    assert_eq!(find_project_root(&nested), Some(root.clone()));
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn git_file_is_a_project() {
+    let root = std::env::temp_dir()
+      .join(format!("dekit-git-file-{}", std::process::id()));
+    let nested = root.join("a");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(root.join(".git"), "gitdir: /elsewhere\n").unwrap();
+    assert_eq!(find_project_root(&nested), Some(root.clone()));
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn package_json_is_a_project() {
+    let root = std::env::temp_dir()
+      .join(format!("dekit-pkg-project-{}", std::process::id()));
+    let nested = root.join("src");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    assert_eq!(find_project_root(&nested), Some(root.clone()));
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn dekit_yaml_wins_over_closer_markers() {
+    let root = std::env::temp_dir()
+      .join(format!("dekit-yaml-over-{}", std::process::id()));
+    let nested = root.join("pkg/src");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(root.join("dekit.yaml"), "tasks: {}\n").unwrap();
+    std::fs::create_dir(root.join("pkg/.git")).unwrap();
+    std::fs::write(root.join("pkg/package.json"), "{}\n").unwrap();
+    assert_eq!(find_project_root(&nested), Some(root.clone()));
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn git_repo_wins_over_closer_package_json() {
+    let root = std::env::temp_dir()
+      .join(format!("dekit-git-over-pkg-{}", std::process::id()));
+    let nested = root.join("pkg/src");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join("pkg/package.json"), "{}\n").unwrap();
+    assert_eq!(find_project_root(&nested), Some(root.clone()));
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  #[test]
   fn no_project_is_an_error_not_the_host_runner() {
     let dir = std::env::temp_dir()
       .join(format!("dekit-no-project-{}", std::process::id()));
@@ -313,7 +390,7 @@ mod tests {
     std::fs::create_dir_all(&dir).unwrap();
     let dir = dunce::canonicalize(&dir).unwrap();
     let err = RunnerSpec::discover_with_host(&dir, None).unwrap_err();
-    assert!(err.to_string().contains("no dekit.yaml"), "{err}");
+    assert!(err.to_string().contains("no project found"), "{err}");
     let _ = std::fs::remove_dir_all(dir);
   }
 

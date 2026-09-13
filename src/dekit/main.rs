@@ -386,7 +386,9 @@ fn runner_from_ref(runner: &Runner) -> anyhow::Result<RunnerSpec> {
       Some(RunnerKind::Project) => {
         match crate::runner::find_project_root(&std::env::current_dir()?) {
           Some(dir) => RunnerSpec::project(&dir),
-          None => anyhow::bail!("no dekit.yaml found above the current dir"),
+          None => anyhow::bail!(
+            "no project found above the current dir (looked for dekit.yaml, a git repo, or package.json)"
+          ),
         }
       }
       Some(RunnerKind::Host) => RunnerSpec::host(),
@@ -587,7 +589,9 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         .long("chdir")
         .short('C')
         .global(true)
-        .help("Explicit project root (default: nearest dekit.yaml)"),
+        .help(
+          "Explicit project root (default: nearest dekit.yaml, git repo, or package.json)",
+        ),
     )
     .arg(
       Arg::new("json")
