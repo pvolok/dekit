@@ -14,22 +14,10 @@ pub struct RawFrame {
   pub payload: Bytes,
 }
 
-pub struct FrameCodec {
-  state: DecoderState,
-}
-
-enum DecoderState {
-  Header,
-  Data(usize),
-}
-
-impl FrameCodec {
-  pub fn new() -> Self {
-    FrameCodec {
-      state: DecoderState::Header,
-    }
-  }
-}
+/// Stateless: a frame is taken from the buffer only once it is complete,
+/// so undecoded bytes always start at a frame boundary and can be handed
+/// to another decoder.
+pub struct FrameCodec;
 
 fn protocol_error(msg: String) -> std::io::Error {
   std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
@@ -43,28 +31,20 @@ impl Decoder for FrameCodec {
     &mut self,
     src: &mut BytesMut,
   ) -> Result<Option<Self::Item>, Self::Error> {
-    let len = match self.state {
-      DecoderState::Header => {
-        if src.len() < 4 {
-          return Ok(None);
-        }
-        let len = src.get_u32() as usize;
-        if len < 1 || len > MAX_FRAME {
-          return Err(protocol_error(format!("bad frame length: {len}")));
-        }
-        self.state = DecoderState::Data(len);
-        len
-      }
-      DecoderState::Data(len) => len,
+    let Some(header) = src.first_chunk::<4>() else {
+      return Ok(None);
     };
-
-    if src.len() < len {
-      src.reserve(len - src.len());
+    let len = u32::from_be_bytes(*header) as usize;
+    if len < 1 || len > MAX_FRAME {
+      return Err(protocol_error(format!("bad frame length: {len}")));
+    }
+    if src.len() < 4 + len {
+      src.reserve(4 + len - src.len());
       return Ok(None);
     }
 
+    src.advance(4);
     let mut frame = src.split_to(len);
-    self.state = DecoderState::Header;
     let kind = frame.get_u8();
     Ok(Some(RawFrame {
       kind,
@@ -99,7 +79,7 @@ mod tests {
 
   fn encode(frame: RawFrame) -> BytesMut {
     let mut buf = BytesMut::new();
-    FrameCodec::new().encode(frame, &mut buf).unwrap();
+    FrameCodec.encode(frame, &mut buf).unwrap();
     buf
   }
 
@@ -110,7 +90,7 @@ mod tests {
       payload: Bytes::from_static(b"{\"type\":\"hello\"}"),
     };
     let mut buf = encode(frame.clone());
-    let decoded = FrameCodec::new().decode(&mut buf).unwrap().unwrap();
+    let decoded = FrameCodec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded, frame);
     assert!(buf.is_empty());
   }
@@ -122,7 +102,7 @@ mod tests {
       payload: Bytes::new(),
     };
     let mut buf = encode(frame.clone());
-    let decoded = FrameCodec::new().decode(&mut buf).unwrap().unwrap();
+    let decoded = FrameCodec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded, frame);
   }
 
@@ -132,9 +112,11 @@ mod tests {
       kind: KIND_OUT,
       payload: Bytes::from_static(b"hello world"),
     });
-    let mut codec = FrameCodec::new();
+    let mut codec = FrameCodec;
     let mut partial = BytesMut::from(&buf[..7]);
     assert_eq!(codec.decode(&mut partial).unwrap(), None);
+    // Nothing is consumed until the frame is complete.
+    assert_eq!(&partial[..], &buf[..7]);
     partial.extend_from_slice(&buf[7..]);
     let decoded = codec.decode(&mut partial).unwrap().unwrap();
     assert_eq!(decoded.payload, Bytes::from_static(b"hello world"));
@@ -146,7 +128,7 @@ mod tests {
       kind: KIND_CTL,
       payload: Bytes::from_static(b"x"),
     });
-    let mut codec = FrameCodec::new();
+    let mut codec = FrameCodec;
     let mut partial = BytesMut::from(&buf[..2]);
     assert_eq!(codec.decode(&mut partial).unwrap(), None);
     partial.extend_from_slice(&buf[2..]);
@@ -163,7 +145,7 @@ mod tests {
       kind: KIND_OUT,
       payload: Bytes::from_static(b"b"),
     }));
-    let mut codec = FrameCodec::new();
+    let mut codec = FrameCodec;
     assert_eq!(codec.decode(&mut buf).unwrap().unwrap().kind, KIND_CTL);
     assert_eq!(codec.decode(&mut buf).unwrap().unwrap().kind, KIND_OUT);
     assert_eq!(codec.decode(&mut buf).unwrap(), None);
@@ -173,14 +155,14 @@ mod tests {
   fn zero_length_is_fatal() {
     let mut buf = BytesMut::new();
     buf.put_u32(0);
-    assert!(FrameCodec::new().decode(&mut buf).is_err());
+    assert!(FrameCodec.decode(&mut buf).is_err());
   }
 
   #[test]
   fn oversize_length_is_fatal() {
     let mut buf = BytesMut::new();
     buf.put_u32((MAX_FRAME + 1) as u32);
-    assert!(FrameCodec::new().decode(&mut buf).is_err());
+    assert!(FrameCodec.decode(&mut buf).is_err());
   }
 
   #[test]
@@ -190,7 +172,7 @@ mod tests {
       payload: Bytes::from(vec![0u8; MAX_FRAME]),
     };
     let mut buf = BytesMut::new();
-    assert!(FrameCodec::new().encode(frame, &mut buf).is_err());
+    assert!(FrameCodec.encode(frame, &mut buf).is_err());
   }
 
   #[test]
@@ -199,7 +181,7 @@ mod tests {
       kind: 0x7f,
       payload: Bytes::from_static(b"future"),
     });
-    let decoded = FrameCodec::new().decode(&mut buf).unwrap().unwrap();
+    let decoded = FrameCodec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.kind, 0x7f);
   }
 }

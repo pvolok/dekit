@@ -4,11 +4,13 @@ use std::{
   ptr::{null, null_mut},
 };
 
-use rustix::{process::WaitStatus, termios::Pid};
+use std::os::fd::{AsRawFd, RawFd};
+
+use rustix::termios::Pid;
 use tokio::io::unix::AsyncFd;
 
 use crate::{
-  kernel::task::TaskId,
+  kernel::task::{ExitInfo, TaskId},
   process::{process::Process, unix_processes_waiter::UnixProcessesWaiter},
   term::Winsize,
 };
@@ -25,7 +27,7 @@ impl UnixProcess {
     _id: TaskId,
     spec: &ProcessSpec,
     size: Winsize,
-    on_wait_returned: Box<dyn Fn(WaitStatus) + Send + Sync>,
+    on_wait_returned: Box<dyn Fn(ExitInfo) + Send + Sync>,
   ) -> std::io::Result<Self> {
     let prog = CString::new(spec.prog.as_str()).unwrap_or_default();
 
@@ -138,6 +140,26 @@ impl UnixProcess {
         master: AsyncFd::new(master)?,
       })
     }
+  }
+}
+
+impl UnixProcess {
+  /// Takes over a child and its PTY master inherited across an exec. The
+  /// fd is already non-blocking. Unlike `spawn`, the caller registers
+  /// for the exit: the child may already be reaped.
+  pub fn adopt(pid: u32, master_fd: RawFd) -> std::io::Result<Self> {
+    let pid = Pid::from_raw(pid as i32).ok_or_else(|| {
+      std::io::Error::new(std::io::ErrorKind::InvalidInput, "pid 0")
+    })?;
+    let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
+    Ok(UnixProcess {
+      pid,
+      master: AsyncFd::new(master)?,
+    })
+  }
+
+  pub fn master_fd(&self) -> RawFd {
+    self.master.as_raw_fd()
   }
 }
 

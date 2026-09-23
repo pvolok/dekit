@@ -1,0 +1,140 @@
+{
+  "format": "dekit-snapshot",
+  "version": 1,
+  "source_version": "0.9.6",
+  "pid": 4100,
+  "runner": { "kind": "project", "root": "/home/me/app" },
+  "started_at": 1789500000,
+  "lock_fd": 3,
+  "live_fd": 4,
+  "listener_fd": 9,
+  "next_task_id": 3,
+  "tasks": [
+    {
+      "id": 1,
+      "space": "dekit",
+      "path": "console",
+      "tags": [],
+      "pinned": true,
+      "deps": [],
+      "restart": "never",
+      "state": { "state": "ready" },
+      "vetoed": false,
+      "killed": false,
+      "attempts": 0,
+      "last_start_secs_ago": 120,
+      "kind": { "kind": "console" }
+    },
+    {
+      "id": 2,
+      "space": "",
+      "path": "web",
+      "label": "web",
+      "tags": ["autostart"],
+      "pinned": true,
+      "deps": [],
+      "restart": "on_failure",
+      "state": { "state": "ready" },
+      "vetoed": false,
+      "killed": false,
+      "attempts": 0,
+      "last_start_secs_ago": 119,
+      "kind": {
+        "kind": "process",
+        "spec": {
+          "prog": "sh",
+          "args": ["-c", "while true; do date; sleep 1; done"],
+          "cwd": "/home/me/app",
+          "env": [["PORT", "3000"], ["UNSET_ME", null]]
+        },
+        "stop": { "stop": "shutdown" },
+        "log": { "name": "web", "enabled": true, "dir": "/home/me/app/logs", "truncate": false },
+        "scrollback_len": 1000,
+        "mouse_scroll_speed": 5,
+        "instance": {
+          "pid": 4242,
+          "master_fd": 12,
+          "stdout_eof": false,
+          "ready_sent": false,
+          "ready_line": "",
+          "log_path": "/home/me/app/logs/web.log"
+        },
+        "screen": {
+          "grid": {
+            "width": 4,
+            "height": 2,
+            "pos": [1, 0],
+            "saved_pos": [0, 0],
+            "scroll_top": 0,
+            "scroll_bottom": 1,
+            "rows": [
+              { "text": "hi", "cells": [[1, 2], [0, 2]], "attrs": [[0, 2], [1, 2]], "wrapped": false, "size": 2 },
+              { "text": "\u4e2de\u0301", "cells": [[1, 1], [0, 1], [2, 1], [0, 1]], "attrs": [[1, 4]], "wrapped": false, "size": 3 }
+            ],
+            "used_rows": 1,
+            "origin_mode": false,
+            "saved_origin_mode": false,
+            "scrollback_len": 1000,
+            "scrollback_offset": 0,
+            "cursor_style": 0
+          },
+          "alt_grid": {
+            "width": 4,
+            "height": 2,
+            "pos": [0, 0],
+            "saved_pos": [0, 0],
+            "scroll_top": 0,
+            "scroll_bottom": 1,
+            "rows": [
+              { "text": "", "cells": [[0, 4]], "attrs": [[1, 4]], "wrapped": false, "size": 0 },
+              { "text": "", "cells": [[0, 4]], "attrs": [[1, 4]], "wrapped": false, "size": 0 }
+            ],
+            "used_rows": 0,
+            "origin_mode": false,
+            "saved_origin_mode": false,
+            "scrollback_len": 0,
+            "scrollback_offset": 0,
+            "cursor_style": 0
+          },
+          "attrs": { "fg": "default", "bg": "default", "mode": 0 },
+          "saved_attrs": { "fg": "default", "bg": "default", "mode": 0 },
+          "modes": 0,
+          "mouse_mode": "none",
+          "mouse_encoding": "default",
+          "g0": "ascii",
+          "g1": "ascii",
+          "shift_out": false,
+          "insert": false,
+          "kitty_flags": [],
+          "alt_kitty_flags": [],
+          "title": "",
+          "pending_input": "G1sz",
+          "attrs_table": [
+            { "fg": { "idx": 2 }, "bg": "default", "mode": 1 },
+            { "fg": "default", "bg": "default", "mode": 0 }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": [
+    {
+      "fd": 10,
+      "hello": { "protocol": 1, "version": "0.9.6", "app": "dekit 0.9.6", "features": [] },
+      "buffered_input": "",
+      "kind": { "kind": "rpc", "pending_upgrade": 1 }
+    },
+    {
+      "fd": 11,
+      "hello": { "protocol": 1, "version": "0.9.5", "app": "dekit 0.9.5", "features": [] },
+      "buffered_input": "AAAABQA=",
+      "buffered_output": "AAAABgFoZWxsbw==",
+      "kind": { "kind": "attach", "task": 2, "width": 120, "height": 40, "until_exit": false }
+    },
+    {
+      "fd": 13,
+      "buffered_input": "AAAA",
+      "kind": { "kind": "rpc" }
+    }
+  ]
+}

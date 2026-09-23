@@ -95,6 +95,37 @@ impl Params {
   pub fn is_sub(&self, i: usize) -> bool {
     i < self.len as usize && self.subs & (1 << i) != 0
   }
+
+  /// Writes the bytes that, scanned after `ESC [`, rebuild these params
+  /// for a CSI still waiting for its final byte.
+  pub(crate) fn write_unfinished(&self, out: &mut Vec<u8>) {
+    if self.prefix != 0 {
+      out.push(self.prefix);
+    }
+    for i in 0..self.len as usize {
+      if i > 0 {
+        out.push(if self.subs & (1 << i) != 0 {
+          b':'
+        } else {
+          b';'
+        });
+      }
+      if self.given & (1 << i) != 0 {
+        out.extend_from_slice(self.values[i].to_string().as_bytes());
+      }
+    }
+    // Invalid params always have a param or a prefix, so one more prefix
+    // byte marks them invalid and changes nothing else.
+    if self.invalid {
+      out.push(b'?');
+    }
+    match self.inter {
+      0 => (),
+      // More than one intermediate.
+      0xFF => out.extend_from_slice(b"  "),
+      inter => out.push(inter),
+    }
+  }
 }
 
 #[cfg(test)]

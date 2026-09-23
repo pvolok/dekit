@@ -5,6 +5,8 @@ use tokio::sync::mpsc::{
 };
 
 use super::*;
+use crate::kernel::kernel_message::KernelSnapshot;
+use crate::upgrade::snapshot::TaskKind as TaskKindSnapshot;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum RecordedCmd {
@@ -23,6 +25,7 @@ enum Report {
 struct RecordingTask {
   name: &'static str,
   tx: UnboundedSender<(&'static str, RecordedCmd)>,
+  ctx: TaskContext,
 }
 
 impl Task for RecordingTask {
@@ -40,7 +43,10 @@ impl Task for RecordingTask {
         self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
         fx.stopped(ExitInfo::signal(9));
       }
-      TaskCmd::Duplicate(_) => (),
+      TaskCmd::Duplicate(_) | TaskCmd::Thaw => (),
+      TaskCmd::Freeze(number) => self
+        .ctx
+        .send(KernelCommand::TaskFrozen(number, TaskKindSnapshot::Console)),
       TaskCmd::Msg(m) => match m.downcast::<Report>() {
         Ok(report) => match *report {
           Report::Started => fx.started(),
@@ -75,7 +81,8 @@ impl Task for ExitOnNotify {
         self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
         fx.stopped(ExitInfo::signal(9));
       }
-      TaskCmd::Duplicate(_) => (),
+      // Never frozen by these tests.
+      TaskCmd::Duplicate(_) | TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
       TaskCmd::Msg(_) => fx.stopped(ExitInfo::code(0)),
     }
   }
@@ -102,7 +109,8 @@ impl Task for SilentTask {
         self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
         fx.stopped(ExitInfo::signal(9));
       }
-      TaskCmd::Duplicate(_) => (),
+      // Never frozen by these tests.
+      TaskCmd::Duplicate(_) | TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
       TaskCmd::Msg(_) => (),
     }
   }
@@ -112,6 +120,7 @@ impl Task for SilentTask {
 struct StubbornTask {
   name: &'static str,
   tx: UnboundedSender<(&'static str, RecordedCmd)>,
+  ctx: TaskContext,
 }
 
 impl Task for StubbornTask {
@@ -127,7 +136,10 @@ impl Task for StubbornTask {
       TaskCmd::Kill => {
         self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
       }
-      TaskCmd::Duplicate(_) => (),
+      TaskCmd::Duplicate(_) | TaskCmd::Thaw => (),
+      TaskCmd::Freeze(number) => self
+        .ctx
+        .send(KernelCommand::TaskFrozen(number, TaskKindSnapshot::Console)),
       TaskCmd::Msg(_) => (),
     }
   }
@@ -159,7 +171,7 @@ impl Fixture {
       .kernel
       .as_mut()
       .unwrap()
-      .register_task(def, move |_| Box::new(RecordingTask { name, tx }))
+      .register_task(def, move |ctx| Box::new(RecordingTask { name, tx, ctx }))
   }
 
   fn run(&mut self) -> tokio::task::JoinHandle<()> {
@@ -671,7 +683,14 @@ fn registration_with_missing_dep_is_refused() {
       deps: vec![TaskSelector::Id(dep_id)],
       ..path_def("app")
     },
-    Box::new(move |_| Box::new(RecordingTask { name: "app", tx })),
+    Box::new(move |ctx| {
+      Box::new(RecordingTask {
+        name: "app",
+        tx,
+        ctx,
+      })
+    }),
+    None,
   );
   assert_eq!(
     registered,
@@ -696,7 +715,12 @@ fn registration_with_missing_dep_is_refused() {
       .register_task_with_id(
         dep_id,
         path_def("dep"),
-        Box::new(move |_| Box::new(RecordingTask { name: "dep", tx })),
+        Box::new(move |ctx| Box::new(RecordingTask {
+          name: "dep",
+          tx,
+          ctx
+        })),
+        None,
       )
       .is_ok()
   );
@@ -710,7 +734,12 @@ fn registration_with_missing_dep_is_refused() {
           deps: vec![TaskSelector::Id(dep_id)],
           ..path_def("app")
         },
-        Box::new(move |_| Box::new(RecordingTask { name: "app", tx })),
+        Box::new(move |ctx| Box::new(RecordingTask {
+          name: "app",
+          tx,
+          ctx
+        })),
+        None,
       )
       .is_ok()
   );
@@ -1150,8 +1179,8 @@ async fn unresponsive_task_is_killed_then_given_up() {
     .kernel
     .as_mut()
     .unwrap()
-    .register_task(path_def("a"), move |_| {
-      Box::new(StubbornTask { name: "a", tx })
+    .register_task(path_def("a"), move |ctx| {
+      Box::new(StubbornTask { name: "a", tx, ctx })
     });
   let handle = fx.run();
 
@@ -1234,8 +1263,8 @@ async fn start_during_stop_grace_survives_give_up() {
     .kernel
     .as_mut()
     .unwrap()
-    .register_task(path_def("a"), move |_| {
-      Box::new(StubbornTask { name: "a", tx })
+    .register_task(path_def("a"), move |ctx| {
+      Box::new(StubbornTask { name: "a", tx, ctx })
     });
   let handle = fx.run();
 
@@ -1790,4 +1819,309 @@ async fn subscribe_replays_existing_tasks() {
 
   pc.send(KernelCommand::Quit);
   handle.await.unwrap();
+}
+
+// ---- Upgrade freeze / thaw / restore ----
+
+async fn try_freeze(fx: &Fixture) -> Result<KernelSnapshot, String> {
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  fx.pc.send(KernelCommand::Freeze(tx));
+  tokio::time::timeout(Duration::from_secs(1), rx)
+    .await
+    .expect("timed out waiting for the freeze")
+    .expect("freeze reply dropped")
+}
+
+async fn freeze(fx: &Fixture) -> KernelSnapshot {
+  try_freeze(fx).await.expect("freeze refused")
+}
+
+#[tokio::test]
+async fn freeze_defers_intent_until_thaw() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", path_def("a"));
+  let handle = fx.run();
+
+  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+  let snapshot = freeze(&fx).await;
+  assert_eq!(snapshot.tasks.len(), 1);
+  assert_eq!(snapshot.tasks[0].state, snap::TaskState::Ready);
+  assert!(snapshot.tasks[0].pinned);
+
+  // Intent waits; reads still work.
+  fx.pc.send(KernelCommand::Down(TaskSelector::Id(a), None));
+  fx.flush().await;
+  fx.assert_no_cmd();
+
+  fx.pc.send(KernelCommand::Thaw);
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn second_freeze_is_refused_and_reports_still_apply() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", path_def("a"));
+  let handle = fx.run();
+  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+  let _first = freeze(&fx).await;
+  assert!(
+    try_freeze(&fx).await.is_err(),
+    "a second freeze must be refused"
+  );
+
+  // A task exit reported while frozen lands in the graph without any
+  // driving (no restart command goes out).
+  let task_ctx = TaskContext::new(
+    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(100)),
+    a,
+    fx.pc.sender_for_tests(),
+  );
+  task_ctx.send(KernelCommand::TaskStopped(ExitInfo::code(1)));
+  fx.flush().await;
+  fx.assert_no_cmd();
+  match fx
+    .pc
+    .query(KernelQuery::ListTasks(TaskSelector::Id(a)))
+    .await
+  {
+    Ok(KernelQueryResponse::TaskList(tasks)) => {
+      assert_eq!(tasks[0].state, TaskState::Exited(ExitInfo::code(1)));
+    }
+    _ => panic!("query failed"),
+  }
+
+  fx.pc.send(KernelCommand::Thaw);
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn freeze_is_refused_while_shutting_down() {
+  let mut fx = Fixture::new();
+  let tx = fx.tx.clone();
+  let a = fx
+    .kernel
+    .as_mut()
+    .unwrap()
+    .register_task(path_def("a"), move |ctx| {
+      Box::new(StubbornTask { name: "a", tx, ctx })
+    });
+  let handle = fx.run();
+  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  // The stubborn task keeps the quit in progress.
+  fx.pc.send(KernelCommand::Quit);
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+
+  let err = try_freeze(&fx).await.unwrap_err();
+  assert!(err.contains("shutting down"), "{err}");
+
+  // Nothing froze: dropping the task lets the quit finish.
+  fx.pc.send(KernelCommand::Remove(TaskSelector::Id(a), None));
+  tokio::time::timeout(Duration::from_secs(2), handle)
+    .await
+    .expect("timed out waiting for kernel to quit")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn freeze_names_a_task_whose_handler_stopped() {
+  let mut fx = Fixture::new();
+  fx.add("a", path_def("a"));
+  fx.kernel
+    .as_mut()
+    .unwrap()
+    .register_task(path_def("gone"), |_| {
+      let (tx, _) = unbounded_channel();
+      Box::new(crate::kernel::task::ChannelTask::new(tx))
+    });
+  let handle = fx.run();
+
+  let err = try_freeze(&fx).await.unwrap_err();
+  assert!(err.contains("gone"), "{err}");
+
+  fx.pc.send(KernelCommand::Thaw);
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn a_late_answer_to_an_earlier_freeze_is_ignored() {
+  struct Mute;
+  impl Task for Mute {
+    fn handle_cmd(&mut self, _cmd: TaskCmd, _fx: &mut Effects) {}
+  }
+  let mut fx = Fixture::new();
+  let a = fx
+    .kernel
+    .as_mut()
+    .unwrap()
+    .register_task(path_def("a"), |_| Box::new(Mute));
+  let handle = fx.run();
+  let task_ctx = TaskContext::new(
+    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(100)),
+    a,
+    fx.pc.sender_for_tests(),
+  );
+
+  // Freeze 1 never hears back (as if it timed out) and is thawed.
+  let (tx, _first) = tokio::sync::oneshot::channel();
+  fx.pc.send(KernelCommand::Freeze(tx));
+  fx.pc.send(KernelCommand::Thaw);
+
+  let (tx, mut second) = tokio::sync::oneshot::channel();
+  fx.pc.send(KernelCommand::Freeze(tx));
+  task_ctx.send(KernelCommand::TaskFrozen(1, TaskKindSnapshot::Console));
+  fx.flush().await;
+  assert!(
+    second.try_recv().is_err(),
+    "a stale answer completed freeze 2"
+  );
+
+  task_ctx.send(KernelCommand::TaskFrozen(2, TaskKindSnapshot::Console));
+  let snapshot = tokio::time::timeout(Duration::from_secs(1), second)
+    .await
+    .expect("timed out waiting for the freeze")
+    .unwrap()
+    .unwrap();
+  assert_eq!(snapshot.tasks.len(), 1);
+
+  fx.pc.send(KernelCommand::Thaw);
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn thawed_intent_is_handled_one_message_at_a_time() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", path_def("a"));
+  let handle = fx.run();
+  let _ = freeze(&fx).await;
+
+  // Settled one message at a time, as without the freeze, the start
+  // happens before the down undoes it.
+  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc.send(KernelCommand::Down(TaskSelector::Id(a), None));
+  fx.flush().await;
+  fx.assert_no_cmd();
+
+  fx.pc.send(KernelCommand::Thaw);
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn stopping_task_keeps_its_deadline_in_the_snapshot() {
+  let mut fx = Fixture::new();
+  let tx = fx.tx.clone();
+  let a = fx
+    .kernel
+    .as_mut()
+    .unwrap()
+    .register_task(path_def("a"), move |ctx| {
+      Box::new(StubbornTask { name: "a", tx, ctx })
+    });
+  let handle = fx.run();
+  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  fx.pc.send(KernelCommand::Down(TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+
+  let snapshot = freeze(&fx).await;
+  let task = &snapshot.tasks[0];
+  assert_eq!(task.state, snap::TaskState::Stopping);
+  let remaining = task.timer_ms.expect("stop grace remaining");
+  assert!(remaining > 0 && remaining <= STOP_GRACE.as_millis() as u64);
+
+  fx.pc.send(KernelCommand::Thaw);
+  // The stubborn task would hold quit for the whole grace; drop it.
+  fx.pc.send(KernelCommand::Remove(TaskSelector::Id(a), None));
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn restore_rebuilds_graph_and_drives_only_what_changed() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", path_def("a"));
+  let b = fx.add(
+    "b",
+    TaskDef {
+      deps: vec![TaskSelector::Id(a)],
+      ..path_def("b")
+    },
+  );
+  let handle = fx.run();
+  fx.pc.send(KernelCommand::Start(TaskSelector::Id(b), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
+  let snapshot = freeze(&fx).await;
+  fx.pc.send(KernelCommand::Thaw);
+  fx.quit(handle).await;
+
+  // A new kernel from the snapshot: both tasks are Ready already, so
+  // nothing is started; b is pinned and requires a.
+  let mut restored = Fixture::new();
+  let tasks = snapshot
+    .tasks
+    .iter()
+    .map(|saved| {
+      let name: &'static str = if saved.id == a.0 { "a" } else { "b" };
+      let tx = restored.tx.clone();
+      let def = TaskDef {
+        path: saved.path.as_deref().map(|p| TaskPath::new(p).unwrap()),
+        deps: saved
+          .deps
+          .iter()
+          .map(|id| TaskSelector::Id(TaskId(*id)))
+          .collect(),
+        pinned: saved.pinned,
+        ..Default::default()
+      };
+      (
+        saved,
+        TaskRegistration {
+          task_id: TaskId(saved.id),
+          def,
+          factory: Box::new(move |ctx| {
+            Box::new(RecordingTask { name, tx, ctx })
+          }),
+        },
+      )
+    })
+    .collect();
+  restored
+    .kernel
+    .as_mut()
+    .unwrap()
+    .restore(snapshot.next_task_id, tasks)
+    .unwrap();
+  let handle = restored.run();
+  restored.flush().await;
+  restored.assert_no_cmd();
+
+  match restored
+    .pc
+    .query(KernelQuery::Explain(TaskSelector::Id(b)))
+    .await
+  {
+    Ok(KernelQueryResponse::Explain(explain)) => {
+      assert_eq!(explain[0].state, TaskState::Ready);
+      assert!(explain[0].pinned);
+      assert_eq!(explain[0].deps.len(), 1);
+    }
+    _ => panic!("explain failed"),
+  }
+
+  // Dropping the pin now stops b first, then a: the edges survived.
+  restored
+    .pc
+    .send(KernelCommand::Down(TaskSelector::Id(b), None));
+  assert_eq!(restored.recv().await, ("b", RecordedCmd::Stop));
+  assert_eq!(restored.recv().await, ("a", RecordedCmd::Stop));
+  restored.quit(handle).await;
 }

@@ -936,16 +936,7 @@ impl Screen {
       // DECSCUSR - Select Cursor Style
       // https://terminalguide.namepad.de/seq/csi_sq_t_space/
       (0, b' ', b'q') => {
-        self.grid.cursor_style = match p.get16(0, 0) {
-          0 => CursorStyle::Default,
-          1 => CursorStyle::BlinkingBlock,
-          2 => CursorStyle::SteadyBlock,
-          3 => CursorStyle::BlinkingUnderline,
-          4 => CursorStyle::SteadyUnderline,
-          5 => CursorStyle::BlinkingBar,
-          6 => CursorStyle::SteadyBar,
-          _ => CursorStyle::Default,
-        };
+        self.grid.cursor_style = CursorStyle::from_u16(p.get16(0, 0));
       }
       // DECSTBM - Set Top and Bottom Margins
       // https://terminalguide.namepad.de/seq/csi_sr/
@@ -1564,5 +1555,212 @@ mod tests {
         prop_assert_eq!(single_events, chunked_events);
       }
     }
+  }
+}
+
+impl Screen {
+  pub fn snapshot(&self) -> crate::upgrade::snapshot::Screen {
+    use super::snapshot::{AttrsTable, attrs_snapshot};
+    use crate::upgrade::snapshot::to_base64;
+    let mut table = AttrsTable::default();
+    let grid = self.grid.snapshot(&mut table);
+    let alt_grid = self.alternate_grid.snapshot(&mut table);
+    let charset = |set: &CharSet| match set {
+      CharSet::Ascii => "ascii",
+      CharSet::Uk => "uk",
+      CharSet::DecLineDrawing => "dec",
+    };
+    crate::upgrade::snapshot::Screen {
+      grid,
+      alt_grid,
+      attrs: attrs_snapshot(&self.attrs),
+      saved_attrs: attrs_snapshot(&self.saved_attrs),
+      modes: self.modes,
+      mouse_mode: match self.mouse_protocol_mode {
+        MouseProtocolMode::None => "none",
+        MouseProtocolMode::Press => "press",
+        MouseProtocolMode::PressRelease => "press_release",
+        MouseProtocolMode::ButtonMotion => "button_motion",
+        MouseProtocolMode::AnyMotion => "any_motion",
+      }
+      .to_string(),
+      mouse_encoding: match self.mouse_protocol_encoding {
+        MouseProtocolEncoding::Default => "default",
+        MouseProtocolEncoding::Utf8 => "utf8",
+        MouseProtocolEncoding::Sgr => "sgr",
+      }
+      .to_string(),
+      g0: charset(&self.g0).to_string(),
+      g1: charset(&self.g1).to_string(),
+      shift_out: self.shift_out,
+      insert: self.insert,
+      kitty_flags: self.kitty_flags.clone(),
+      alt_kitty_flags: self.alt_kitty_flags.clone(),
+      title: self.title.clone(),
+      pending_input: to_base64(&self.scanner.pending()),
+      attrs_table: table.into_entries(),
+    }
+  }
+
+  pub fn from_snapshot(
+    screen: &crate::upgrade::snapshot::Screen,
+  ) -> anyhow::Result<Self> {
+    use super::snapshot::attrs_from_snapshot;
+    use crate::upgrade::snapshot::from_base64;
+    let table: Vec<Attrs> =
+      screen.attrs_table.iter().map(attrs_from_snapshot).collect();
+    let charset = |name: &str| match name {
+      "uk" => CharSet::Uk,
+      "dec" => CharSet::DecLineDrawing,
+      _ => CharSet::Ascii,
+    };
+    let mut restored = Self {
+      scanner: Scanner::default(),
+      grid: super::grid::Grid::from_snapshot(&screen.grid, &table)?,
+      alternate_grid: super::grid::Grid::from_snapshot(
+        &screen.alt_grid,
+        &table,
+      )?,
+      attrs: attrs_from_snapshot(&screen.attrs),
+      saved_attrs: attrs_from_snapshot(&screen.saved_attrs),
+      modes: screen.modes,
+      mouse_protocol_mode: match screen.mouse_mode.as_str() {
+        "press" => MouseProtocolMode::Press,
+        "press_release" => MouseProtocolMode::PressRelease,
+        "button_motion" => MouseProtocolMode::ButtonMotion,
+        "any_motion" => MouseProtocolMode::AnyMotion,
+        _ => MouseProtocolMode::None,
+      },
+      mouse_protocol_encoding: match screen.mouse_encoding.as_str() {
+        "utf8" => MouseProtocolEncoding::Utf8,
+        "sgr" => MouseProtocolEncoding::Sgr,
+        _ => MouseProtocolEncoding::Default,
+      },
+      g0: charset(&screen.g0),
+      g1: charset(&screen.g1),
+      shift_out: screen.shift_out,
+      insert: screen.insert,
+      kitty_flags: screen.kitty_flags.clone(),
+      alt_kitty_flags: screen.alt_kitty_flags.clone(),
+      title: screen.title.clone(),
+    };
+    // An unfinished sequence cannot complete or emit anything on its own,
+    // so replaying it only rebuilds the parser state.
+    let pending = from_base64(&screen.pending_input)?;
+    let mut events = Vec::new();
+    restored.process(&pending, &mut events);
+    Ok(restored)
+  }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+  use super::*;
+  use crate::term::ansi::render_screen_ansi;
+
+  fn state(s: &Screen) -> (String, (u16, u16), String, bool, usize) {
+    (
+      render_screen_ansi(s),
+      s.cursor_position(),
+      s.title().to_string(),
+      s.hide_cursor(),
+      s.scrollback(),
+    )
+  }
+
+  #[test]
+  fn round_trip_preserves_rendering_and_parser_state() {
+    let mut screen = Screen::new(
+      Size {
+        width: 20,
+        height: 5,
+      },
+      50,
+    );
+    let mut events = Vec::new();
+    for i in 0..30 {
+      screen.process(
+        format!("\x1b[1;3{}mline {i} \u{4e2d}\x1b[0m\r\n", i % 8).as_bytes(),
+        &mut events,
+      );
+    }
+    screen.process(b"\x1b]2;title\x07\x1b[?25l\x1b[2;3H", &mut events);
+    screen.scroll_screen_up(3);
+    // Half an escape sequence, then the rest after the round trip.
+    screen.process(b"\x1b[3", &mut events);
+
+    let snapshot = screen.snapshot();
+    let json = serde_json::to_vec(&snapshot).unwrap();
+    let decoded = serde_json::from_slice(&json).unwrap();
+    let mut restored = Screen::from_snapshot(&decoded).unwrap();
+    assert_eq!(state(&restored), state(&screen));
+    assert_eq!(restored.scanner.pending(), b"\x1b[3");
+
+    screen.process(b"0mX", &mut events);
+    restored.process(b"0mX", &mut events);
+    assert_eq!(state(&restored), state(&screen));
+    assert_eq!(restored.attrs, screen.attrs);
+  }
+
+  #[test]
+  fn alternate_screen_and_modes_survive() {
+    let mut screen = Screen::new(
+      Size {
+        width: 10,
+        height: 3,
+      },
+      0,
+    );
+    let mut events = Vec::new();
+    screen.process(b"main\x1b[?1049h\x1b[?1000h\x1b[?1006halt", &mut events);
+    let restored = Screen::from_snapshot(&screen.snapshot()).unwrap();
+    assert_eq!(state(&restored), state(&screen));
+    assert_eq!(
+      restored.mouse_protocol_mode(),
+      MouseProtocolMode::PressRelease
+    );
+    assert_eq!(
+      restored.mouse_protocol_encoding(),
+      MouseProtocolEncoding::Sgr
+    );
+    assert_eq!(restored.modes, screen.modes);
+  }
+
+  #[test]
+  fn cells_keep_their_boundaries() {
+    let mut screen = Screen::new(
+      Size {
+        width: 10,
+        height: 2,
+      },
+      0,
+    );
+    let mut events = Vec::new();
+    // A combining accent, a wide char with its continuation, a gap.
+    screen.process("e\u{301}x\u{4e2d}y\x1b[2Cz".as_bytes(), &mut events);
+    let restored = Screen::from_snapshot(&screen.snapshot()).unwrap();
+    for col in 0..10 {
+      let cell = |s: &Screen| s.cell(0, col).map(|c| c.contents().to_string());
+      assert_eq!(cell(&restored), cell(&screen), "col {col}");
+    }
+    assert_eq!(state(&restored), state(&screen));
+  }
+
+  #[test]
+  fn pending_wrap_survives() {
+    let mut screen = Screen::new(
+      Size {
+        width: 5,
+        height: 3,
+      },
+      0,
+    );
+    let mut events = Vec::new();
+    // Exactly fills the row: the next char wraps.
+    screen.process(b"abcde", &mut events);
+    let mut restored = Screen::from_snapshot(&screen.snapshot()).unwrap();
+    screen.process(b"X", &mut events);
+    restored.process(b"X", &mut events);
+    assert_eq!(state(&restored), state(&screen));
   }
 }

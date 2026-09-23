@@ -52,6 +52,8 @@ use crate::{
   },
 };
 
+use crate::upgrade::snapshot::TaskKind as TaskKindSnapshot;
+
 fn kernel_copy_move(dir: CopyMove) -> KernelCopyMove {
   match dir {
     CopyMove::Up => KernelCopyMove::Up,
@@ -341,7 +343,15 @@ impl App {
         self.stop = true;
         return;
       }
-      TaskCmd::Duplicate(_) => return,
+      TaskCmd::Duplicate(_) | TaskCmd::Thaw => return,
+      // The console keeps no state worth carrying: attachments re-attach
+      // and the task list is replayed on resume.
+      TaskCmd::Freeze(number) => {
+        self
+          .pc
+          .send(KernelCommand::TaskFrozen(number, TaskKindSnapshot::Console));
+        return;
+      }
       TaskCmd::Msg(msg) => msg,
     };
     let msg = match msg.downcast::<Action>() {

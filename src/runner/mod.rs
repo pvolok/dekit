@@ -225,13 +225,13 @@ pub fn resolve_kernel_binary(runner: &RunnerSpec) -> anyhow::Result<PathBuf> {
   }
 }
 
-fn validate_binary(path: PathBuf) -> anyhow::Result<PathBuf> {
+pub(crate) fn validate_binary(path: PathBuf) -> anyhow::Result<PathBuf> {
   if !path.is_file() {
-    bail!("configured dekit kernel does not exist: {}", path.display());
+    bail!("dekit binary does not exist: {}", path.display());
   }
   validate_executable(&path)?;
   dunce::canonicalize(&path)
-    .with_context(|| format!("invalid dekit kernel `{}`", path.display()))
+    .with_context(|| format!("invalid dekit binary `{}`", path.display()))
 }
 
 fn validate_executable(path: &Path) -> anyhow::Result<()> {
@@ -251,10 +251,19 @@ fn validate_executable(path: &Path) -> anyhow::Result<()> {
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
   use std::io::Write;
 
+  atomic_write_with(path, |out| Ok(out.write_all(contents)?))
+}
+
+/// Like `atomic_write`, with the contents streamed by `write`.
+pub(crate) fn atomic_write_with(
+  path: &Path,
+  write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
   let temp = path.with_extension(format!("tmp-{}", std::process::id()));
   let result = (|| {
-    let mut file = std::fs::File::create(&temp)?;
-    file.write_all(contents)?;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&temp)?);
+    write(&mut out)?;
+    let file = out.into_inner().map_err(|err| err.into_error())?;
     file.sync_data()?;
     std::fs::rename(&temp, path)?;
     anyhow::Ok(())

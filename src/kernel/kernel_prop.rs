@@ -70,7 +70,8 @@ impl Task for ScriptedTask {
       TaskCmd::Start => self.script.on_start.apply(fx),
       TaskCmd::Stop => self.script.on_stop.apply(fx),
       TaskCmd::Kill => self.script.on_kill.apply(fx),
-      TaskCmd::Duplicate(_) => (),
+      // Never frozen: the harness drives no upgrades.
+      TaskCmd::Duplicate(_) | TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
       TaskCmd::Msg(_) => self.script.on_msg.apply(fx),
     }
   }
@@ -330,6 +331,7 @@ impl Run {
       task_id,
       def,
       Box::new(move |_| Box::new(ScriptedTask { script })),
+      None,
     );
     assert_eq!(
       registered.is_ok(),

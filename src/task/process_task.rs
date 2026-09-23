@@ -1,6 +1,6 @@
 use std::future::pending;
 
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::error::ResultLogger;
 use crate::kernel::kernel_message::{
@@ -17,12 +17,11 @@ use crate::kernel::task_screen::{
 use crate::process::NativeProcess;
 use crate::process::process::Process as _;
 use crate::process::process_spec::ProcessSpec;
-use crate::task::logger::{LogResolver, spawn_logger};
+use crate::task::logger::{LogSink, LogSpec, spawn_logger};
 use crate::term::key::Key;
 use crate::term::vt::emit::{self, KeyEncodeModes};
 use crate::term::{Screen, Winsize};
-
-struct ProcExited(ExitInfo);
+use crate::upgrade::snapshot as snap;
 
 /// An OS signal a `Signal` stop can deliver. The name table and the libc
 /// mapping are generated from one list so they can't drift. On Windows only
@@ -39,6 +38,12 @@ macro_rules! signals {
         match name {
           $($name => Some(Sig::$variant),)+
           _ => None,
+        }
+      }
+
+      pub fn name(self) -> &'static str {
+        match self {
+          $(Sig::$variant => $name,)+
         }
       }
 
@@ -129,7 +134,7 @@ pub struct ProcessTaskConfig {
   pub spec: ProcessSpec,
   pub label: Option<String>,
   pub stop: StopSignal,
-  pub log: Option<LogResolver>,
+  pub log: Option<LogSpec>,
   pub restart: RestartMode,
   /// Readiness probe: the task reports ready once an output line contains
   /// this string. Without it the task is ready as soon as it starts.
@@ -149,6 +154,81 @@ pub fn process_task_registration(
   config: ProcessTaskConfig,
 ) -> TaskRegistration {
   let vt = SharedVt::new(Screen::new(DEFAULT_SIZE, config.scrollback_len));
+  registration(task_id, key, config, vt, None)
+}
+
+/// A process task re-created around its inherited child and PTY.
+#[cfg(unix)]
+pub fn process_task_from_snapshot(
+  task_id: TaskId,
+  key: Option<TaskKey>,
+  saved: &snap::Task,
+  process: &snap::ProcessTask,
+) -> anyhow::Result<TaskRegistration> {
+  let spec = ProcessSpec {
+    prog: process.spec.prog.clone(),
+    args: process.spec.args.clone(),
+    cwd: process.spec.cwd.clone(),
+    env: process.spec.env.iter().cloned().collect(),
+  };
+  let stop = match &process.stop {
+    snap::StopSignal::Shutdown => StopSignal::Shutdown,
+    snap::StopSignal::Kill => StopSignal::Kill,
+    snap::StopSignal::Signal { sig, group } => StopSignal::Signal {
+      sig: Sig::from_name(sig)
+        .ok_or_else(|| anyhow::anyhow!("unknown stop signal {sig}"))?,
+      group: *group,
+    },
+    snap::StopSignal::SendKeys { keys } => StopSignal::SendKeys(keys.clone()),
+    snap::StopSignal::Cmd { cmd } => StopSignal::Cmd(cmd.clone()),
+  };
+  let log = process.log.as_ref().map(|log| LogSpec {
+    config: crate::config::task_log::TaskLogConfig {
+      enabled: log.enabled,
+      dir: log.dir.as_ref().map(std::path::PathBuf::from),
+      file: log.file.as_ref().map(std::path::PathBuf::from),
+      mode: Some(if log.truncate {
+        crate::config::task_log::LogMode::Truncate
+      } else {
+        crate::config::task_log::LogMode::Append
+      }),
+    },
+    name: log.name.clone(),
+  });
+  let config = ProcessTaskConfig {
+    spec,
+    label: saved.label.clone(),
+    stop,
+    log,
+    restart: saved.restart.into(),
+    ready_log: process.ready_log.clone(),
+    scrollback_len: process.scrollback_len,
+    mouse_scroll_speed: process.mouse_scroll_speed,
+    deps: saved
+      .deps
+      .iter()
+      .map(|id| TaskSelector::Id(TaskId(*id)))
+      .collect(),
+    tags: saved.tags.clone(),
+    pinned: saved.pinned,
+  };
+  let vt = SharedVt::new(Screen::from_snapshot(&process.screen)?);
+  Ok(registration(
+    task_id,
+    key,
+    config,
+    vt,
+    process.instance.clone(),
+  ))
+}
+
+fn registration(
+  task_id: TaskId,
+  key: Option<TaskKey>,
+  config: ProcessTaskConfig,
+  vt: SharedVt,
+  instance: Option<snap::Instance>,
+) -> TaskRegistration {
   let task_vt = vt.clone();
   let (space, path) = match key.clone() {
     Some(key) => (key.space, Some(key.path)),
@@ -173,9 +253,109 @@ pub fn process_task_registration(
       ..Default::default()
     },
     move |ctx, receiver| async move {
-      process_main(ctx, receiver, key, task_vt, config).await;
+      process_main(ctx, receiver, key, task_vt, config, instance).await;
     },
   )
+}
+
+/// What the task tracks about its current child besides the process
+/// itself; carried across an upgrade with it.
+#[derive(Default)]
+struct Instance {
+  /// Where the reaper hands the exit status; gone once it has.
+  exits: Option<UnboundedReceiver<ExitInfo>>,
+  exit_info: Option<ExitInfo>,
+  stdout_eof: bool,
+  ready_sent: bool,
+  ready_line_buf: Vec<u8>,
+  /// The log path is resolved per spawn (it may contain the pid).
+  current_log: Option<(std::path::PathBuf, u64)>,
+}
+
+impl Instance {
+  fn exited(&mut self, info: ExitInfo, process: Option<&mut NativeProcess>) {
+    self.exit_info = Some(info);
+    self.exits = None;
+    if let Some(p) = process {
+      p.on_exited();
+    }
+  }
+}
+
+fn snapshot(
+  config: &ProcessTaskConfig,
+  process: Option<&NativeProcess>,
+  task_screen: &TaskScreen,
+  instance: &Instance,
+) -> snap::ProcessTask {
+  let stop = match &config.stop {
+    StopSignal::Shutdown => snap::StopSignal::Shutdown,
+    StopSignal::Kill => snap::StopSignal::Kill,
+    StopSignal::Signal { sig, group } => snap::StopSignal::Signal {
+      sig: sig.name().to_string(),
+      group: *group,
+    },
+    StopSignal::SendKeys(keys) => {
+      snap::StopSignal::SendKeys { keys: keys.clone() }
+    }
+    StopSignal::Cmd(cmd) => snap::StopSignal::Cmd { cmd: cmd.clone() },
+  };
+  #[cfg(unix)]
+  let instance = process.map(|p| snap::Instance {
+    pid: p.pid(),
+    master_fd: p.master_fd(),
+    exit: instance.exit_info.map(Into::into),
+    stdout_eof: instance.stdout_eof,
+    ready_sent: instance.ready_sent,
+    ready_line: snap::to_base64(&instance.ready_line_buf),
+    log_path: instance
+      .current_log
+      .as_ref()
+      .map(|(path, _)| path.to_string_lossy().into_owned()),
+  });
+  #[cfg(not(unix))]
+  let instance = {
+    let _ = (process, instance);
+    None
+  };
+  snap::ProcessTask {
+    spec: snap::ProcessSpec {
+      prog: config.spec.prog.clone(),
+      args: config.spec.args.clone(),
+      cwd: config.spec.cwd.clone(),
+      env: config
+        .spec
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect(),
+    },
+    stop,
+    log: config.log.as_ref().map(|log| snap::LogSpec {
+      name: log.name.clone(),
+      enabled: log.config.enabled,
+      dir: log
+        .config
+        .dir
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned()),
+      file: log
+        .config
+        .file
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned()),
+      truncate: log.config.mode() == crate::config::task_log::LogMode::Truncate,
+    }),
+    ready_log: config.ready_log.clone(),
+    scrollback_len: config.scrollback_len,
+    mouse_scroll_speed: config.mouse_scroll_speed,
+    instance,
+    screen: task_screen
+      .vt()
+      .read()
+      .map(|screen| screen.snapshot())
+      .unwrap_or_else(|_| Screen::new(DEFAULT_SIZE, 0).snapshot()),
+  }
 }
 
 async fn process_main(
@@ -183,25 +363,54 @@ async fn process_main(
   mut receiver: UnboundedReceiver<TaskCmd>,
   key: Option<TaskKey>,
   vt: SharedVt,
-  mut config: ProcessTaskConfig,
+  config: ProcessTaskConfig,
+  saved: Option<snap::Instance>,
 ) {
   let mut task_screen =
     TaskScreen::new(ctx.task_id, vt, config.mouse_scroll_speed);
   let mut screen_effects: Vec<TaskScreenEffect> = Vec::new();
 
   let mut process: Option<NativeProcess> = None;
-  // The log path is resolved per spawn (it may contain the pid).
-  let mut current_log: Option<(std::path::PathBuf, u64)> = None;
+  let mut instance = Instance::default();
   let mut read_buf = [0u8; 8 * 1024];
   let mut key_buf: Vec<u8> = Vec::new();
-  let mut stdout_eof = false;
-  let mut exit_info: Option<ExitInfo> = None;
-  let mut ready_line_buf: Vec<u8> = Vec::new();
-  let mut ready_sent = false;
+  // Frozen for an upgrade: no reads until thawed.
+  let mut frozen = false;
+
+  #[cfg(unix)]
+  if let Some(saved) = saved {
+    match adopt_native(&saved) {
+      Ok((adopted, receiver)) => {
+        process = Some(adopted);
+        instance.exits = receiver;
+        instance.exit_info = saved.exit.map(Into::into);
+        instance.stdout_eof = saved.stdout_eof;
+        instance.ready_sent = saved.ready_sent;
+        instance.ready_line_buf =
+          snap::from_base64(&saved.ready_line).unwrap_or_default();
+        if let Some(path) = saved.log_path {
+          let path = std::path::PathBuf::from(path);
+          let id = task_screen.add_logger(spawn_logger(LogSink {
+            path: path.clone(),
+            append: true,
+          }));
+          instance.current_log = Some((path, id));
+        }
+      }
+      Err(err) => {
+        log::error!("Failed to adopt child {}: {err}", saved.pid);
+        // No process to wait for: without this report the task would
+        // stay active forever.
+        ctx.send(KernelCommand::TaskStopped(ExitInfo::error()));
+      }
+    }
+  }
+  #[cfg(not(unix))]
+  let _ = saved;
 
   loop {
-    if stdout_eof
-      && let Some(info) = exit_info
+    if instance.stdout_eof
+      && let Some(info) = instance.exit_info
       && process.take().is_some()
     {
       ctx.send(KernelCommand::TaskStopped(info));
@@ -210,36 +419,49 @@ async fn process_main(
     enum Next {
       Cmd(Option<TaskCmd>),
       Read(std::io::Result<usize>),
+      Exited(Option<ExitInfo>),
     }
     let read_fut = async {
       match process.as_mut() {
-        Some(p) if !stdout_eof => p.read(&mut read_buf).await,
+        Some(p) if !instance.stdout_eof && !frozen => {
+          p.read(&mut read_buf).await
+        }
         _ => pending().await,
+      }
+    };
+    let exit_fut = async {
+      match instance.exits.as_mut() {
+        Some(exits) => exits.recv().await,
+        None => pending().await,
       }
     };
     let next = tokio::select! {
       cmd = receiver.recv() => Next::Cmd(cmd),
       n = read_fut => Next::Read(n),
+      info = exit_fut => Next::Exited(info),
     };
 
     match next {
       Next::Cmd(None) => break,
       Next::Cmd(Some(cmd)) => match cmd {
         TaskCmd::Start => {
-          if process.is_none() {
-            process = start_instance(&ctx, &config.spec, task_screen.vt());
-            if let Some(p) = &process {
-              exit_info = None;
-              stdout_eof = false;
-              ready_line_buf.clear();
-              ready_sent = false;
-              update_log_observer(
-                &mut task_screen,
-                &mut config.log,
-                &mut current_log,
-                p.pid(),
-              );
-            }
+          if process.is_none()
+            && let Some((p, receiver)) =
+              start_instance(&ctx, &config.spec, task_screen.vt())
+          {
+            instance.exit_info = None;
+            instance.stdout_eof = false;
+            instance.ready_line_buf.clear();
+            instance.ready_sent = false;
+            update_log_observer(
+              &mut task_screen,
+              &config.log,
+              &mut instance.current_log,
+              ctx.task_id,
+              p.pid(),
+            );
+            process = Some(p);
+            instance.exits = Some(receiver);
           }
         }
         TaskCmd::Stop => {
@@ -285,40 +507,55 @@ async fn process_main(
             }
           });
         }
-        TaskCmd::Msg(msg) => {
-          let msg = match msg.downcast::<ProcExited>() {
-            Ok(exited) => {
-              exit_info = Some(exited.0);
-              if let Some(p) = process.as_mut() {
-                p.on_exited();
-              }
-              continue;
-            }
-            Err(msg) => msg,
-          };
-          match msg.downcast::<TaskScreenCmd>() {
-            Ok(cmd) => {
-              task_screen.handle_cmd(*cmd, &mut screen_effects);
-              apply_effects(
-                &mut screen_effects,
-                &mut process,
-                task_screen.vt(),
-                &mut key_buf,
-              )
-              .await;
-            }
-            Err(_) => log::error!("ProcessTask received unknown Msg"),
+        TaskCmd::Freeze(number) => {
+          // An exit the reaper collected before reaping paused is already
+          // queued; the snapshot must carry it.
+          if let Some(info) = instance
+            .exits
+            .as_mut()
+            .and_then(|receiver| receiver.try_recv().ok())
+          {
+            instance.exited(info, process.as_mut());
           }
+          task_screen.flush_loggers().await;
+          frozen = true;
+          let saved =
+            snapshot(&config, process.as_ref(), &task_screen, &instance);
+          ctx.send(KernelCommand::TaskFrozen(
+            number,
+            snap::TaskKind::Process(saved),
+          ));
         }
+        TaskCmd::Thaw => frozen = false,
+        TaskCmd::Msg(msg) => match msg.downcast::<TaskScreenCmd>() {
+          Ok(cmd) => {
+            task_screen.handle_cmd(*cmd, &mut screen_effects);
+            apply_effects(
+              &mut screen_effects,
+              &mut process,
+              task_screen.vt(),
+              &mut key_buf,
+            )
+            .await;
+          }
+          Err(_) => log::error!("ProcessTask received unknown Msg"),
+        },
       },
 
-      Next::Read(Ok(0)) => stdout_eof = true,
+      // Each instance exits once; `None` means the reaper is gone.
+      Next::Exited(Some(info)) => instance.exited(info, process.as_mut()),
+      Next::Exited(None) => instance.exits = None,
+      Next::Read(Ok(0)) => instance.stdout_eof = true,
       Next::Read(Ok(n)) => {
         if let Some(pattern) = &config.ready_log
-          && !ready_sent
+          && !instance.ready_sent
         {
-          ready_sent =
-            scan_ready(&ctx, pattern, &mut ready_line_buf, &read_buf[..n]);
+          instance.ready_sent = scan_ready(
+            &ctx,
+            pattern,
+            &mut instance.ready_line_buf,
+            &read_buf[..n],
+          );
         }
         task_screen
           .process(&read_buf[..n], &mut screen_effects)
@@ -333,7 +570,7 @@ async fn process_main(
       }
       Next::Read(Err(e)) => {
         log::warn!("Process read error: {}", e);
-        stdout_eof = true;
+        instance.stdout_eof = true;
       }
     }
   }
@@ -363,14 +600,15 @@ fn scan_ready(
 
 fn update_log_observer(
   task_screen: &mut TaskScreen,
-  log: &mut Option<LogResolver>,
+  log: &Option<LogSpec>,
   current: &mut Option<(std::path::PathBuf, u64)>,
+  task_id: TaskId,
   pid: u32,
 ) {
-  let Some(resolve) = log.as_mut() else {
+  let Some(log) = log else {
     return;
   };
-  let Some(sink) = resolve(pid) else {
+  let Some(sink) = log.resolve(task_id.0, pid) else {
     return;
   };
   if let Some((path, _)) = current {
@@ -390,7 +628,7 @@ fn start_instance(
   ctx: &TaskContext,
   spec: &ProcessSpec,
   vt: &SharedVt,
-) -> Option<NativeProcess> {
+) -> Option<(NativeProcess, UnboundedReceiver<ExitInfo>)> {
   let size = match vt.read() {
     Ok(screen) => {
       let s = screen.size();
@@ -413,9 +651,9 @@ fn start_instance(
     screen.set_size(size.y, size.x);
   }
   match spawn_native(ctx, spec, size) {
-    Ok(process) => {
+    Ok(spawned) => {
       ctx.send(KernelCommand::TaskStarted);
-      Some(process)
+      Some(spawned)
     }
     Err(err) => {
       log::warn!("Process spawn error: {}", err);
@@ -543,38 +781,48 @@ async fn stop_process(
 }
 
 fn run_stop_cmd(spec: &ProcessSpec, shell: String) {
-  let cwd = spec.cwd.clone();
-  let env = spec.env.clone();
-  tokio::spawn(async move {
-    #[cfg(windows)]
-    let mut cmd = {
-      let mut c = tokio::process::Command::new("pwsh.exe");
-      c.arg("-Command").arg(&shell);
-      c
-    };
-    #[cfg(not(windows))]
-    let mut cmd = {
-      let mut c = tokio::process::Command::new("/bin/sh");
-      c.arg("-c").arg(&shell);
-      c
-    };
-    if let Some(cwd) = &cwd {
-      cmd.current_dir(cwd);
-    }
-    for (k, v) in &env {
-      match v {
-        Some(v) => {
-          cmd.env(k, v);
-        }
-        None => {
-          cmd.env_remove(k);
-        }
+  #[cfg(windows)]
+  let mut cmd = {
+    let mut c = std::process::Command::new("pwsh.exe");
+    c.arg("-Command").arg(&shell);
+    c
+  };
+  #[cfg(not(windows))]
+  let mut cmd = {
+    let mut c = std::process::Command::new("/bin/sh");
+    c.arg("-c").arg(&shell);
+    c
+  };
+  if let Some(cwd) = &spec.cwd {
+    cmd.current_dir(cwd);
+  }
+  for (k, v) in &spec.env {
+    match v {
+      Some(v) => {
+        cmd.env(k, v);
+      }
+      None => {
+        cmd.env_remove(k);
       }
     }
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    if let Err(e) = cmd.status().await {
-      log::warn!("Stop command failed: {}", e);
+  }
+  cmd.stdout(std::process::Stdio::null());
+  cmd.stderr(std::process::Stdio::null());
+
+  #[cfg(unix)]
+  match cmd.spawn() {
+    Ok(child) => {
+      crate::process::unix_processes_waiter::UnixProcessesWaiter::wait_for_child(
+        child,
+        Box::new(|info| log::debug!("Stop command exited: {info}")),
+      )
+    }
+    Err(err) => log::warn!("Stop command failed: {err}"),
+  }
+  #[cfg(windows)]
+  tokio::spawn(async move {
+    if let Err(err) = tokio::process::Command::from(cmd).status().await {
+      log::warn!("Stop command failed: {err}");
     }
   });
 }
@@ -584,12 +832,12 @@ fn run_stop_cmd(spec: &ProcessSpec, shell: String) {
 mod tests {
   use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+  use crate::config::task_log::{LogMode, TaskLogConfig};
   use crate::kernel::kernel::Kernel;
   use crate::kernel::kernel_message::{
     KernelCommand, KernelQuery, KernelQueryResponse, SpaceSelector, TaskContext,
   };
   use crate::kernel::task::TaskId;
-  use crate::task::logger::LogSink;
 
   use super::*;
 
@@ -669,12 +917,15 @@ mod tests {
       &pc,
       Some(path),
       ProcessTaskConfig {
-        log: Some(Box::new(move |_pid| {
-          Some(LogSink {
-            path: sink_path.clone(),
-            append: false,
-          })
-        })),
+        log: Some(LogSpec {
+          config: TaskLogConfig {
+            enabled: Some(true),
+            dir: None,
+            file: Some(sink_path),
+            mode: Some(LogMode::Truncate),
+          },
+          name: "logged".to_string(),
+        }),
         ..ProcessTaskConfig::new(spec)
       },
     );
@@ -708,8 +959,6 @@ mod tests {
 
   #[tokio::test]
   async fn log_path_is_resolved_with_real_pid() {
-    use std::sync::{Arc, Mutex};
-
     let nanos = SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .unwrap()
@@ -726,20 +975,19 @@ mod tests {
       "-c".to_string(),
       "printf hi".to_string(),
     ]);
-    let seen_pid = Arc::new(Mutex::new(None::<u32>));
-    let cap = seen_pid.clone();
-    let log_dir = dir.clone();
     let (id, _) = spawn_process_task(
       &pc,
       Some(TaskKey::default_space(TaskPath::new("pidlog").unwrap())),
       ProcessTaskConfig {
-        log: Some(Box::new(move |pid| {
-          *cap.lock().unwrap() = Some(pid);
-          Some(LogSink {
-            path: log_dir.join(format!("{pid}.log")),
-            append: false,
-          })
-        })),
+        log: Some(LogSpec {
+          config: TaskLogConfig {
+            enabled: Some(true),
+            dir: Some(dir.clone()),
+            file: Some(std::path::PathBuf::from("{pid}.log")),
+            mode: Some(LogMode::Truncate),
+          },
+          name: "pidlog".to_string(),
+        }),
         ..ProcessTaskConfig::new(spec)
       },
     );
@@ -749,16 +997,27 @@ mod tests {
 
     let deadline = Instant::now() + Duration::from_secs(2);
     let pid = loop {
-      if let Some(pid) = *seen_pid.lock().unwrap() {
-        let log = dir.join(format!("{pid}.log"));
-        if std::fs::read_to_string(&log).is_ok_and(|c| c.contains("hi")) {
-          break pid;
-        }
+      let found = std::fs::read_dir(&dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+          std::fs::read_to_string(entry.path()).is_ok_and(|c| c.contains("hi"))
+        })
+        .and_then(|entry| {
+          entry
+            .path()
+            .file_stem()
+            .and_then(|stem| stem.to_str()?.parse::<u32>().ok())
+        });
+      if let Some(pid) = found {
+        break pid;
       }
       assert!(Instant::now() < deadline, "pid-named log never got output");
       tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    assert_ne!(pid, 0, "resolver should receive a real pid");
+    assert_ne!(pid, 0, "log file should be named after a real pid");
 
     let id = resolve(&pc, "pidlog").await;
     pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
@@ -823,35 +1082,105 @@ mod tests {
 
     let _ = std::fs::remove_file(&marker);
   }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn failed_adopt_reports_the_task_stopped() {
+    let config =
+      ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".to_string()]));
+    let screen = TaskScreen::new(
+      TaskId(1),
+      SharedVt::new(Screen::new(DEFAULT_SIZE, 0)),
+      config.mouse_scroll_speed,
+    );
+    let mut process = snapshot(&config, None, &screen, &Instance::default());
+    // Pid 0 cannot be adopted.
+    process.instance = Some(snap::Instance {
+      pid: 0,
+      master_fd: -1,
+      exit: None,
+      stdout_eof: false,
+      ready_sent: false,
+      ready_line: String::new(),
+      log_path: None,
+    });
+    let saved = snap::Task {
+      id: 1,
+      space: String::new(),
+      path: Some("adopted".to_string()),
+      label: None,
+      tags: Vec::new(),
+      pinned: true,
+      deps: Vec::new(),
+      restart: snap::Restart::Never,
+      state: snap::TaskState::Running,
+      vetoed: false,
+      killed: false,
+      attempts: 1,
+      last_start_secs_ago: None,
+      timer_ms: None,
+      kind: snap::TaskKind::Process(process.clone()),
+    };
+    let key = TaskKey::default_space(TaskPath::new("adopted").unwrap());
+    let registration =
+      process_task_from_snapshot(TaskId(1), Some(key), &saved, &process)
+        .unwrap();
+
+    let mut kernel = Kernel::new();
+    let pc = kernel.context();
+    kernel.restore(2, vec![(&saved, registration)]).unwrap();
+    let kernel_task = tokio::spawn(kernel.run());
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+      let (tx, rx) = tokio::sync::oneshot::channel();
+      pc.send(KernelCommand::Query(
+        KernelQuery::ListTasks(TaskSelector::Id(TaskId(1))),
+        tx,
+      ));
+      let active = match rx.await.unwrap() {
+        KernelQueryResponse::TaskList(tasks) => tasks[0].state.is_active(),
+        KernelQueryResponse::Explain(_) => unreachable!(),
+      };
+      if !active {
+        break;
+      }
+      assert!(Instant::now() < deadline, "task stayed active");
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    pc.send(KernelCommand::Quit);
+    tokio::time::timeout(Duration::from_secs(2), kernel_task)
+      .await
+      .expect("timed out waiting for kernel to quit")
+      .unwrap();
+  }
 }
 
 fn spawn_native(
   ctx: &TaskContext,
   spec: &ProcessSpec,
   size: Winsize,
-) -> anyhow::Result<NativeProcess> {
-  let exit_ctx = ctx.clone();
+) -> anyhow::Result<(NativeProcess, UnboundedReceiver<ExitInfo>)> {
+  let (exit_sender, exits) = unbounded_channel();
 
   #[cfg(unix)]
   {
-    Ok(crate::process::unix_process::UnixProcess::spawn(
+    let process = crate::process::unix_process::UnixProcess::spawn(
       ctx.task_id,
       spec,
       size,
-      Box::new(move |wait_status| {
-        let info = ExitInfo {
-          code: wait_status.exit_status().map(|code| code as i32),
-          signal: wait_status.terminating_signal().map(|sig| sig as i32),
-        };
-        exit_ctx.send_self_custom(ProcExited(info));
+      Box::new(move |info| {
+        let _ = exit_sender.send(info);
       }),
-    )?)
+    )?;
+    Ok((process, exits))
   }
 
   #[cfg(windows)]
   {
     use anyhow::Context as _;
-    crate::process::win_process::WinProcess::spawn(
+    let process = crate::process::win_process::WinProcess::spawn(
       ctx.task_id,
       spec,
       size,
@@ -860,9 +1189,33 @@ fn spawn_native(
           Some(code) => ExitInfo::code(code as i32),
           None => ExitInfo::error(),
         };
-        exit_ctx.send_self_custom(ProcExited(info));
+        let _ = exit_sender.send(info);
       }),
     )
-    .context("WinProcess::spawn")
+    .context("WinProcess::spawn")?;
+    Ok((process, exits))
   }
+}
+
+#[cfg(unix)]
+fn adopt_native(
+  saved: &snap::Instance,
+) -> std::io::Result<(NativeProcess, Option<UnboundedReceiver<ExitInfo>>)> {
+  let process = crate::process::unix_process::UnixProcess::adopt(
+    saved.pid,
+    saved.master_fd,
+  )?;
+  // The previous image already collected this exit, freeing the pid for
+  // reuse: waiting on it could catch an unrelated child.
+  if saved.exit.is_some() {
+    return Ok((process, None));
+  }
+  let (exit_sender, exits) = unbounded_channel();
+  crate::process::unix_processes_waiter::UnixProcessesWaiter::wait_for(
+    process.pid,
+    Box::new(move |info| {
+      let _ = exit_sender.send(info);
+    }),
+  );
+  Ok((process, Some(exits)))
 }

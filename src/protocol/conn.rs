@@ -1,9 +1,9 @@
 use anyhow::bail;
-use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use bytes::{Bytes, BytesMut};
+use futures::SinkExt;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio_util::codec::{Decoder, Encoder, FramedWrite};
 
 use crate::protocol::ctl::{
   Bye, CtlMsg, Hello, PROTOCOL_VERSION, codes, local_hello,
@@ -25,41 +25,119 @@ pub struct ConnSender {
 
 impl ConnSender {
   pub fn new<W: AsyncWrite + Unpin + Send + 'static>(write: W) -> Self {
+    Self::with_pending(write, &[])
+  }
+
+  /// Continues a connection inherited across an upgrade: the bytes the
+  /// previous image had not written yet go out first.
+  pub fn with_pending<W: AsyncWrite + Unpin + Send + 'static>(
+    write: W,
+    pending: &[u8],
+  ) -> Self {
     let write: Box<DynWrite> = Box::new(write);
-    ConnSender {
-      writer: FramedWrite::new(write, FrameCodec::new()),
-    }
+    let mut writer = FramedWrite::new(write, FrameCodec);
+    writer.write_buffer_mut().extend_from_slice(pending);
+    ConnSender { writer }
+  }
+
+  /// Queued but not written yet.
+  pub fn pending(&self) -> &[u8] {
+    self.writer.write_buffer()
+  }
+
+  /// Adds a message to the queue; `flush` writes it.
+  pub fn queue_ctl(&mut self, msg: CtlMsg) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(&msg)?;
+    self.queue(RawFrame {
+      kind: KIND_CTL,
+      payload: Bytes::from(payload),
+    })
+  }
+
+  pub fn queue_out(&mut self, bytes: Bytes) -> anyhow::Result<()> {
+    self.queue(RawFrame {
+      kind: KIND_OUT,
+      payload: bytes,
+    })
+  }
+
+  fn queue(&mut self, frame: RawFrame) -> anyhow::Result<()> {
+    FrameCodec.encode(frame, self.writer.write_buffer_mut())?;
+    Ok(())
+  }
+
+  /// Writes the queue. Cancel-safe: whatever was written has left the
+  /// queue and the rest stays, so a caller can stop waiting at any time.
+  pub async fn flush(&mut self) -> anyhow::Result<()> {
+    SinkExt::<RawFrame>::flush(&mut self.writer).await?;
+    Ok(())
   }
 
   pub async fn send_ctl(&mut self, msg: CtlMsg) -> anyhow::Result<()> {
-    let payload = serde_json::to_vec(&msg)?;
-    let frame = RawFrame {
-      kind: KIND_CTL,
-      payload: Bytes::from(payload),
-    };
-    self.writer.send(frame).await?;
-    Ok(())
+    self.queue_ctl(msg)?;
+    self.flush().await
   }
 
   pub async fn send_out(&mut self, bytes: Bytes) -> anyhow::Result<()> {
-    let frame = RawFrame {
-      kind: KIND_OUT,
-      payload: bytes,
-    };
-    self.writer.send(frame).await?;
-    Ok(())
+    self.queue_out(bytes)?;
+    self.flush().await
   }
 }
 
+const READ_CAPACITY: usize = 8 * 1024;
+
 pub struct ConnReceiver {
-  reader: FramedRead<Box<DynRead>, FrameCodec>,
+  read: Box<DynRead>,
+  /// Read but not yet decoded; starts at a frame boundary.
+  buf: BytesMut,
 }
 
 impl ConnReceiver {
   pub fn new<R: AsyncRead + Unpin + Send + 'static>(read: R) -> Self {
-    let read: Box<DynRead> = Box::new(read);
+    Self::with_buffered(read, &[])
+  }
+
+  /// Bytes read from the transport but not yet decoded into a frame.
+  pub fn buffered(&self) -> &[u8] {
+    &self.buf
+  }
+
+  /// Continues a connection whose transport was inherited with bytes
+  /// already read by the previous image.
+  pub fn with_buffered<R: AsyncRead + Unpin + Send + 'static>(
+    read: R,
+    buffered: &[u8],
+  ) -> Self {
+    let mut buf = BytesMut::with_capacity(READ_CAPACITY);
+    buf.extend_from_slice(buffered);
     ConnReceiver {
-      reader: FramedRead::new(read, FrameCodec::new()),
+      read: Box::new(read),
+      buf,
+    }
+  }
+
+  /// Decodes what is buffered before reading more. Cancel-safe: a read
+  /// either lands in the buffer or does not happen.
+  async fn next_frame(&mut self) -> Option<std::io::Result<RawFrame>> {
+    loop {
+      match FrameCodec.decode(&mut self.buf) {
+        Ok(Some(frame)) => return Some(Ok(frame)),
+        Ok(None) => (),
+        Err(err) => return Some(Err(err)),
+      }
+      // Room to read into: a read of zero bytes would look like EOF.
+      self.buf.reserve(1);
+      match self.read.read_buf(&mut self.buf).await {
+        Ok(0) if self.buf.is_empty() => return None,
+        Ok(0) => {
+          return Some(Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed in the middle of a frame",
+          )));
+        }
+        Ok(_) => (),
+        Err(err) => return Some(Err(err)),
+      }
     }
   }
 
@@ -68,7 +146,7 @@ impl ConnReceiver {
   /// Unknown frame kinds and unknown control message types are skipped.
   pub async fn recv(&mut self) -> Option<anyhow::Result<Msg>> {
     loop {
-      let frame = match self.reader.next().await? {
+      let frame = match self.next_frame().await? {
         Ok(frame) => frame,
         Err(err) => return Some(Err(err.into())),
       };
@@ -148,34 +226,21 @@ pub async fn client_handshake(
   }
 }
 
-pub async fn server_handshake(
-  sender: &mut ConnSender,
-  receiver: &mut ConnReceiver,
-) -> anyhow::Result<Hello> {
-  match receiver.recv_ctl().await? {
-    CtlMsg::Hello(hello) => {
-      if hello.protocol != PROTOCOL_VERSION {
-        let bye = Bye {
-          code: codes::UNSUPPORTED_PROTOCOL.to_string(),
-          message: format!(
-            "runner speaks protocol {}, client ({}) speaks {}",
-            PROTOCOL_VERSION, hello.app, hello.protocol,
-          ),
-          state: None,
-          screen: None,
-        };
-        let _ = sender.send_ctl(CtlMsg::Bye(bye)).await;
-        bail!(
-          "client ({}) speaks unsupported protocol {}",
-          hello.app,
-          hello.protocol
-        );
-      }
-      sender.send_ctl(CtlMsg::Hello(local_hello())).await?;
-      Ok(hello)
-    }
-    msg => bail!("expected hello from client, got {msg:?}"),
+/// The runner's answer to a client's hello: its own hello, or a bye when
+/// they speak different protocols.
+pub fn server_hello(client: &Hello) -> Result<Hello, Bye> {
+  if client.protocol != PROTOCOL_VERSION {
+    return Err(Bye {
+      code: codes::UNSUPPORTED_PROTOCOL.to_string(),
+      message: format!(
+        "runner speaks protocol {}, client ({}) speaks {}",
+        PROTOCOL_VERSION, client.app, client.protocol,
+      ),
+      state: None,
+      screen: None,
+    });
   }
+  Ok(local_hello())
 }
 
 fn bye_text(bye: &Bye) -> String {
@@ -214,7 +279,7 @@ mod tests {
     let (_client_read, mut client_write) = tokio::io::split(client);
     let (server_read, _server_write) = tokio::io::split(server);
     let mut buf = BytesMut::new();
-    let mut codec = FrameCodec::new();
+    let mut codec = FrameCodec;
     for frame in frames {
       codec.encode(frame, &mut buf).unwrap();
     }
@@ -230,41 +295,47 @@ mod tests {
     }
   }
 
-  #[tokio::test]
-  async fn handshake_completes_both_ways() {
-    let (mut cs, mut cr, mut ss, mut sr) = pair();
-    let server =
-      tokio::spawn(
-        async move { server_handshake(&mut ss, &mut sr).await.unwrap() },
-      );
-    let server_hello = client_handshake(&mut cs, &mut cr).await.unwrap();
-    let client_hello = server.await.unwrap();
-    assert_eq!(server_hello.protocol, PROTOCOL_VERSION);
-    assert_eq!(client_hello.protocol, PROTOCOL_VERSION);
-    assert!(client_hello.app.starts_with("dekit "));
+  #[test]
+  fn server_hello_answers_the_same_protocol() {
+    let ours = server_hello(&local_hello()).unwrap();
+    assert_eq!(ours.protocol, PROTOCOL_VERSION);
+    assert!(ours.app.starts_with("dekit "));
   }
 
-  #[tokio::test]
-  async fn server_rejects_unsupported_protocol_with_bye() {
-    let (mut cs, mut cr, mut ss, mut sr) = pair();
-    let server =
-      tokio::spawn(
-        async move { server_handshake(&mut ss, &mut sr).await.is_err() },
-      );
-    cs.send_ctl(CtlMsg::Hello(Hello {
+  #[test]
+  fn server_hello_refuses_another_protocol_with_bye() {
+    let bye = server_hello(&Hello {
       protocol: 999,
       version: "99.0.0".to_string(),
       app: "dekit future".to_string(),
       features: vec![],
-    }))
-    .await
-    .unwrap();
-    assert!(server.await.unwrap());
-    match cr.recv_ctl().await.unwrap() {
-      CtlMsg::Bye(bye) => {
-        assert_eq!(bye.code, codes::UNSUPPORTED_PROTOCOL);
-      }
-      msg => panic!("expected bye, got {msg:?}"),
+    })
+    .unwrap_err();
+    assert_eq!(bye.code, codes::UNSUPPORTED_PROTOCOL);
+  }
+
+  #[tokio::test]
+  async fn pending_bytes_go_out_before_new_frames() {
+    let mut carried = BytesMut::new();
+    FrameCodec
+      .encode(ctl_frame(r#"{"type":"bye","code":"one"}"#), &mut carried)
+      .unwrap();
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (client_read, _client_write) = tokio::io::split(client);
+    let (_server_read, server_write) = tokio::io::split(server);
+    // Half a frame was written by the previous image; the rest is owed.
+    let mut sender = ConnSender::with_pending(server_write, &carried[5..]);
+    let mut receiver = ConnReceiver::with_buffered(client_read, &carried[..5]);
+    sender.queue_out(Bytes::from_static(b"after")).unwrap();
+    sender.flush().await.unwrap();
+    assert!(sender.pending().is_empty());
+    match receiver.recv().await.unwrap().unwrap() {
+      Msg::Ctl(CtlMsg::Bye(bye)) => assert_eq!(bye.code, "one"),
+      msg => panic!("expected the carried bye, got {msg:?}"),
+    }
+    match receiver.recv().await.unwrap().unwrap() {
+      Msg::Out(bytes) => assert_eq!(bytes, Bytes::from_static(b"after")),
+      msg => panic!("expected the new frame, got {msg:?}"),
     }
   }
 
@@ -403,5 +474,58 @@ mod tests {
   async fn close_yields_none() {
     let mut receiver = raw_pair(vec![]).await;
     assert!(receiver.recv().await.is_none());
+  }
+
+  fn encoded(json: &str) -> BytesMut {
+    let mut buf = BytesMut::new();
+    FrameCodec.encode(ctl_frame(json), &mut buf).unwrap();
+    buf
+  }
+
+  fn bye_code(msg: Option<anyhow::Result<Msg>>) -> String {
+    match msg {
+      Some(Ok(Msg::Ctl(CtlMsg::Bye(bye)))) => bye.code,
+      msg => panic!("expected bye, got {msg:?}"),
+    }
+  }
+
+  #[tokio::test]
+  async fn carried_frames_are_decoded_before_reading() {
+    use futures::FutureExt;
+
+    let third = encoded(r#"{"type":"bye","code":"three"}"#);
+    let mut carried = encoded(r#"{"type":"bye","code":"one"}"#);
+    carried.extend_from_slice(&encoded(r#"{"type":"bye","code":"two"}"#));
+    carried.extend_from_slice(&third[..6]);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (_client_read, mut client_write) = tokio::io::split(client);
+    let (server_read, _server_write) = tokio::io::split(server);
+    let mut receiver = ConnReceiver::with_buffered(server_read, &carried);
+
+    // Nothing new on the socket: both complete frames are ready at once.
+    assert_eq!(bye_code(receiver.recv().now_or_never().unwrap()), "one");
+    assert_eq!(bye_code(receiver.recv().now_or_never().unwrap()), "two");
+    assert!(receiver.recv().now_or_never().is_none());
+    assert_eq!(receiver.buffered(), &third[..6]);
+
+    // The partial frame continues with the bytes the peer sends next.
+    client_write.write_all(&third[6..]).await.unwrap();
+    assert_eq!(bye_code(receiver.recv().await), "three");
+  }
+
+  #[tokio::test]
+  async fn partial_frame_is_buffered_from_its_header() {
+    use futures::FutureExt;
+
+    let frame = encoded(r#"{"type":"bye","code":"quit"}"#);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (_client_read, mut client_write) = tokio::io::split(client);
+    let (server_read, _server_write) = tokio::io::split(server);
+    let mut receiver = ConnReceiver::new(server_read);
+    client_write.write_all(&frame[..6]).await.unwrap();
+
+    assert!(receiver.recv().now_or_never().is_none());
+    // What another image would carry over: the frame from its start.
+    assert_eq!(receiver.buffered(), &frame[..6]);
   }
 }

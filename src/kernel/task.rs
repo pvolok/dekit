@@ -66,6 +66,11 @@ pub enum TaskCmd {
   /// Register a copy of this task, if the task kind supports it.
   Duplicate(Option<String>),
   Msg(Box<dyn Any + Send>),
+  /// Stop all I/O and answer with `KernelCommand::TaskFrozen`, echoing
+  /// this freeze's number, with the task's state. No other command
+  /// arrives until `Thaw`, or the process is replaced.
+  Freeze(u64),
+  Thaw,
 }
 
 impl TaskCmd {
@@ -82,6 +87,8 @@ impl fmt::Debug for TaskCmd {
       TaskCmd::Kill => write!(f, "Kill"),
       TaskCmd::Duplicate(label) => write!(f, "Duplicate({:?})", label),
       TaskCmd::Msg(_) => write!(f, "Msg(...)"),
+      TaskCmd::Freeze(number) => write!(f, "Freeze({number})"),
+      TaskCmd::Thaw => write!(f, "Thaw"),
     }
   }
 }
@@ -249,7 +256,10 @@ impl Task for TargetTask {
     match cmd {
       TaskCmd::Start => fx.started(),
       TaskCmd::Stop | TaskCmd::Kill => fx.stopped(ExitInfo::code(0)),
-      TaskCmd::Duplicate(_) | TaskCmd::Msg(_) => (),
+      TaskCmd::Duplicate(_)
+      | TaskCmd::Msg(_)
+      | TaskCmd::Freeze(_)
+      | TaskCmd::Thaw => (),
     }
   }
 }
@@ -269,6 +279,9 @@ pub struct TaskHandle {
   pub killed: bool,
   pub attempts: u32,
   pub last_start: Option<Instant>,
+  /// When the running stop grace or backoff delay ends; cleared with the
+  /// epoch bump that invalidates the timer.
+  pub deadline: Option<Instant>,
 
   /// Cached reconciler state, maintained incrementally.
   /// `wanted`: reachable from a pin through non-vetoed nodes.

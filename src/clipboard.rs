@@ -80,11 +80,17 @@ fn copy_impl(s: &str, provider: &Provider) -> Result<()> {
         .spawn()
         .unwrap();
       if let Err(e) = std::io::Write::write_all(
-        &mut child.stdin.as_ref().unwrap(),
+        &mut child.stdin.take().unwrap(),
         s.as_bytes(),
       ) {
         log::warn!("Failed to write into copy process: {:?}", e);
       }
+      #[cfg(unix)]
+      crate::process::unix_processes_waiter::UnixProcessesWaiter::wait_for_child(
+        child,
+        Box::new(|_| ()),
+      );
+      #[cfg(not(unix))]
       child.wait()?;
     }
 

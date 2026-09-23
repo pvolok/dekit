@@ -70,16 +70,29 @@ pub async fn connect_client_socket(
 }
 
 #[cfg(unix)]
-pub use self::unix::{bind_server_socket, connect_socket};
+pub use self::unix::{ServerSocket, bind_server_socket, connect_socket};
 #[cfg(windows)]
-pub use self::windows::{bind_server_socket, connect_socket};
+pub use self::windows::{ServerSocket, bind_server_socket, connect_socket};
+
+/// An accepted client connection and, where the transport is a file
+/// descriptor, its number (for inheritance across an upgrade).
+pub struct Accepted {
+  pub sender: ConnSender,
+  pub receiver: ConnReceiver,
+  pub fd: Option<i32>,
+}
+
+#[cfg(unix)]
+pub use self::unix::adopt_connection;
 
 #[cfg(unix)]
 mod unix {
+  use std::os::fd::{AsRawFd, FromRawFd};
   use std::path::Path;
 
   use tokio::net::{UnixListener, UnixStream};
 
+  use super::Accepted;
   use crate::protocol::{ConnReceiver, ConnSender};
 
   pub async fn bind_server_socket(
@@ -112,13 +125,47 @@ mod unix {
   }
 
   impl ServerSocket {
-    pub async fn accept(
-      &mut self,
-    ) -> anyhow::Result<(ConnSender, ConnReceiver)> {
+    pub async fn accept(&mut self) -> anyhow::Result<Accepted> {
       let (stream, _addr) = self.listener.accept().await?;
+      let fd = stream.as_raw_fd();
       let (read, write) = stream.into_split();
-      Ok((ConnSender::new(write), ConnReceiver::new(read)))
+      Ok(Accepted {
+        sender: ConnSender::new(write),
+        receiver: ConnReceiver::new(read),
+        fd: Some(fd),
+      })
     }
+
+    pub fn raw_fd(&self) -> Option<i32> {
+      Some(self.listener.as_raw_fd())
+    }
+
+    /// A listener inherited across an exec.
+    pub fn adopt(fd: i32) -> anyhow::Result<Self> {
+      let std_listener =
+        unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+      std_listener.set_nonblocking(true)?;
+      Ok(ServerSocket {
+        listener: UnixListener::from_std(std_listener)?,
+      })
+    }
+  }
+
+  /// A client connection inherited across an exec, with the bytes the
+  /// previous image had read but not consumed, and those it still owed.
+  pub fn adopt_connection(
+    fd: i32,
+    input: &[u8],
+    output: &[u8],
+  ) -> anyhow::Result<(ConnSender, ConnReceiver)> {
+    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    std_stream.set_nonblocking(true)?;
+    let stream = UnixStream::from_std(std_stream)?;
+    let (read, write) = stream.into_split();
+    Ok((
+      ConnSender::with_pending(write, output),
+      ConnReceiver::with_buffered(read, input),
+    ))
   }
 
   pub async fn connect_socket(
@@ -140,6 +187,7 @@ mod windows {
     ClientOptions, NamedPipeServer, ServerOptions,
   };
 
+  use super::Accepted;
   use crate::protocol::{ConnReceiver, ConnSender};
 
   // ERROR_PIPE_BUSY: all pipe instances are taken; retry shortly.
@@ -161,16 +209,22 @@ mod windows {
   }
 
   impl ServerSocket {
-    pub async fn accept(
-      &mut self,
-    ) -> anyhow::Result<(ConnSender, ConnReceiver)> {
+    pub async fn accept(&mut self) -> anyhow::Result<Accepted> {
       self.next.connect().await?;
       let connected = std::mem::replace(
         &mut self.next,
         ServerOptions::new().create(&self.pipe_name)?,
       );
       let (read, write) = tokio::io::split(connected);
-      Ok((ConnSender::new(write), ConnReceiver::new(read)))
+      Ok(Accepted {
+        sender: ConnSender::new(write),
+        receiver: ConnReceiver::new(read),
+        fd: None,
+      })
+    }
+
+    pub fn raw_fd(&self) -> Option<i32> {
+      None
     }
   }
 

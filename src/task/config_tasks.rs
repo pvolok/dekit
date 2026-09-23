@@ -7,7 +7,6 @@ use crate::{
   config::{
     config::Config,
     task::{AUTOSTART_TAG, TaskConfig},
-    task_log::LogMode,
   },
   kernel::{
     kernel_message::{
@@ -18,7 +17,7 @@ use crate::{
     task_path::TaskPath,
   },
   task::{
-    logger::{LogResolver, LogSink},
+    logger::LogSpec,
     process_task::{ProcessTaskConfig, process_task_registration},
   },
 };
@@ -98,26 +97,19 @@ fn config_task_registration(
   process_task_registration(
     task_id,
     path.map(|path| TaskKey::new(space, path)),
-    process_task_config(&merged, config.runner.as_ref(), task_id, deps, pinned),
+    process_task_config(&merged, config.runner.as_ref(), deps, pinned),
   )
 }
 
 fn process_task_config(
   cfg: &TaskConfig,
   runner: Option<&crate::runner::RunnerSpec>,
-  task_id: TaskId,
   deps: Vec<TaskSelector>,
   pinned: bool,
 ) -> ProcessTaskConfig {
-  let log = cfg.log.clone().map(|log_cfg| {
-    let name = cfg.path.clone();
-    let id = task_id.0;
-    Box::new(move |pid: u32| {
-      log_cfg.file_path(&name, id, pid).map(|path| LogSink {
-        path,
-        append: log_cfg.mode() == LogMode::Append,
-      })
-    }) as LogResolver
+  let log = cfg.log.clone().map(|config| LogSpec {
+    config,
+    name: cfg.path.clone(),
   });
   ProcessTaskConfig {
     spec: crate::config::task::process_spec(cfg, runner),

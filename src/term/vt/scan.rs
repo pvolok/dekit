@@ -103,6 +103,69 @@ impl Scanner {
     }
   }
 
+  /// Bytes that put a fresh scanner into this scanner's state: the
+  /// unfinished sequence, rebuilt from what was parsed of it so far.
+  /// Empty at rest.
+  pub fn pending(&self) -> Vec<u8> {
+    let mut out = Vec::new();
+    match self.state {
+      State::Ground => (),
+      State::Utf8 => {
+        out.extend_from_slice(&self.utf8[..self.utf8_len as usize]);
+      }
+      State::Esc => out.push(0x1B),
+      State::EscInter => {
+        out.push(0x1B);
+        match self.esc_inter {
+          // More than one intermediate.
+          0xFF => out.extend_from_slice(b"  "),
+          inter => out.push(inter),
+        }
+      }
+      State::EscUtf8 => {
+        out.push(0x1B);
+        out.extend_from_slice(&self.utf8[..self.utf8_len as usize]);
+      }
+      State::Csi => {
+        out.extend_from_slice(b"\x1b[");
+        self.params.write_unfinished(&mut out);
+      }
+      State::Osc => {
+        out.extend_from_slice(b"\x1b]");
+        out.extend_from_slice(&self.body);
+      }
+      State::OscEsc => {
+        out.extend_from_slice(b"\x1b]");
+        out.extend_from_slice(&self.body);
+        out.push(0x1B);
+      }
+      State::Dcs => {
+        out.extend_from_slice(b"\x1bP");
+        out.extend_from_slice(&self.body);
+      }
+      State::DcsEsc => {
+        out.extend_from_slice(b"\x1bP");
+        out.extend_from_slice(&self.body);
+        out.push(0x1B);
+      }
+      State::Skip => {
+        out.extend_from_slice(b"\x1bX");
+        out.extend_from_slice(&self.body);
+      }
+      State::SkipEsc => {
+        out.extend_from_slice(b"\x1bX");
+        out.extend_from_slice(&self.body);
+        out.push(0x1B);
+      }
+      State::Ss3 => out.extend_from_slice(b"\x1bO"),
+      State::X10Mouse => {
+        out.extend_from_slice(b"\x1b[M");
+        out.extend_from_slice(&self.x10[..self.x10_len as usize]);
+      }
+    }
+    out
+  }
+
   /// Input mode: resolve a trailing lone ESC into an Esc key press. Called
   /// when a read chunk ends and no more input is immediately available.
   pub fn flush<F: for<'a> FnMut(Seq<'a>)>(&mut self, mut f: F) {
@@ -677,5 +740,79 @@ mod tests {
     assert_eq!(items, vec![true]);
     // Flush with no pending ESC emits nothing.
     scanner.flush(|_| panic!("nothing pending"));
+  }
+
+  /// Text runs split wherever the chunks do; only their content matters.
+  fn merge_text(items: Vec<Item>) -> Vec<Item> {
+    let mut merged: Vec<Item> = Vec::new();
+    for item in items {
+      match (merged.last_mut(), item) {
+        (Some(Item::Text(prev)), Item::Text(text)) => prev.push_str(&text),
+        (_, item) => merged.push(item),
+      }
+    }
+    merged
+  }
+
+  /// At every split point, a fresh scanner fed `pending()` of the head
+  /// continues the tail exactly like the original scanner would.
+  fn resumes_anywhere(mode: ScanMode, input: &[u8]) {
+    let whole = merge_text(collect(&mut Scanner::new(mode), &[input]));
+    for split in 0..=input.len() {
+      let mut head = Scanner::new(mode);
+      let mut items = collect(&mut head, &[&input[..split]]);
+      let mut resumed = Scanner::new(mode);
+      let replayed = collect(&mut resumed, &[&head.pending()]);
+      assert_eq!(replayed, vec![], "pending emitted at {split} of {input:?}");
+      items.extend(collect(&mut resumed, &[&input[split..]]));
+      assert_eq!(merge_text(items), whole, "split at {split} of {input:?}");
+    }
+  }
+
+  #[test]
+  fn pending_rebuilds_the_state() {
+    let too_many = format!(
+      "\x1b[{}m",
+      (1..=40)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(";")
+    );
+    for input in [
+      &b"\x1b[?25;38:5:196;;7 q"[..],
+      too_many.as_bytes(),
+      b"\x1b[1?2m",
+      b"\x1b[?>1m",
+      b"\x1b[3\n1m",
+      b"\x1b[99999999999m",
+      b"\x1b[1 !m",
+      b"\x1b(B\x1b !B",
+      b"\x1b\x1b7",
+      b"\x1b]0;a\x1bb\x1b\x1bc\x07x",
+      b"\x1b]0;title\x1b\\",
+      b"\x1bPdata\x1bx\x1b\\",
+      b"\x1b_hid\x1bden\x1b\\x",
+      "a测b\x1b[1m".as_bytes(),
+    ] {
+      resumes_anywhere(ScanMode::Output, input);
+    }
+    for input in [
+      &b"\x1bOA"[..],
+      b"\x1b[M !\"",
+      "\x1bé".as_bytes(),
+      b"\x1b[<0;5;10M",
+    ] {
+      resumes_anywhere(ScanMode::Input, input);
+    }
+  }
+
+  #[test]
+  fn pending_stays_small_in_an_endless_sequence() {
+    let mut scanner = Scanner::new(ScanMode::Output);
+    scanner.feed(b"\x1b[", |_| ());
+    for _ in 0..10_000 {
+      scanner.feed(b"12345\n", |_| ());
+    }
+    assert!(scanner.pending().len() < 16, "{:?}", scanner.pending());
   }
 }

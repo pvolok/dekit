@@ -37,6 +37,13 @@ impl ScreenDiffer {
     }
   }
 
+  /// Puts a terminal in the state `new` assumes it is in.
+  pub fn reset(out: &mut Vec<u8>) {
+    out.extend_from_slice(emit::SGR_RESET.as_bytes());
+    emit::dec_set(out, emit::DecMode::ShowCursor);
+    emit::cursor_style(out, CursorStyle::default());
+  }
+
   pub fn diff<V: BufferView>(&mut self, out: &mut Vec<u8>, view: &V) {
     let prev = &mut self.cells;
     let brush = &mut self.brush;

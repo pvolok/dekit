@@ -143,6 +143,10 @@ pub mod codes {
   pub const QUIT: &str = "quit";
   /// Attach-with-`until_exit` bye: the attached task's execution ended.
   pub const TASK_EXITED: &str = "task_exited";
+  /// The method exists but this runner/platform cannot perform it.
+  pub const UNSUPPORTED: &str = "unsupported";
+  /// The operation is already in progress.
+  pub const BUSY: &str = "busy";
 }
 
 /// Client-to-server event carrying a terminal input event.

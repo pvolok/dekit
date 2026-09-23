@@ -986,3 +986,68 @@ impl From<(u16, u16, u16, u16)> for Margin {
     }
   }
 }
+
+impl Grid {
+  pub fn snapshot(
+    &self,
+    table: &mut super::snapshot::AttrsTable,
+  ) -> crate::upgrade::snapshot::Grid {
+    crate::upgrade::snapshot::Grid {
+      width: self.size.width,
+      height: self.size.height,
+      pos: (self.pos.row, self.pos.col),
+      saved_pos: (self.saved_pos.row, self.saved_pos.col),
+      scroll_top: self.scroll_top,
+      scroll_bottom: self.scroll_bottom,
+      rows: self.rows.iter().map(|row| row.snapshot(table)).collect(),
+      used_rows: self.used_rows,
+      origin_mode: self.origin_mode,
+      saved_origin_mode: self.saved_origin_mode,
+      scrollback_len: self.scrollback_len,
+      scrollback_offset: self.scrollback_offset,
+      cursor_pos: self.cursor_pos.map(|pos| (pos.row, pos.col)),
+      cursor_style: self.cursor_style as u8,
+    }
+  }
+
+  pub fn from_snapshot(
+    grid: &crate::upgrade::snapshot::Grid,
+    table: &[Attrs],
+  ) -> anyhow::Result<Self> {
+    let size = Size {
+      width: grid.width.max(1),
+      height: grid.height.max(1),
+    };
+    let mut rows = VecDeque::with_capacity(grid.rows.len());
+    for row in &grid.rows {
+      rows.push_back(Row::from_snapshot(row, table)?);
+    }
+    if rows.len() < usize::from(size.height) {
+      anyhow::bail!("grid has fewer rows than its height");
+    }
+    // The text cursor may sit one past the last column: a pending wrap.
+    let cursor = |(row, col): (u16, u16)| Pos {
+      row: row.min(size.height - 1),
+      col: col.min(size.width),
+    };
+    let clamp = |(row, col): (u16, u16)| Pos {
+      row: row.min(size.height - 1),
+      col: col.min(size.width - 1),
+    };
+    Ok(Self {
+      size,
+      pos: cursor(grid.pos),
+      saved_pos: cursor(grid.saved_pos),
+      scroll_top: grid.scroll_top.min(size.height - 1),
+      scroll_bottom: grid.scroll_bottom.min(size.height - 1),
+      rows,
+      used_rows: grid.used_rows.min(size.height),
+      origin_mode: grid.origin_mode,
+      saved_origin_mode: grid.saved_origin_mode,
+      scrollback_len: grid.scrollback_len,
+      scrollback_offset: grid.scrollback_offset,
+      cursor_pos: grid.cursor_pos.map(clamp),
+      cursor_style: CursorStyle::from_u16(u16::from(grid.cursor_style)),
+    })
+  }
+}

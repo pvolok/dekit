@@ -13,21 +13,51 @@ pub struct LogSink {
   pub append: bool,
 }
 
-pub type LogResolver = Box<dyn FnMut(u32) -> Option<LogSink> + Send>;
+/// Where a task's output is logged; resolved per spawn because the path
+/// template may name the pid.
+#[derive(Clone, Debug)]
+pub struct LogSpec {
+  pub config: crate::config::task_log::TaskLogConfig,
+  pub name: String,
+}
 
-pub fn spawn_logger(sink: LogSink) -> Sender<Bytes> {
+impl LogSpec {
+  pub fn resolve(&self, task_id: usize, pid: u32) -> Option<LogSink> {
+    self
+      .config
+      .file_path(&self.name, task_id, pid)
+      .map(|path| LogSink {
+        path,
+        append: self.config.mode() == crate::config::task_log::LogMode::Append,
+      })
+  }
+}
+
+pub enum LogMsg {
+  Bytes(Bytes),
+  /// Answered once everything queued before it is on disk.
+  Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+pub fn spawn_logger(sink: LogSink) -> Sender<LogMsg> {
   let (tx, rx) = mpsc::channel(CHANNEL_CAP);
   tokio::spawn(logger_main(rx, sink));
   tx
 }
 
-async fn logger_main(mut rx: Receiver<Bytes>, sink: LogSink) {
+async fn logger_main(mut rx: Receiver<LogMsg>, sink: LogSink) {
   let mut file = match open_log(&sink).await {
     Some(file) => file,
     None => return,
   };
-  while let Some(bytes) = rx.recv().await {
-    file.write_all(&bytes).await.log_ignore();
+  while let Some(msg) = rx.recv().await {
+    match msg {
+      LogMsg::Bytes(bytes) => file.write_all(&bytes).await.log_ignore(),
+      LogMsg::Flush(done) => {
+        file.flush().await.log_ignore();
+        let _ = done.send(());
+      }
+    }
   }
 }
 

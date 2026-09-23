@@ -13,6 +13,7 @@ use super::sub_trie::SubMode;
 use super::task::{ExitInfo, Task, TaskCmd, TaskDef, TaskId, TaskState};
 use super::task_key::{TaskKey, TaskSpaceId};
 use super::task_path::TaskPath;
+use crate::upgrade::snapshot::TaskKind as TaskKindSnapshot;
 
 pub struct KernelMessage {
   pub from: TaskId,
@@ -96,6 +97,24 @@ pub enum KernelCommand {
   /// backoff delay). The epoch says which state it was set for, so a
   /// timeout from an earlier state is ignored.
   StateTimeout(TaskId, u64),
+
+  /// Freeze every task and answer with the graph once all have reported
+  /// `TaskFrozen`, or with why the runner cannot be frozen. While frozen
+  /// the kernel defers intent and drives nothing; task reports and queries
+  /// still go through. Frozen until `Thaw`, even after an error.
+  Freeze(tokio::sync::oneshot::Sender<Result<KernelSnapshot, String>>),
+  /// A task's answer to `TaskCmd::Freeze`, with that freeze's number.
+  TaskFrozen(u64, TaskKindSnapshot),
+  /// Resumes driving; what the freeze deferred is then handled one message
+  /// at a time, ahead of anything newer.
+  Thaw,
+}
+
+/// The kernel's part of an upgrade snapshot.
+#[derive(Debug)]
+pub struct KernelSnapshot {
+  pub next_task_id: usize,
+  pub tasks: Vec<crate::upgrade::snapshot::Task>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -281,6 +300,11 @@ impl TaskContext {
     }
   }
 
+  #[cfg(test)]
+  pub fn sender_for_tests(&self) -> UnboundedSender<KernelMessage> {
+    self.sender.clone()
+  }
+
   pub fn send(&self, command: KernelCommand) {
     if let Err(_err) = self.sender.send(KernelMessage {
       from: self.task_id,
@@ -295,10 +319,6 @@ impl TaskContext {
 
   pub fn send_msg<T: Any + Send + 'static>(&self, to: TaskId, msg: T) {
     self.send(KernelCommand::TaskMsg(to, Box::new(msg)));
-  }
-
-  pub fn send_self_custom<T: Any + Send + 'static>(&self, custom: T) {
-    self.send_msg(self.task_id, custom);
   }
 
   pub fn alloc_id(&self) -> TaskId {

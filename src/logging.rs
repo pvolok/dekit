@@ -5,8 +5,9 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use anyhow::Result;
+pub use flexi_logger::LoggerHandle;
 use flexi_logger::writers::LogWriter;
-use flexi_logger::{DeferredNow, FormatFunction, Logger, LoggerHandle};
+use flexi_logger::{DeferredNow, FormatFunction, Logger};
 use log::{LevelFilter, Record};
 
 pub struct Config<'a> {

@@ -166,3 +166,120 @@ impl Row {
       .is_some_and(super::cell::Cell::is_wide)
   }
 }
+
+impl Row {
+  pub fn snapshot(
+    &self,
+    table: &mut super::snapshot::AttrsTable,
+  ) -> crate::upgrade::snapshot::Row {
+    let mut text = String::with_capacity(self.cells.len());
+    let mut cells: Vec<(u32, u16)> = Vec::new();
+    let mut attrs: Vec<(usize, u16)> = Vec::new();
+    for cell in &self.cells {
+      text.push_str(cell.contents());
+      push_run(&mut cells, cell.contents().chars().count() as u32);
+      push_run(&mut attrs, table.index(cell.attrs()));
+    }
+    crate::upgrade::snapshot::Row {
+      text,
+      cells,
+      attrs,
+      wrapped: self.wrapped,
+      size: self.size,
+    }
+  }
+
+  pub fn from_snapshot(
+    row: &crate::upgrade::snapshot::Row,
+    table: &[super::attrs::Attrs],
+  ) -> anyhow::Result<Self> {
+    let mut cells = Vec::new();
+    let mut rest = row.text.as_str();
+    for &(chars, len) in &row.cells {
+      for _ in 0..len {
+        let (text, tail) =
+          split_chars(rest, chars as usize).ok_or_else(|| {
+            anyhow::anyhow!("row text is shorter than its cells")
+          })?;
+        rest = tail;
+        let mut cell = super::cell::Cell::default();
+        cell.set_str(text);
+        cells.push(cell);
+      }
+    }
+    if !rest.is_empty() {
+      anyhow::bail!("row text is longer than its cells");
+    }
+    let mut runs = row
+      .attrs
+      .iter()
+      .flat_map(|(index, len)| std::iter::repeat_n(*index, usize::from(*len)));
+    for cell in &mut cells {
+      let index = runs
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("row attrs cover fewer cells"))?;
+      let attrs = table
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("row attrs index out of range"))?;
+      cell.set_attrs(*attrs);
+    }
+    if runs.next().is_some() {
+      anyhow::bail!("row attrs cover more cells");
+    }
+    if cells.is_empty() {
+      anyhow::bail!("row has no cells");
+    }
+    Ok(Row {
+      cells,
+      size: row.size,
+      wrapped: row.wrapped,
+    })
+  }
+}
+
+fn push_run<T: PartialEq>(runs: &mut Vec<(T, u16)>, value: T) {
+  match runs.last_mut() {
+    Some((last, len)) if *last == value => *len += 1,
+    _ => runs.push((value, 1)),
+  }
+}
+
+/// The first `n` chars of `s` and the rest, or None if `s` is shorter.
+fn split_chars(s: &str, n: usize) -> Option<(&str, &str)> {
+  let mut chars = s.chars();
+  let mut end = 0;
+  for _ in 0..n {
+    end += chars.next()?.len_utf8();
+  }
+  Some(s.split_at(end))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::upgrade::snapshot as snap;
+
+  fn row(text: &str, cells: Vec<(u32, u16)>) -> snap::Row {
+    snap::Row {
+      text: text.to_string(),
+      cells,
+      attrs: vec![(0, 3)],
+      wrapped: false,
+      size: 3,
+    }
+  }
+
+  #[test]
+  fn text_and_cells_must_agree() {
+    let table = [super::super::attrs::Attrs::default()];
+    assert!(Row::from_snapshot(&row("abc", vec![(1, 3)]), &table).is_ok());
+    assert!(Row::from_snapshot(&row("ab", vec![(1, 3)]), &table).is_err());
+    assert!(Row::from_snapshot(&row("abcd", vec![(1, 3)]), &table).is_err());
+    // Attrs must cover exactly the cells.
+    let short = snap::Row {
+      attrs: vec![(0, 2)],
+      ..row("abc", vec![(1, 3)])
+    };
+    assert!(Row::from_snapshot(&short, &table).is_err());
+  }
+}

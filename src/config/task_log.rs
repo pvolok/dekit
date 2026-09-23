@@ -1,7 +1,4 @@
-use std::{
-  path::PathBuf,
-  time::{SystemTime, UNIX_EPOCH},
-};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use serde_yaml::Value;
@@ -195,10 +192,7 @@ fn expand_template(
   task_id: usize,
   pid: u32,
 ) -> String {
-  let ts = SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map(|duration| duration.as_secs())
-    .unwrap_or(0);
+  let ts = crate::runner::lockfile::now_secs();
 
   template
     .replace(

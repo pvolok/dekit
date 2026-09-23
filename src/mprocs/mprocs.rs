@@ -28,7 +28,7 @@ use crate::mprocs::yaml_val::Val;
 use crate::task::config_tasks::register_config_tasks;
 use crate::{
   attach_client::client_main,
-  dekit::server::dispatch_connection,
+  dekit::server::{Connections, ServerCtx, dispatch_connection},
   protocol::{ConnReceiver, ConnSender},
   target::Target,
 };
@@ -277,17 +277,16 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
         hook.run(&pc, &config, &app_sender);
       }
 
-      let conn_pc = pc.clone();
-      let conn_config = config.clone();
-      tokio::spawn(async move {
-        dispatch_connection(
-          conn_pc,
-          conn_config,
-          srv_to_clt_sender,
-          clt_to_srv_receiver,
-        )
-        .await
-      });
+      let ctx = ServerCtx::local(pc.clone(), config.clone());
+      let reg = Connections::register(&ctx);
+      tokio::spawn(dispatch_connection(
+        ctx,
+        reg,
+        srv_to_clt_sender,
+        clt_to_srv_receiver,
+        None,
+        None,
+      ));
 
       let ret = client_main(
         "@dekit/console".parse::<Target>().expect("valid target"),

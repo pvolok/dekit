@@ -47,6 +47,8 @@ pub struct RunnerPaths {
   pub record: PathBuf,
   pub socket: PathBuf,
   pub error: PathBuf,
+  /// The upgrade snapshot handed from one runner image to the next.
+  pub snapshot: PathBuf,
 }
 
 impl RunnerPaths {
@@ -60,6 +62,7 @@ impl RunnerPaths {
       live: runtime_dir.join(format!("{stem}.live")),
       record: runtime_dir.join(format!("{stem}.json")),
       error: runtime_dir.join(format!("{stem}.error")),
+      snapshot: runtime_dir.join(format!("{stem}.snapshot")),
       socket,
     }
   }
@@ -67,8 +70,17 @@ impl RunnerPaths {
 
 pub struct LockFileGuard {
   paths: RunnerPaths,
-  _lock: std::fs::File,
-  _live: std::fs::File,
+  lock: std::fs::File,
+  live: std::fs::File,
+  /// Published in the record; survives an upgrade with the process.
+  started_at: u64,
+}
+
+pub(crate) fn now_secs() -> u64 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs()
 }
 
 impl LockFileGuard {
@@ -76,14 +88,45 @@ impl LockFileGuard {
     &self.paths.socket
   }
 
+  pub fn paths(&self) -> &RunnerPaths {
+    &self.paths
+  }
+
+  pub fn started_at(&self) -> u64 {
+    self.started_at
+  }
+
+  /// The lock descriptors, for inheritance across an upgrade: flock
+  /// locks belong to the open file description, so they travel with it.
+  #[cfg(unix)]
+  pub fn fds(&self) -> (i32, i32) {
+    use std::os::fd::AsRawFd;
+    (self.lock.as_raw_fd(), self.live.as_raw_fd())
+  }
+
+  /// Locks inherited across an exec; nothing is re-acquired. The
+  /// previous image checked `holds` before the switch.
+  #[cfg(unix)]
+  pub fn adopt(
+    paths: RunnerPaths,
+    lock_fd: i32,
+    live_fd: i32,
+    started_at: u64,
+  ) -> Self {
+    use std::os::fd::FromRawFd;
+    LockFileGuard {
+      paths,
+      lock: unsafe { std::fs::File::from_raw_fd(lock_fd) },
+      live: unsafe { std::fs::File::from_raw_fd(live_fd) },
+      started_at,
+    }
+  }
+
   pub fn publish(
     &self,
     runner: &RunnerSpec,
     warnings: &[String],
   ) -> anyhow::Result<()> {
-    let started = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .unwrap_or_default();
     // Canonical, so comparisons against the (canonical) selected kernel
     // don't report a restart over a symlinked install path.
     let binary = dunce::canonicalize(std::env::current_exe()?)?;
@@ -101,7 +144,7 @@ impl LockFileGuard {
         .to_str()
         .expect("validated runner root")
         .to_string(),
-      started_at: started.as_secs(),
+      started_at: self.started_at,
       version: env!("CARGO_PKG_VERSION").to_string(),
       binary: binary.to_string(),
       warnings: warnings.to_vec(),
@@ -265,8 +308,9 @@ fn lock_runner_paths(paths: RunnerPaths) -> anyhow::Result<LockFileGuard> {
     }
     return Ok(LockFileGuard {
       paths,
-      _lock: lock,
-      _live: live,
+      lock,
+      live,
+      started_at: now_secs(),
     });
   }
   anyhow::bail!("runner lock changed repeatedly during startup")
@@ -415,6 +459,25 @@ pub fn cleanup_all_stale() -> anyhow::Result<u32> {
     }
   }
   Ok(count)
+}
+
+/// Whether the runtime dir still names the lock files a runner holds by
+/// these descriptors (see `LockFileGuard::fds`); a sweep of the dir while
+/// the runner ran leaves it holding unlinked ones.
+#[cfg(unix)]
+pub fn holds(
+  paths: &RunnerPaths,
+  lock_fd: i32,
+  live_fd: i32,
+) -> anyhow::Result<bool> {
+  use std::{mem::ManuallyDrop, os::fd::FromRawFd};
+  // Borrowed: closing them would release the runner's locks.
+  let lock = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(lock_fd) });
+  let live = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(live_fd) });
+  Ok(
+    path_matches_file(&paths.lock, &lock)?
+      && path_matches_file(&paths.live, &live)?,
+  )
 }
 
 #[cfg(unix)]

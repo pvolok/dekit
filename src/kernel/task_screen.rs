@@ -9,6 +9,7 @@ use crate::{
     kernel_message::SharedVt,
     task::TaskId,
   },
+  task::logger::LogMsg,
   term::{
     Color, MouseProtocolEncoding, MouseProtocolMode, Reply, Screen, Size,
     TermEvent, VtEvent, Winsize,
@@ -49,7 +50,7 @@ pub struct TaskScreen {
   /// An observer's sink closed since the last `settle`.
   lost_observers: bool,
   /// Raw output sinks (log files); they never affect the size.
-  loggers: Vec<(u64, Sender<Bytes>)>,
+  loggers: Vec<(u64, Sender<LogMsg>)>,
   next_logger_id: u64,
 
   copy: Option<CopySession>,
@@ -238,7 +239,7 @@ impl TaskScreen {
     if !self.loggers.is_empty() {
       let bytes = Bytes::copy_from_slice(bytes);
       for (_, sink) in &self.loggers {
-        let _ = sink.send(bytes.clone()).await;
+        let _ = sink.send(LogMsg::Bytes(bytes.clone())).await;
       }
     }
     self.settle(effects);
@@ -590,7 +591,17 @@ impl TaskScreen {
     }
   }
 
-  pub fn add_logger(&mut self, sink: Sender<Bytes>) -> u64 {
+  /// Waits until every logger has written what it was sent.
+  pub async fn flush_loggers(&self) {
+    for (_, sink) in &self.loggers {
+      let (tx, rx) = tokio::sync::oneshot::channel();
+      if sink.send(LogMsg::Flush(tx)).await.is_ok() {
+        let _ = rx.await;
+      }
+    }
+  }
+
+  pub fn add_logger(&mut self, sink: Sender<LogMsg>) -> u64 {
     let id = self.next_logger_id;
     self.next_logger_id += 1;
     self.loggers.push((id, sink));

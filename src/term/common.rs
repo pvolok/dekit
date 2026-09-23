@@ -20,6 +20,21 @@ pub enum CursorStyle {
   SteadyBar = 6,
 }
 
+impl CursorStyle {
+  /// The DECSCUSR parameter; anything unknown is the default.
+  pub fn from_u16(n: u16) -> Self {
+    match n {
+      1 => CursorStyle::BlinkingBlock,
+      2 => CursorStyle::SteadyBlock,
+      3 => CursorStyle::BlinkingUnderline,
+      4 => CursorStyle::SteadyUnderline,
+      5 => CursorStyle::BlinkingBar,
+      6 => CursorStyle::SteadyBar,
+      _ => CursorStyle::Default,
+    }
+  }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Winsize {
   pub x: u16,

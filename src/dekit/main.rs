@@ -500,12 +500,40 @@ pub async fn dekit_main() -> anyhow::Result<()> {
             .long("log-level")
             .help("Diagnostic log level"),
         ),
+      ClapCommand::new("resume")
+        .about("Continue a runner from an upgrade snapshot")
+        .hide(true)
+        .arg(
+          Arg::new("snapshot")
+            .long("snapshot")
+            .required(true)
+            .help("Snapshot written by the previous image"),
+        )
+        .arg(
+          Arg::new("check")
+            .long("check")
+            .action(clap::ArgAction::SetTrue)
+            .help("Only validate the snapshot and config, then exit"),
+        )
+        .arg(
+          Arg::new("log-level")
+            .long("log-level")
+            .help("Diagnostic log level"),
+        ),
       ClapCommand::new("start")
         .about("Start the selected runner")
         .arg(runner_ref_arg()),
       ClapCommand::new("stop")
         .about("Stop the selected runner")
         .arg(runner_ref_arg()),
+      ClapCommand::new("upgrade")
+        .about("Replace the running runner live with its selected kernel")
+        .arg(runner_ref_arg())
+        .arg(
+          Arg::new("binary")
+            .long("binary")
+            .help("Binary to switch to (default: the selected kernel)"),
+        ),
       ClapCommand::new("status")
         .about("Show selected runner status")
         .arg(runner_ref_arg()),
@@ -766,9 +794,82 @@ pub async fn dekit_main() -> anyhow::Result<()> {
           run_m.get_one::<String>("log-level").map(String::as_str);
         run_server(runner, log_level).await?;
       }
+      Some(("resume", sub_m)) => {
+        #[cfg(unix)]
+        {
+          crate::upgrade::resume::resume(crate::upgrade::resume::ResumeArgs {
+            snapshot: PathBuf::from(
+              sub_m.get_one::<String>("snapshot").expect("required"),
+            ),
+            check: sub_m.get_flag("check"),
+            log_level: sub_m.get_one::<String>("log-level").cloned(),
+          })
+          .await?;
+        }
+        #[cfg(not(unix))]
+        {
+          let _ = sub_m;
+          anyhow::bail!("live upgrade is not available on this platform");
+        }
+      }
       Some(("start", sub_m)) => {
         let runner = arg_runner(&matches, sub_m)?;
         start_runner(&runner).await?;
+      }
+      Some(("upgrade", sub_m)) => {
+        let runner = arg_runner(&matches, sub_m)?;
+        let binary = match sub_m.get_one::<String>("binary") {
+          Some(path) => dunce::canonicalize(path)
+            .map_err(|err| anyhow!("invalid binary `{path}`: {err}"))?,
+          None => resolve_kernel_binary(&runner)?,
+        };
+        match lockfile::get_runner_state(&runner)? {
+          lockfile::RunnerState::Ready(record) => {
+            if Path::new(&record.binary) == binary {
+              println!(
+                "Runner already runs {}; switching live anyway.",
+                binary.display()
+              );
+            }
+          }
+          lockfile::RunnerState::Absent
+          | lockfile::RunnerState::Starting
+          | lockfile::RunnerState::Stale(_)
+          | lockfile::RunnerState::Failed(_) => {
+            anyhow::bail!("Runner is not running. Start it with `dekit up`.")
+          }
+        }
+        let result = match rpc_request(
+          &runner,
+          RpcRequest::Upgrade {
+            binary: binary.to_string_lossy().into_owned(),
+          },
+          false,
+        )
+        .await
+        {
+          Ok(result) => result,
+          // A resume that fails after the switch records why, then exits.
+          Err(err) => match lockfile::get_runner_state(&runner)? {
+            lockfile::RunnerState::Failed(error) => anyhow::bail!("{error}"),
+            lockfile::RunnerState::Absent
+            | lockfile::RunnerState::Starting
+            | lockfile::RunnerState::Ready(_)
+            | lockfile::RunnerState::Stale(_) => return Err(err),
+          },
+        };
+        if matches.get_flag("json") {
+          println!("{}", serde_json::to_string(&result)?);
+        } else {
+          let version = result
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+          println!(
+            "Runner upgraded live to dekit {version} ({}).",
+            binary.display()
+          );
+        }
       }
       Some(("stop", sub_m)) => {
         let runner = arg_runner(&matches, sub_m)?;
@@ -831,7 +932,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
               match &selected {
                 Ok(selected) if Path::new(&record.binary) != selected => {
                   println!(
-                    "Restart required to use selected kernel {}.",
+                    "Selected kernel is {}; run `dekit runner upgrade` to switch live.",
                     selected.display()
                   );
                 }
@@ -880,7 +981,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       }
       _ => {
         anyhow::bail!(
-          "expected a subcommand after `dekit runner` (run, start, stop, status, list, clean)"
+          "expected a subcommand after `dekit runner` (run, start, stop, upgrade, status, list, clean)"
         );
       }
     },

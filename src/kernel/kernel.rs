@@ -6,7 +6,8 @@ use std::{
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::kernel::kernel_message::TaskContext;
+use crate::kernel::kernel_message::{KernelSnapshot, TaskContext};
+use crate::upgrade::snapshot as snap;
 
 use super::{
   kernel_message::{
@@ -54,6 +55,19 @@ struct ActiveWatch {
   active: bool,
 }
 
+/// An upgrade freeze in progress: which tasks still owe their snapshot,
+/// what the others answered, and every message deferred meanwhile.
+struct Frozen {
+  /// Tasks echo it, so an answer to an earlier, timed-out freeze is not
+  /// taken for this one.
+  number: u64,
+  /// Taken once answered, with the snapshot or the reason it failed.
+  reply: Option<tokio::sync::oneshot::Sender<Result<KernelSnapshot, String>>>,
+  waiting: HashSet<TaskId>,
+  snapshots: HashMap<TaskId, snap::TaskKind>,
+  deferred: Vec<KernelMessage>,
+}
+
 /// A command the kernel sent to a task, logged for the property harness.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +108,9 @@ struct Graph {
   /// Set whenever a task is added, removed or changes state; watches only
   /// need re-checking then.
   state_changed: bool,
+  frozen: Option<Frozen>,
+  /// Freezes begun so far; numbers them.
+  freezes: u64,
   /// Every state transition, for the property harness to check against
   /// the legal state diagram.
   #[cfg(test)]
@@ -125,6 +142,8 @@ impl Graph {
       pending_effects: VecDeque::new(),
       active_watches: Vec::new(),
       state_changed: false,
+      frozen: None,
+      freezes: 0,
       #[cfg(test)]
       transitions: Vec::new(),
       #[cfg(test)]
@@ -140,12 +159,15 @@ impl Graph {
     )
   }
 
-  /// Returns whether the task was registered.
+  /// Returns whether the task was registered. `saved` is the lifecycle a
+  /// restored task comes back in: in place before its edges are counted
+  /// and its `Added` goes out, so nothing has to be corrected afterwards.
   fn register_task_with_id(
     &mut self,
     task_id: TaskId,
     def: TaskDef,
     factory: Box<dyn FnOnce(TaskContext) -> Box<dyn Task>>,
+    saved: Option<&snap::Task>,
   ) -> Result<(), RegisterError> {
     if self.tasks.contains_key(&task_id) {
       return Err(RegisterError::IdTaken);
@@ -184,7 +206,7 @@ impl Graph {
     let label = def.label.clone();
     let vt = def.vt.clone();
     let tags = def.tags.clone();
-    let handle = TaskHandle {
+    let mut handle = TaskHandle {
       task,
       state: TaskState::Idle,
       epoch: 0,
@@ -192,6 +214,7 @@ impl Graph {
       killed: false,
       attempts: 0,
       last_start: None,
+      deadline: None,
       wanted: false,
       supported: false,
       wanted_parents: 0,
@@ -205,8 +228,33 @@ impl Graph {
       vt: def.vt,
       tags: def.tags,
     };
+    if let Some(saved) = saved {
+      handle.state = match saved.state {
+        snap::TaskState::Idle => TaskState::Idle,
+        snap::TaskState::Starting => TaskState::Starting,
+        snap::TaskState::Running => TaskState::Running,
+        snap::TaskState::Ready => TaskState::Ready,
+        snap::TaskState::Stopping => TaskState::Stopping,
+        snap::TaskState::Backoff => TaskState::Backoff,
+        snap::TaskState::Done(info) => TaskState::Done(info.into()),
+        snap::TaskState::Exited(info) => TaskState::Exited(info.into()),
+      };
+      handle.vetoed = saved.vetoed;
+      handle.killed = saved.killed;
+      handle.attempts = saved.attempts;
+      handle.last_start = saved.last_start_secs_ago.map(|secs| {
+        self
+          .now
+          .checked_sub(Duration::from_secs(secs))
+          .unwrap_or(self.now)
+      });
+    }
+    let state = handle.state;
     self.tasks.insert(task_id, handle);
     self.state_changed = true;
+    if let Some(ms) = saved.and_then(|saved| saved.timer_ms) {
+      self.schedule_state_timeout(task_id, 0, Duration::from_millis(ms));
+    }
 
     for tag in tags {
       self.tags.entry(tag).or_default().insert(task_id);
@@ -227,7 +275,7 @@ impl Graph {
       TaskNotify::Added {
         path,
         label,
-        state: TaskState::Idle,
+        state,
         vt,
       },
     );
@@ -852,7 +900,10 @@ impl Graph {
       TaskCmd::Start => self.sent.push((task_id, SentCmd::Start)),
       TaskCmd::Stop => self.sent.push((task_id, SentCmd::Stop)),
       TaskCmd::Kill => self.sent.push((task_id, SentCmd::Kill)),
-      TaskCmd::Duplicate(_) | TaskCmd::Msg(_) => (),
+      TaskCmd::Duplicate(_)
+      | TaskCmd::Msg(_)
+      | TaskCmd::Freeze(_)
+      | TaskCmd::Thaw => (),
     }
     let mut fx = Effects::new();
     if let Some(task) = self.tasks.get_mut(&task_id) {
@@ -867,6 +918,9 @@ impl Graph {
     epoch: u64,
     delay: Duration,
   ) {
+    if let Some(task) = self.tasks.get_mut(&task_id) {
+      task.deadline = Some(self.now + delay);
+    }
     self.pending_timers.push(TimerRequest {
       task_id,
       epoch,
@@ -1013,6 +1067,8 @@ impl Graph {
     task.state = state;
     task.epoch += 1;
     task.killed = false;
+    // The epoch bump ended whatever timer was running.
+    task.deadline = None;
     self.state_changed = true;
     let now_satisfied = task.is_satisfied();
     let space = task.space.clone();
@@ -1257,6 +1313,164 @@ impl Graph {
     }
   }
 
+  // ---- Upgrade freeze ----
+
+  fn begin_freeze(
+    &mut self,
+    reply: tokio::sync::oneshot::Sender<Result<KernelSnapshot, String>>,
+  ) {
+    if self.frozen.is_some() {
+      let _ = reply.send(Err("a freeze is already in progress".to_string()));
+      return;
+    }
+    // Quit is deferred while frozen, so this holds for the whole freeze.
+    if self.quitting {
+      let _ = reply.send(Err("the runner is shutting down".to_string()));
+      return;
+    }
+    self.freezes += 1;
+    let number = self.freezes;
+    let ids: Vec<TaskId> = self.tasks.keys().copied().collect();
+    let mut dead = None;
+    for id in &ids {
+      let mut fx = Effects::new();
+      if let Some(task) = self.tasks.get_mut(id) {
+        task.task.handle_cmd(TaskCmd::Freeze(number), &mut fx);
+      }
+      for effect in fx.drain() {
+        // Tasks answer through the queue. A report here comes from a task
+        // whose handler is gone: nothing will ever answer for it.
+        match &effect {
+          TaskEffect::Stopped(_) => dead = dead.or(Some(*id)),
+          TaskEffect::Started | TaskEffect::Ready => (),
+        }
+        self.pending_effects.push_back((*id, effect));
+      }
+    }
+    let reply = match dead {
+      Some(id) => {
+        let task = &self.tasks[&id];
+        let name = task_name(id, &task.space, task.path.as_ref());
+        let _ = reply.send(Err(format!(
+          "task {name} can't be carried across: its handler has stopped"
+        )));
+        None
+      }
+      None => Some(reply),
+    };
+    self.frozen = Some(Frozen {
+      number,
+      reply,
+      waiting: ids.into_iter().collect(),
+      snapshots: HashMap::new(),
+      deferred: Vec::new(),
+    });
+    self.finish_freeze_if_complete();
+  }
+
+  fn on_task_frozen(
+    &mut self,
+    task_id: TaskId,
+    number: u64,
+    snapshot: snap::TaskKind,
+  ) {
+    let Some(frozen) = self.frozen.as_mut() else {
+      log::debug!("Ignoring TaskFrozen from {:?} outside a freeze", task_id);
+      return;
+    };
+    if frozen.number != number || !frozen.waiting.remove(&task_id) {
+      return;
+    }
+    frozen.snapshots.insert(task_id, snapshot);
+    self.finish_freeze_if_complete();
+  }
+
+  fn finish_freeze_if_complete(&mut self) {
+    let Some(frozen) = self.frozen.as_mut() else {
+      return;
+    };
+    if !frozen.waiting.is_empty() {
+      return;
+    }
+    let Some(reply) = frozen.reply.take() else {
+      return;
+    };
+    let kinds = std::mem::take(&mut frozen.snapshots);
+    let _ = reply.send(Ok(self.snapshot(kinds)));
+  }
+
+  fn thaw(&mut self) -> Vec<KernelMessage> {
+    let Some(frozen) = self.frozen.take() else {
+      return Vec::new();
+    };
+    let ids: Vec<TaskId> = self.tasks.keys().copied().collect();
+    for id in ids {
+      self.send_cmd(id, TaskCmd::Thaw);
+    }
+    frozen.deferred
+  }
+
+  /// Everything in the graph, in the current snapshot schema. Task
+  /// kinds are the tasks' own `TaskFrozen` answers.
+  fn snapshot(
+    &self,
+    mut kinds: HashMap<TaskId, snap::TaskKind>,
+  ) -> KernelSnapshot {
+    let mut tasks: Vec<snap::Task> = Vec::with_capacity(kinds.len());
+    for (id, task) in &self.tasks {
+      let Some(kind) = kinds.remove(id) else {
+        continue;
+      };
+      let state = match task.state {
+        TaskState::Idle => snap::TaskState::Idle,
+        TaskState::Starting => snap::TaskState::Starting,
+        TaskState::Running => snap::TaskState::Running,
+        TaskState::Ready => snap::TaskState::Ready,
+        TaskState::Stopping => snap::TaskState::Stopping,
+        TaskState::Backoff => snap::TaskState::Backoff,
+        TaskState::Done(info) => snap::TaskState::Done(info.into()),
+        TaskState::Exited(info) => snap::TaskState::Exited(info.into()),
+      };
+      let mut deps: Vec<usize> = self
+        .edges
+        .get(id)
+        .map(|set| set.iter().map(|dep| dep.0).collect())
+        .unwrap_or_default();
+      deps.sort_unstable();
+      tasks.push(snap::Task {
+        id: id.0,
+        space: task.space.as_str().to_string(),
+        path: task.path.as_ref().map(|path| path.as_str().to_string()),
+        label: task.label.clone(),
+        tags: task.tags.clone(),
+        pinned: self
+          .redges
+          .get(id)
+          .is_some_and(|set| set.contains(&INIT_TASK_ID)),
+        deps,
+        restart: task.restart.into(),
+        state,
+        vetoed: task.vetoed,
+        killed: task.killed,
+        attempts: task.attempts,
+        last_start_secs_ago: task
+          .last_start
+          .map(|start| self.now.saturating_duration_since(start).as_secs()),
+        timer_ms: task.deadline.map(|deadline| {
+          deadline.saturating_duration_since(self.now).as_millis() as u64
+        }),
+        kind,
+      });
+    }
+    tasks.sort_by_key(|task| task.id);
+    KernelSnapshot {
+      next_task_id: self
+        .next_task_id
+        .load(std::sync::atomic::Ordering::Relaxed),
+      tasks,
+    }
+  }
+
   fn notify_subscribers(
     &mut self,
     from: TaskId,
@@ -1300,6 +1514,8 @@ pub struct Kernel {
   graph: Graph,
   sender: UnboundedSender<KernelMessage>,
   receiver: UnboundedReceiver<KernelMessage>,
+  /// What a thaw handed back, handled before anything newer.
+  replay: VecDeque<KernelMessage>,
 }
 
 impl Kernel {
@@ -1310,6 +1526,7 @@ impl Kernel {
       graph,
       sender,
       receiver,
+      replay: VecDeque::new(),
     }
   }
 
@@ -1329,9 +1546,10 @@ impl Kernel {
         .next_task_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     );
-    let _ = self
-      .graph
-      .register_task_with_id(task_id, def, Box::new(factory));
+    let _ =
+      self
+        .graph
+        .register_task_with_id(task_id, def, Box::new(factory), None);
     task_id
   }
 
@@ -1344,31 +1562,93 @@ impl Kernel {
       registration.task_id,
       registration.def,
       registration.factory,
+      None,
     )
   }
 
+  /// Rebuilds the graph from an upgrade snapshot before `run`. Each task
+  /// comes with the registration its kind built from the snapshot; the
+  /// kernel registers them dependencies first, each in its saved
+  /// lifecycle state.
+  pub fn restore(
+    &mut self,
+    next_task_id: usize,
+    tasks: Vec<(&snap::Task, TaskRegistration)>,
+  ) -> anyhow::Result<()> {
+    self
+      .graph
+      .next_task_id
+      .store(next_task_id, std::sync::atomic::Ordering::Relaxed);
+    self.graph.now = Instant::now();
+    let slot: HashMap<usize, usize> = tasks
+      .iter()
+      .enumerate()
+      .map(|(i, (saved, _))| (saved.id, i))
+      .collect();
+    let mut missing_deps: Vec<usize> =
+      tasks.iter().map(|(saved, _)| saved.deps.len()).collect();
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
+    for (i, (saved, _)) in tasks.iter().enumerate() {
+      for dep in &saved.deps {
+        let Some(&j) = slot.get(dep) else {
+          anyhow::bail!(
+            "task {} has a dependency that is not in the snapshot",
+            saved.id
+          );
+        };
+        dependents[j].push(i);
+      }
+    }
+    let mut ready: Vec<usize> =
+      (0..tasks.len()).filter(|i| missing_deps[*i] == 0).collect();
+    let mut tasks: Vec<Option<(&snap::Task, TaskRegistration)>> =
+      tasks.into_iter().map(Some).collect();
+    let mut registered = 0;
+    while let Some(i) = ready.pop() {
+      let (saved, registration) = tasks[i].take().expect("ready once");
+      self
+        .graph
+        .register_task_with_id(
+          registration.task_id,
+          registration.def,
+          registration.factory,
+          Some(saved),
+        )
+        .map_err(|err| anyhow::anyhow!("restoring task {}: {err}", saved.id))?;
+      registered += 1;
+      for &dependent in &dependents[i] {
+        missing_deps[dependent] -= 1;
+        if missing_deps[dependent] == 0 {
+          ready.push(dependent);
+        }
+      }
+    }
+    if registered != tasks.len() {
+      anyhow::bail!("the snapshot's dependencies form a cycle");
+    }
+    Ok(())
+  }
+
   pub async fn run(mut self) {
+    self.after_dispatch();
     loop {
-      let Some(msg) = self.receiver.recv().await else {
-        log::debug!("Kernel receiver returned None.");
-        break;
+      // Deferred messages take one turn each, as if they had arrived
+      // right after the thaw.
+      let msg = match self.replay.pop_front() {
+        Some(msg) => msg,
+        None => match self.receiver.recv().await {
+          Some(msg) => msg,
+          None => {
+            log::debug!("Kernel receiver returned None.");
+            break;
+          }
+        },
       };
       self.graph.now = Instant::now();
       if self.dispatch(msg) {
         break;
       }
-      self.graph.settle();
-      self.graph.check_active_watches();
-      for req in self.graph.take_timers() {
-        let sender = self.sender.clone();
-        tokio::spawn(async move {
-          tokio::time::sleep(req.delay).await;
-          let _ = sender.send(KernelMessage {
-            from: INIT_TASK_ID,
-            command: KernelCommand::StateTimeout(req.task_id, req.epoch),
-          });
-        });
-      }
+      self.after_dispatch();
       if self.graph.quitting && self.graph.no_active_tasks() {
         break;
       }
@@ -1376,8 +1656,65 @@ impl Kernel {
     log::debug!("After kernel loop.");
   }
 
+  /// Settles and arms timers; skipped while frozen so nothing drives.
+  fn after_dispatch(&mut self) {
+    if self.graph.frozen.is_some() {
+      return;
+    }
+    self.graph.settle();
+    self.graph.check_active_watches();
+    for req in self.graph.take_timers() {
+      let sender = self.sender.clone();
+      tokio::spawn(async move {
+        tokio::time::sleep(req.delay).await;
+        let _ = sender.send(KernelMessage {
+          from: INIT_TASK_ID,
+          command: KernelCommand::StateTimeout(req.task_id, req.epoch),
+        });
+      });
+    }
+  }
+
   /// Returns true when the loop should exit at once (a second quit).
   fn dispatch(&mut self, msg: KernelMessage) -> bool {
+    let Some(frozen) = self.graph.frozen.as_mut() else {
+      return self.dispatch_now(msg);
+    };
+    match msg.command {
+      // Facts about what a task did before it froze, and reads.
+      KernelCommand::TaskStarted
+      | KernelCommand::TaskReady
+      | KernelCommand::TaskStopped(_)
+      | KernelCommand::Query(..)
+      | KernelCommand::Freeze(_)
+      | KernelCommand::TaskFrozen(..)
+      | KernelCommand::Thaw => (),
+      // Intent and delivery wait for the thaw (or die with this image).
+      KernelCommand::Quit
+      | KernelCommand::RegisterTask(..)
+      | KernelCommand::Start(..)
+      | KernelCommand::Stop(..)
+      | KernelCommand::Kill(..)
+      | KernelCommand::Restart(..)
+      | KernelCommand::ForceRestart(..)
+      | KernelCommand::Down(..)
+      | KernelCommand::Veto(..)
+      | KernelCommand::Remove(..)
+      | KernelCommand::SetLabel(..)
+      | KernelCommand::Duplicate(..)
+      | KernelCommand::TaskMsg(..)
+      | KernelCommand::SubscribePath(..)
+      | KernelCommand::UnsubscribePath(..)
+      | KernelCommand::WatchActive(..)
+      | KernelCommand::StateTimeout(..) => {
+        frozen.deferred.push(msg);
+        return false;
+      }
+    }
+    self.dispatch_now(msg)
+  }
+
+  fn dispatch_now(&mut self, msg: KernelMessage) -> bool {
     match msg.command {
       KernelCommand::Quit => return self.graph.begin_quit(),
 
@@ -1388,6 +1725,7 @@ impl Kernel {
               registration.task_id,
               registration.def,
               registration.factory,
+              None,
             )
           } else {
             Err(RegisterError::ReservedSpace(registration.def.space))
@@ -1513,6 +1851,12 @@ impl Kernel {
       KernelCommand::WatchActive(selector, sender) => {
         self.graph.watch_active(selector, sender);
       }
+
+      KernelCommand::Freeze(reply) => self.graph.begin_freeze(reply),
+      KernelCommand::TaskFrozen(number, snapshot) => {
+        self.graph.on_task_frozen(msg.from, number, snapshot)
+      }
+      KernelCommand::Thaw => self.replay.extend(self.graph.thaw()),
     }
     false
   }

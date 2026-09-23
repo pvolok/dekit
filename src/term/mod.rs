@@ -11,6 +11,7 @@ pub mod mouse;
 pub mod row;
 pub mod screen;
 pub mod screen_differ;
+pub mod snapshot;
 pub mod vt;
 
 pub use cell::Cell;

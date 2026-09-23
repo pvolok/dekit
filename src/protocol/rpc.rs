@@ -35,11 +35,19 @@ pub enum RpcRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     until_exit: bool,
   },
+  /// Replace the runner live with the given binary.
+  /// The reply comes from the new binary after activation, as
+  /// `{version}`; `unsupported` where live replacement is not available,
+  /// `busy` while one is in progress.
+  Upgrade {
+    binary: String,
+  },
 }
 
 /// Gate for `from_wire`: methods not listed here are `unknown_method`
 /// instead of `invalid_params`. Kept in sync with the enum by tests.
-const METHODS: &[&str] = &["command", "ls", "why", "screen", "attach"];
+const METHODS: &[&str] =
+  &["command", "ls", "why", "screen", "attach", "upgrade"];
 
 impl RpcRequest {
   pub fn to_wire(&self) -> (String, Value) {
@@ -195,6 +203,9 @@ mod tests {
         height: 24,
         until_exit: true,
       },
+      RpcRequest::Upgrade {
+        binary: "/opt/dekit/bin/dekit".to_string(),
+      },
     ]
   }
 
@@ -220,6 +231,7 @@ mod tests {
         "attach",
         r#"{"height":24,"target":"web/dev","until_exit":true,"width":80}"#,
       ),
+      ("upgrade", r#"{"binary":"/opt/dekit/bin/dekit"}"#),
     ];
     let samples = samples();
     assert_eq!(samples.len(), expected.len());

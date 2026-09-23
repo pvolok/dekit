@@ -2,101 +2,10 @@
 //! verb must see exactly-one-winner (spawn) or only well-defined replies
 //! (start under churn), never internal errors.
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::path::Path;
 
-const DEKIT: &str = env!("CARGO_BIN_EXE_dekit");
-
-/// Unique temp dir, removed on drop.
-struct TmpDir {
-  path: PathBuf,
-}
-
-impl TmpDir {
-  /// Keep `name` short: the runtime dir ends up inside a unix socket
-  /// path, which must stay under SUN_LEN (~104 bytes).
-  fn new(name: &str) -> Self {
-    let path =
-      std::env::temp_dir().join(format!("dk-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).unwrap();
-    TmpDir { path }
-  }
-}
-
-impl Drop for TmpDir {
-  fn drop(&mut self) {
-    let _ = std::fs::remove_dir_all(&self.path);
-  }
-}
-
-/// One isolated runner: its own working dir and runtime dir.
-struct TestRunner {
-  work: TmpDir,
-  runtime: TmpDir,
-}
-
-impl TestRunner {
-  fn new(name: &str) -> Self {
-    TestRunner {
-      work: TmpDir::new(&format!("{}w", name)),
-      runtime: TmpDir::new(&format!("{}r", name)),
-    }
-  }
-
-  fn start(name: &str) -> Self {
-    let runner = TestRunner::new(name);
-    runner.start_runner();
-    runner
-  }
-
-  fn start_runner(&self) {
-    let out = self.run(&["runner", "start"]);
-    assert!(
-      out.status.success(),
-      "runner start failed: {}",
-      String::from_utf8_lossy(&out.stderr)
-    );
-  }
-
-  fn cmd(&self, args: &[&str]) -> Command {
-    let mut cmd = Command::new(DEKIT);
-    cmd
-      .arg("-C")
-      .arg(&self.work.path)
-      .args(args)
-      .env("XDG_RUNTIME_DIR", &self.runtime.path)
-      .env("XDG_CONFIG_HOME", &self.runtime.path)
-      .env("XDG_DATA_HOME", &self.runtime.path);
-    cmd
-  }
-
-  fn run(&self, args: &[&str]) -> Output {
-    self.cmd(args).output().unwrap()
-  }
-
-  fn spawn(&self, args: &[&str]) -> Child {
-    self
-      .cmd(args)
-      .stdout(std::process::Stdio::piped())
-      .stderr(std::process::Stdio::piped())
-      .spawn()
-      .unwrap()
-  }
-
-  fn stop(&self) {
-    let out = self.run(&["runner", "stop"]);
-    assert!(
-      out.status.success(),
-      "runner stop failed: {}",
-      String::from_utf8_lossy(&out.stderr)
-    );
-  }
-}
-
-fn stderr_of(out: &Output) -> String {
-  String::from_utf8_lossy(&out.stderr).into_owned()
-}
+mod common;
+use common::{TestRunner, TmpDir, stderr_of};
 
 fn assert_dir_has_no_lock(runtime: &Path) {
   let dekit_dir = runtime.join("dekit");
