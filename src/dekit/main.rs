@@ -490,7 +490,9 @@ fn arg_runner(
   }
 }
 
-pub async fn dekit_main() -> anyhow::Result<()> {
+/// The command tree. `dekit help` reads it too, so command pages show the
+/// same arguments and flags the parser accepts.
+pub fn cli() -> ClapCommand {
   let target_arg = |help: &'static str| Arg::new("target").help(help);
   let required_target = || {
     Arg::new("target")
@@ -609,7 +611,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       ClapCommand::new("list").about("List published runner records"),
       ClapCommand::new("clean").about("Remove stale runtime records"),
     ]);
-  let cmd = clap::command!()
+  clap::command!()
     .subcommands([
       ClapCommand::new("attach")
         .about("Attach the terminal to a task's screen (default: the console)")
@@ -718,8 +720,11 @@ pub async fn dekit_main() -> anyhow::Result<()> {
        down  unpins only; a task keeps running while something still needs it.\n  \
        veto  forces a task down and holds it there until it is started again.\n  \
        kill  is stop with an immediate hard kill.",
-    );
-  let matches = cmd.get_matches();
+    )
+}
+
+pub async fn dekit_main() -> anyhow::Result<()> {
+  let matches = cli().get_matches();
   let json = matches.get_flag("json");
 
   if let Some(("mprocs", sub_m)) = matches.subcommand() {

@@ -1,0 +1,7 @@
+sections:
+  - dir: start
+    title: Start
+  - dir: cli
+    title: CLI
+  - dir: config
+    title: Config
