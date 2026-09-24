@@ -93,8 +93,14 @@ mod unix {
 mod windows {
   use std::path::PathBuf;
 
-  use windows::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+  use windows::Win32::{
+    Foundation::{HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation},
+    System::{
+      Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+      },
+      Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS},
+    },
   };
 
   pub fn spawn_impl(
@@ -103,6 +109,18 @@ mod windows {
     kind: &str,
   ) -> anyhow::Result<()> {
     use std::{os::windows::process::CommandExt, process::Stdio};
+
+    // std spawns with bInheritHandles, so the runner would hold our
+    // caller's stdio pipes open forever.
+    for std in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+      if let Ok(handle) = unsafe { GetStdHandle(std) }
+        && !handle.is_invalid()
+      {
+        let _ = unsafe {
+          SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
+        };
+      }
+    }
 
     std::process::Command::new(path)
       .args(["runner", "run", "--dir", dir, "--kind", kind])
