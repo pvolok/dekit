@@ -612,6 +612,7 @@ pub fn cli() -> ClapCommand {
       ClapCommand::new("clean").about("Remove stale runtime records"),
     ]);
   clap::command!()
+    .disable_help_subcommand(true)
     .subcommands([
       ClapCommand::new("attach")
         .about("Attach the terminal to a task's screen (default: the console)")
@@ -682,6 +683,11 @@ pub fn cli() -> ClapCommand {
             .trailing_var_arg(true)
             .allow_hyphen_values(true),
         ),
+      ClapCommand::new("help")
+        .about("Show a documentation topic, or the index of topics")
+        .arg(Arg::new("topic").num_args(0..).help(
+          "A command (up, runner stop), a page (config, targets), or a tag",
+        )),
     ])
     .arg(
       Arg::new("chdir")
@@ -706,20 +712,8 @@ pub fn cli() -> ClapCommand {
         .help("A .js script to run; with no command, attach to the console"),
     )
     .after_help(
-      "TARGETS\n  \
-       A target is a task path (services/web), a glob (services/*, **), or\n  \
-       a +tag (+backend), optionally in a space (@dekit/console, @*/web)\n  \
-       and a runner (project::web, /abs/dir::+ci). The surgical verbs\n  \
-       (start, stop, kill, veto, restart, rm) require a target; the workday\n  \
-       verbs (up, down) default to the autostart set / everything. spawn\n  \
-       adds a task from a command line; run does the same in the foreground\n  \
-       and removes the task when it exits.\n\
-       \n\
-       BRINGING TASKS DOWN\n  \
-       stop  unpins and stops now; a task restarts if a dependent still needs it.\n  \
-       down  unpins only; a task keeps running while something still needs it.\n  \
-       veto  forces a task down and holds it there until it is started again.\n  \
-       kill  is stop with an immediate hard kill.",
+      "Run `dekit help` for the documentation topics, `dekit help <command>`\n\
+       for a command's page, and `dekit help targets` for the target syntax.",
     )
 }
 
@@ -853,6 +847,13 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       )
       .await?;
       print_acted(result, json, "Put down", "No tasks matched.")?;
+    }
+    Some(("help", sub_m)) => {
+      let words: Vec<String> = sub_m
+        .get_many::<String>("topic")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+      crate::help::help::run(&words, json)?;
     }
     Some(("runner", sub_m)) => match sub_m.subcommand() {
       Some(("run", run_m)) => {

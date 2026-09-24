@@ -234,6 +234,21 @@ pub fn compile(
     });
   }
 
+  // Home first, then nav order; hidden topics keep their source order.
+  let visible_order: Vec<String> = std::iter::once("index".to_string())
+    .chain(
+      nav
+        .iter()
+        .flat_map(|section| section.topics.iter().cloned()),
+    )
+    .collect();
+  topics.sort_by_key(|topic| {
+    visible_order
+      .iter()
+      .position(|id| id == &topic.id)
+      .unwrap_or(usize::MAX)
+  });
+
   let tag_targets: BTreeMap<String, TagTarget> = tags
     .iter()
     .map(|(tag, (target, _, _))| (tag.clone(), target.clone()))

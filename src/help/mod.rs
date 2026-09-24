@@ -4,10 +4,14 @@
 mod compile;
 mod error;
 mod generate;
+pub mod help;
 mod inline;
 pub mod ir;
+mod layout;
+mod markdown;
 mod parse;
 mod patterns;
+mod term;
 #[cfg(test)]
 mod tests;
 
