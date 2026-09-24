@@ -7,35 +7,24 @@ use std::{
   ptr::null,
 };
 
-use tokio::{
-  io::{AsyncReadExt, AsyncWriteExt},
-  net::windows::named_pipe::NamedPipeServer,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use windows::{
   Win32::{
-    Foundation::{CloseHandle, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
-    Storage::FileSystem::{
-      CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
-      FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING,
-      PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
-    },
+    Foundation::{CloseHandle, HANDLE},
     System::{
       Console::{
         COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON,
         ResizePseudoConsole,
       },
-      Pipes::{
-        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_BYTE,
-      },
+      Pipes::CreatePipe,
       Threading::{
         CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
         GetExitCodeProcess, InitializeProcThreadAttributeList,
         LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-        PROCESS_INFORMATION, RegisterWaitForSingleObject, STARTUPINFOEXW,
-        TerminateProcess, UnregisterWait, UpdateProcThreadAttribute,
-        WT_EXECUTEONLYONCE,
+        PROCESS_INFORMATION, RegisterWaitForSingleObject, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, TerminateProcess, UnregisterWait,
+        UpdateProcThreadAttribute, WT_EXECUTEONLYONCE,
       },
     },
   },
@@ -53,8 +42,8 @@ const SIGKILL: i32 = 9;
 
 pub struct WinProcess {
   pub pid: i32,
-  reader: NamedPipeServer,
-  writer: NamedPipeServer,
+  reader: tokio::fs::File,
+  writer: tokio::fs::File,
   conpty: HPCON,
   process_handle: OwnedHandle,
   wait_handle: HANDLE,
@@ -65,86 +54,25 @@ type OnWaitReturned = Box<dyn Fn(Option<i32>) + Send + Sync>;
 
 impl WinProcess {
   pub fn spawn(
-    id: TaskId,
+    _id: TaskId,
     spec: &ProcessSpec,
     size: Winsize,
     on_wait_returned: OnWaitReturned,
   ) -> io::Result<Self> {
     unsafe {
-      let (host_write, conpty_input) = {
-        let input_pipe_name = format!("\\\\.\\pipe\\conpty-input-{}", id.0);
-        let input_pipe_name_wide: Vec<u16> =
-          input_pipe_name.encode_utf16().chain(once(0)).collect();
-        let input_pipe_name_ptr = PCWSTR(input_pipe_name_wide.as_ptr());
+      // ConPTY consumes synchronous pipe handles. Tokio's file adapter keeps
+      // the host-facing synchronous ends off the async runtime's worker.
+      let mut conpty_input = HANDLE::default();
+      let mut host_write = HANDLE::default();
+      CreatePipe(&mut conpty_input, &mut host_write, None, 0)?;
+      let conpty_input = OwnedHandle::from_raw_handle(conpty_input.0);
+      let host_write = OwnedHandle::from_raw_handle(host_write.0);
 
-        let host_write = CreateNamedPipeW(
-          input_pipe_name_ptr,
-          PIPE_ACCESS_OUTBOUND
-            | FILE_FLAG_OVERLAPPED
-            | FILE_FLAG_FIRST_PIPE_INSTANCE,
-          PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
-          1,
-          0,
-          0,
-          0,
-          None,
-        );
-        if host_write == INVALID_HANDLE_VALUE {
-          return Err(io::Error::last_os_error());
-        }
-        let host_write = OwnedHandle::from_raw_handle(host_write.0);
-
-        let conpty_input = CreateFileW(
-          input_pipe_name_ptr,
-          windows::Win32::Foundation::GENERIC_READ.0,
-          windows::Win32::Storage::FileSystem::FILE_SHARE_NONE,
-          None,
-          windows::Win32::Storage::FileSystem::OPEN_EXISTING,
-          windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL
-            | FILE_FLAG_OVERLAPPED,
-          None,
-        )?;
-        let conpty_input = OwnedHandle::from_raw_handle(conpty_input.0);
-
-        (host_write, conpty_input)
-      };
-
-      let (host_read, conpty_output) = {
-        let output_pipe_name = format!("\\\\.\\pipe\\conpty-output-{}", id.0);
-        let output_pipe_name_wide: Vec<u16> =
-          output_pipe_name.encode_utf16().chain(once(0)).collect();
-        let output_pipe_name_ptr = PCWSTR(output_pipe_name_wide.as_ptr());
-
-        let host_read = CreateNamedPipeW(
-          output_pipe_name_ptr,
-          PIPE_ACCESS_INBOUND
-            | FILE_FLAG_OVERLAPPED
-            | FILE_FLAG_FIRST_PIPE_INSTANCE,
-          PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
-          1,
-          0,
-          0,
-          0,
-          None,
-        );
-        if host_read == INVALID_HANDLE_VALUE {
-          return Err(io::Error::last_os_error());
-        }
-        let host_read = OwnedHandle::from_raw_handle(host_read.0);
-
-        let conpty_output = CreateFileW(
-          output_pipe_name_ptr,
-          GENERIC_WRITE.0,
-          FILE_SHARE_NONE,
-          None,
-          OPEN_EXISTING,
-          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-          None,
-        )?;
-        let conpty_output = OwnedHandle::from_raw_handle(conpty_output.0);
-
-        (host_read, conpty_output)
-      };
+      let mut host_read = HANDLE::default();
+      let mut conpty_output = HANDLE::default();
+      CreatePipe(&mut host_read, &mut conpty_output, None, 0)?;
+      let host_read = OwnedHandle::from_raw_handle(host_read.0);
+      let conpty_output = OwnedHandle::from_raw_handle(conpty_output.0);
 
       // Create pseudo console
       let coord = COORD {
@@ -157,11 +85,12 @@ impl WinProcess {
         HANDLE(conpty_output.as_raw_handle()),
         0,
       )?;
-      drop(conpty_input);
-      drop(conpty_output);
 
       let mut startup_info_ex: STARTUPINFOEXW = zeroed();
       startup_info_ex.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+      // Prevent CreateProcessW from retaining the parent's console handles.
+      // ConPTY supplies the child's real standard handles during attachment.
+      startup_info_ex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
       let mut attr_list_size: usize = 0;
       // Note: This initial call will return an error by design. This is
@@ -194,12 +123,22 @@ impl WinProcess {
       // Build environment block
       let mut env_map: std::collections::HashMap<String, String> =
         env::vars().collect();
+      let term_is_explicit =
+        spec.env.keys().any(|key| key.eq_ignore_ascii_case("TERM"));
       for (key, value) in &spec.env {
         if let Some(val) = value {
           env_map.insert(key.clone(), val.clone());
         } else {
           env_map.remove(key);
         }
+      }
+      if !term_is_explicit {
+        // The child talks to dekit's ConPTY/VT implementation, not directly
+        // to the terminal that launched the runner. In particular, inheriting
+        // TERM=dumb makes full-screen applications such as Neovim suppress
+        // their UI even though this PTY supports xterm-style color and input.
+        env_map.retain(|key, _| !key.eq_ignore_ascii_case("TERM"));
+        env_map.insert("TERM".to_string(), "xterm-256color".to_string());
       }
       let mut env_block: Vec<u16> = Vec::new();
       let mut env_pairs: Vec<(&String, &String)> = env_map.iter().collect();
@@ -262,6 +201,11 @@ impl WinProcess {
         &startup_info_ex.StartupInfo,
         &mut process_info,
       )?;
+      // Keep the ConPTY-facing pipe handles alive until the client has been
+      // attached. Closing them earlier can tear down conhost before it has
+      // processed PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
+      drop(conpty_input);
+      drop(conpty_output);
       DeleteProcThreadAttributeList(startup_info_ex.lpAttributeList);
 
       let process_handle =
@@ -304,10 +248,12 @@ impl WinProcess {
         WT_EXECUTEONLYONCE,
       )?;
 
-      let reader =
-        NamedPipeServer::from_raw_handle(host_read.into_raw_handle())?;
-      let writer =
-        NamedPipeServer::from_raw_handle(host_write.into_raw_handle())?;
+      let reader = tokio::fs::File::from_std(std::fs::File::from_raw_handle(
+        host_read.into_raw_handle(),
+      ));
+      let writer = tokio::fs::File::from_std(std::fs::File::from_raw_handle(
+        host_write.into_raw_handle(),
+      ));
 
       Ok(WinProcess {
         pid,
@@ -390,5 +336,76 @@ impl Drop for WinProcess {
         UnregisterWait(self.wait_handle).log_ignore();
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  use tokio::sync::mpsc::unbounded_channel;
+
+  use super::*;
+
+  #[tokio::test]
+  async fn reads_output_from_conpty() {
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(10_000);
+    let id = TaskId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
+    let spec = ProcessSpec::from_argv(vec![
+      "cmd.exe".to_string(),
+      "/d".to_string(),
+      "/c".to_string(),
+      "echo DEKIT_CONPTY_PROBE".to_string(),
+    ]);
+    let (exit_tx, mut exit_rx) = unbounded_channel();
+    let mut process = WinProcess::spawn(
+      id,
+      &spec,
+      Winsize {
+        x: 80,
+        y: 24,
+        x_px: 0,
+        y_px: 0,
+      },
+      Box::new(move |code| {
+        let _ = exit_tx.send(code);
+      }),
+    )
+    .unwrap();
+
+    let output =
+      tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut output = Vec::new();
+        let mut buf = [0; 4096];
+        loop {
+          let n = process.read(&mut buf).await.unwrap();
+          if n == 0 {
+            break output;
+          }
+          output.extend_from_slice(&buf[..n]);
+          if output
+            .windows(b"DEKIT_CONPTY_PROBE".len())
+            .any(|window| window == b"DEKIT_CONPTY_PROBE")
+          {
+            break output;
+          }
+        }
+      })
+      .await
+      .expect("timed out waiting for ConPTY output");
+
+    assert!(
+      output
+        .windows(b"DEKIT_CONPTY_PROBE".len())
+        .any(|window| window == b"DEKIT_CONPTY_PROBE"),
+      "ConPTY output was: {:?}",
+      String::from_utf8_lossy(&output)
+    );
+    let code =
+      tokio::time::timeout(std::time::Duration::from_secs(5), exit_rx.recv())
+        .await
+        .expect("timed out waiting for child exit");
+    assert_eq!(code, Some(Some(0)));
+    process.on_exited();
   }
 }
