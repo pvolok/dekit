@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dekit.run/schemas/dekit.json",
+  "title": "dekit project",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "kernel": {
+      "oneOf": [
+        { "const": "npm" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path"],
+          "properties": {
+            "path": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "load": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file"],
+            "properties": {
+              "file": { "type": "string" },
+              "at": { "type": "string" }
+            }
+          }
+        ]
+      }
+    },
+    "tasks": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/task" }
+    },
+    "defaults": { "$ref": "#/$defs/taskSettings" },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "level": { "type": "string" },
+        "file": { "type": "string" }
+      }
+    },
+    "on_init": { "type": "object" },
+    "on_idle": { "type": "object" }
+  },
+  "$defs": {
+    "taskSettings": {
+      "type": "object",
+      "properties": {
+        "cwd": { "type": "string" },
+        "env": { "type": "object" },
+        "add_path": { "type": "array", "items": { "type": "string" } },
+        "autostart": { "type": "boolean" },
+        "autorestart": { "type": "boolean" },
+        "ready_log": { "type": "string" },
+        "stop": {
+          "oneOf": [
+            { "type": "string" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "signal": { "type": "string" },
+                "group": { "type": "boolean" },
+                "send-keys": { "type": "array", "items": { "type": "string" } },
+                "cmd": { "type": "string" }
+              }
+            }
+          ]
+        },
+        "log": {
+          "oneOf": [
+            { "type": "boolean" },
+            { "type": "string" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "dir": { "type": "string" },
+                "file": { "type": "string" },
+                "mode": { "enum": ["append", "truncate"] },
+                "append": { "type": "boolean" }
+              }
+            }
+          ]
+        },
+        "scrollback_len": { "type": "integer", "minimum": 0 },
+        "mouse_scroll_speed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "task": {
+      "allOf": [
+        { "$ref": "#/$defs/taskSettings" },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "label": { "type": "string" },
+            "cmd": {
+              "oneOf": [
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" } }
+              ]
+            },
+            "shell": { "type": "string" },
+            "script": { "type": "string", "pattern": "\\.m?js$" },
+            "deps": {
+              "type": "array",
+              "description": "Local names are rebased by fragment mounts; prefix / to address the project root.",
+              "items": { "type": "string" }
+            },
+            "tags": { "type": "array", "items": { "type": "string" } }
+          },
+          "oneOf": [
+            { "required": ["cmd"] },
+            { "required": ["shell"] },
+            { "required": ["script"] }
+          ]
+        }
+      ]
+    }
+  }
+}

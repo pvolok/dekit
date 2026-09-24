@@ -17,7 +17,7 @@ const DEFAULT_SCROLLBACK_LEN: usize = 1000;
 const DEFAULT_MOUSE_SCROLL_SPEED: usize = 5;
 
 /// Keys allowed under `defaults:` (shared process settings, no cmd/deps).
-const TASK_SETTING_KEYS: &[&str] = &[
+pub(crate) const TASK_SETTING_KEYS: &[&str] = &[
   "cwd",
   "env",
   "add_path",
@@ -31,7 +31,7 @@ const TASK_SETTING_KEYS: &[&str] = &[
 ];
 
 /// Keys allowed on a full task entry (settings + cmd form + graph fields).
-const TASK_KEYS: &[&str] = &[
+pub(crate) const TASK_KEYS: &[&str] = &[
   "label",
   "cmd",
   "shell",

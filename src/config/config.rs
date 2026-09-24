@@ -12,12 +12,12 @@ use crate::config::tui::TuiConfig;
 use crate::kernel::task_path::TaskPath;
 use crate::runner::user_config_dir;
 
-const ROOT_KEYS: &[&str] = &[
+pub(crate) const ROOT_KEYS: &[&str] = &[
   "kernel", "load", "log", "defaults", "on_init", "on_idle", "tasks", "tui",
   "keymap",
 ];
 const FRAGMENT_KEYS: &[&str] = &["load", "tasks"];
-const PRESENTATION_KEYS: &[&str] = &["tui", "keymap"];
+pub(crate) const PRESENTATION_KEYS: &[&str] = &["tui", "keymap"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelConfig {

@@ -496,3 +496,88 @@ fn embedded_docs_compile() {
     panic!("{}", super::error::join(&errors));
   }
 }
+
+fn command_paths(cmd: &clap::Command, path: String, out: &mut Vec<String>) {
+  out.push(path.clone());
+  for sub in cmd.get_subcommands().filter(|sub| !sub.is_hide_set()) {
+    command_paths(sub, format!("{path} {}", sub.get_name()), out);
+  }
+}
+
+#[test]
+fn every_command_has_a_topic() {
+  let docs =
+    load().unwrap_or_else(|errors| panic!("{}", super::error::join(&errors)));
+  let mut commands = Vec::new();
+  command_paths(
+    &crate::dekit::main::cli(),
+    "dekit".to_string(),
+    &mut commands,
+  );
+  commands.sort();
+  let mut documented: Vec<String> =
+    docs.topics.iter().filter_map(|t| t.cli.clone()).collect();
+  documented.sort();
+  assert_eq!(commands, documented);
+}
+
+#[test]
+fn config_keys_match_code_schema_and_docs() {
+  use std::collections::BTreeSet;
+
+  use crate::config::config::{PRESENTATION_KEYS, ROOT_KEYS};
+  use crate::config::task::{TASK_KEYS, TASK_SETTING_KEYS};
+
+  let docs =
+    load().unwrap_or_else(|errors| panic!("{}", super::error::join(&errors)));
+  let mut docs_root = BTreeSet::new();
+  let mut docs_task = BTreeSet::new();
+  for topic in &docs.topics {
+    for block in &topic.blocks {
+      let Block::Fields {
+        kind: FieldKind::Config,
+        items,
+      } = block
+      else {
+        continue;
+      };
+      for item in items {
+        if let Some(key) = item.key.strip_prefix("tasks.*.") {
+          docs_task.insert(key.to_string());
+        } else if !item.key.contains('.') {
+          docs_root.insert(item.key.clone());
+        }
+      }
+    }
+  }
+  let set = |keys: &[&str]| -> BTreeSet<String> {
+    keys.iter().map(|k| k.to_string()).collect()
+  };
+  let code_root: BTreeSet<String> = ROOT_KEYS
+    .iter()
+    .filter(|key| !PRESENTATION_KEYS.contains(key))
+    .map(|key| key.to_string())
+    .collect();
+  assert_eq!(docs_root, code_root, "project keys: docs vs code");
+  assert_eq!(docs_task, set(TASK_KEYS), "task keys: docs vs code");
+
+  let schema: serde_json::Value =
+    serde_json::from_str(include_str!("../../schemas/dekit.json")).unwrap();
+  let keys = |value: &serde_json::Value| -> BTreeSet<String> {
+    value.as_object().unwrap().keys().cloned().collect()
+  };
+  assert_eq!(
+    keys(&schema["properties"]),
+    code_root,
+    "project keys: schema vs code"
+  );
+  let settings = keys(&schema["$defs"]["taskSettings"]["properties"]);
+  assert_eq!(
+    settings,
+    set(TASK_SETTING_KEYS),
+    "task settings: schema vs code"
+  );
+  let mut schema_task = settings;
+  schema_task.extend(keys(&schema["$defs"]["task"]["allOf"][1]["properties"]));
+  assert_eq!(schema_task, set(TASK_KEYS), "task keys: schema vs code");
+}

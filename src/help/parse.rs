@@ -39,7 +39,6 @@ pub enum RawBlock {
   },
   Footnote {
     inlines: Vec<Inline>,
-    line: usize,
   },
   Image {
     src: String,
@@ -824,7 +823,7 @@ fn parse_container(
         .join(" ");
       let (inlines, inner) = parse_inlines(&text, path, ln);
       errors.extend(inner);
-      Some(RawBlock::Footnote { inlines, line: ln })
+      Some(RawBlock::Footnote { inlines })
     }
     "commands" => {
       if head.bare.is_some() || !head.attrs.is_empty() {

@@ -21,6 +21,7 @@ mod embed {
   include!(concat!(env!("OUT_DIR"), "/docs_embed.rs"));
 }
 
+#[cfg(test)]
 pub fn compile(
   sources: &[(&str, &str)],
   manifest: &str,

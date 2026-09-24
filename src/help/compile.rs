@@ -471,9 +471,7 @@ fn convert(
       }
       out.push(Block::Fields { kind, items });
     }
-    RawBlock::Footnote { inlines, line: _ } => {
-      out.push(Block::Footnote { inlines })
-    }
+    RawBlock::Footnote { inlines } => out.push(Block::Footnote { inlines }),
     RawBlock::Image { src, alt, line } => {
       if !(src.starts_with("https://") || src.starts_with("http://")) {
         errors.push(err(
