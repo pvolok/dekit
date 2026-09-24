@@ -50,6 +50,30 @@ declare const std: {
     isAbsolute(path: string): boolean;
   };
 
+  /** Commands for the runner this script belongs to. Targets are written
+   *  as on the command line; every call resolves to the number of tasks
+   *  it acted on. */
+  readonly dekit: {
+    /** Pin and start the matching tasks and their dependencies. */
+    start(target: string): Promise<number>;
+    /** Force-restart the matching tasks, whether or not they are wanted. */
+    run(target: string): Promise<number>;
+    /** Unpin and stop; a task restarts if a dependent still needs it. */
+    stop(target: string): Promise<number>;
+    /** Unpin only. */
+    down(target: string): Promise<number>;
+    /** Stop with an immediate hard kill. */
+    kill(target: string): Promise<number>;
+    /** Force down and hold down until started again. */
+    veto(target: string): Promise<number>;
+    /** Restart the matching tasks. */
+    restart(target: string): Promise<number>;
+    /** Remove the matching tasks, killing running ones. */
+    remove(target: string): Promise<number>;
+    /** Register a process task at an exact path with the given argv and start it. */
+    add(path: string, cmd: string[]): Promise<number>;
+  };
+
   /** Environment variable access. */
   readonly env: {
     /** Get an environment variable's value, or `undefined` if unset. */

@@ -581,3 +581,54 @@ fn config_keys_match_code_schema_and_docs() {
   schema_task.extend(keys(&schema["$defs"]["task"]["allOf"][1]["properties"]));
   assert_eq!(schema_task, set(TASK_KEYS), "task keys: schema vs code");
 }
+
+const JS_MEMBERS: &str = r#"(() => {
+  const out = [];
+  const walk = (obj, prefix) => {
+    for (const key of Object.keys(obj)) {
+      const value = obj[key];
+      const name = prefix + "." + key;
+      if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+        walk(value, name);
+      } else {
+        out.push(name);
+      }
+    }
+  };
+  walk(std, "std");
+  return JSON.stringify(out.sort());
+})()"#;
+
+#[tokio::test]
+async fn every_js_member_has_a_record() {
+  use std::collections::BTreeSet;
+
+  let docs =
+    load().unwrap_or_else(|errors| panic!("{}", super::error::join(&errors)));
+  let vm = crate::js::js_vm::JsVm::new(None).await.unwrap();
+  let json: String = rquickjs::async_with!(vm.context => |ctx| {
+    ctx.eval::<String, _>(JS_MEMBERS).map_err(|err| err.to_string())
+  })
+  .await
+  .unwrap();
+  let runtime: BTreeSet<String> = serde_json::from_str::<Vec<String>>(&json)
+    .unwrap()
+    .into_iter()
+    .collect();
+  let documented: BTreeSet<String> = docs
+    .topics
+    .iter()
+    .flat_map(|topic| topic.blocks.iter())
+    .filter_map(|block| match block {
+      Block::Fields {
+        kind: FieldKind::Js,
+        items,
+      } => Some(items),
+      _ => None,
+    })
+    .flatten()
+    .map(|field| field.key.clone())
+    .filter(|key| key.starts_with("std."))
+    .collect();
+  assert_eq!(runtime, documented, "std members: runtime vs docs");
+}

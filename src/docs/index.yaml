@@ -5,3 +5,7 @@ sections:
     title: CLI
   - dir: config
     title: Config
+  - dir: js
+    title: JavaScript
+  - dir: rpc
+    title: RPC
