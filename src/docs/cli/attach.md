@@ -1,6 +1,7 @@
 ---
 title: dekit attach
 cli: dekit attach
+order: 1
 related: [cli, config/user, cli/screen]
 ---
 

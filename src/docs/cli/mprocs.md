@@ -1,6 +1,7 @@
 ---
 title: dekit mprocs
 cli: dekit mprocs
+order: 17
 related: [start/from-mprocs]
 ---
 

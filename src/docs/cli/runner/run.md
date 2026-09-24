@@ -1,6 +1,7 @@
 ---
 title: dekit runner run
 cli: dekit runner run
+order: 6
 related: [cli/runner, cli/runner/start]
 ---
 

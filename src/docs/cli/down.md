@@ -1,6 +1,7 @@
 ---
 title: dekit down
 cli: dekit down
+order: 3
 related: [cli/up, cli/stop, start/targets]
 ---
 

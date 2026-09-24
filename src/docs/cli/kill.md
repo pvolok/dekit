@@ -1,6 +1,7 @@
 ---
 title: dekit kill
 cli: dekit kill
+order: 9
 related: [cli/stop, cli/rm, config/tasks]
 ---
 

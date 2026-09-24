@@ -1,6 +1,7 @@
 ---
 title: dekit kernel status
 cli: dekit kernel status
+order: 1
 related: [cli/kernel, cli/runner/status, config/kernel]
 ---
 

@@ -1,6 +1,7 @@
 ---
 title: dekit kernel
 cli: dekit kernel
+order: 16
 related: [config/kernel, cli/runner/upgrade]
 ---
 

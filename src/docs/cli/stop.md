@@ -1,6 +1,7 @@
 ---
 title: dekit stop
 cli: dekit stop
+order: 8
 related: [cli/down, cli/kill, cli/veto, config/tasks]
 ---
 

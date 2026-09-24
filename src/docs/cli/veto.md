@@ -1,6 +1,7 @@
 ---
 title: dekit veto
 cli: dekit veto
+order: 10
 related: [cli/stop, cli/down, cli/start, start/targets]
 ---
 

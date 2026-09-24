@@ -1,6 +1,7 @@
 ---
 title: dekit runner restart
 cli: dekit runner restart
+order: 8
 related: [cli/runner, cli/runner/upgrade, cli/restart]
 ---
 

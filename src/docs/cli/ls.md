@@ -1,6 +1,7 @@
 ---
 title: dekit ls
 cli: dekit ls
+order: 4
 related: [cli/why, start/targets, start/agents]
 ---
 

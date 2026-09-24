@@ -1,6 +1,7 @@
 ---
 title: dekit run
 cli: dekit run
+order: 13
 related: [cli/spawn, cli/attach, start/agents]
 ---
 

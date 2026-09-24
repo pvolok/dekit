@@ -1,6 +1,7 @@
 ---
 title: dekit spawn
 cli: dekit spawn
+order: 12
 related: [cli/run, cli/rm, config/tasks]
 ---
 

@@ -2,7 +2,7 @@
 title: dekit up
 cli: dekit up
 related: [cli, start/targets, config]
-order: 10
+order: 2
 ---
 
 `dekit up` is the workday start verb. With no target it starts every task

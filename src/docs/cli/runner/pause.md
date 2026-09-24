@@ -1,6 +1,7 @@
 ---
 title: dekit runner pause
 cli: dekit runner pause
+order: 9
 related: [cli/runner, cli/runner/stop, cli/runner/start]
 ---
 

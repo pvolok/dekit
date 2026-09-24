@@ -1,6 +1,7 @@
 ---
 title: dekit runner stop
 cli: dekit runner stop
+order: 2
 related: [cli/runner, cli/down, cli/runner/pause]
 ---
 

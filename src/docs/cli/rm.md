@@ -1,6 +1,7 @@
 ---
 title: dekit rm
 cli: dekit rm
+order: 14
 related: [cli/spawn, cli/kill, start/targets]
 ---
 

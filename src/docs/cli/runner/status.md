@@ -1,6 +1,7 @@
 ---
 title: dekit runner status
 cli: dekit runner status
+order: 3
 related: [cli/runner, cli/runner/list, cli/kernel/status]
 ---
 

@@ -1,6 +1,7 @@
 ---
 title: dekit screen
 cli: dekit screen
+order: 6
 related: [cli/attach, cli/ls, start/agents]
 ---
 

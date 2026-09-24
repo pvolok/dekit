@@ -1,6 +1,7 @@
 ---
 title: dekit runner
 cli: dekit runner
+order: 15
 related: [start/runners, cli/runner/stop, cli/kernel]
 ---
 

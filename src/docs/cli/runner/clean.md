@@ -1,6 +1,7 @@
 ---
 title: dekit runner clean
 cli: dekit runner clean
+order: 5
 related: [cli/runner, cli/runner/list]
 ---
 

@@ -1,6 +1,7 @@
 ---
 title: dekit start
 cli: dekit start
+order: 7
 related: [cli/up, cli/stop, start/targets]
 ---
 

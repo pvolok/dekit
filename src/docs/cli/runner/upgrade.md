@@ -1,6 +1,7 @@
 ---
 title: dekit runner upgrade
 cli: dekit runner upgrade
+order: 7
 related: [cli/runner, cli/kernel, config/kernel]
 ---
 

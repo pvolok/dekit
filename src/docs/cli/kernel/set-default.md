@@ -1,6 +1,7 @@
 ---
 title: dekit kernel set-default
 cli: dekit kernel set-default
+order: 2
 related: [cli/kernel, cli/kernel/clear-default, config/kernel]
 ---
 

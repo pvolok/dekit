@@ -1,6 +1,7 @@
 ---
 title: dekit restart
 cli: dekit restart
+order: 11
 related: [cli/start, cli/stop, cli/runner/restart]
 ---
 

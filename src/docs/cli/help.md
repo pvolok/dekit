@@ -1,6 +1,7 @@
 ---
 title: dekit help
 cli: dekit help
+order: 18
 related: [cli, start/agents]
 ---
 
