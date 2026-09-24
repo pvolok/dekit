@@ -1567,54 +1567,60 @@ impl Kernel {
   }
 
   /// Rebuilds the graph from an upgrade snapshot before `run`. Each task
-  /// comes with the registration its kind built from the snapshot; the
-  /// kernel registers them dependencies first, each in its saved
-  /// lifecycle state.
+  /// comes with the registration its kind built from the snapshot, and
+  /// its saved lifecycle state; a task without one (added from the config
+  /// since the snapshot) starts idle. The kernel registers them
+  /// dependencies first.
   pub fn restore(
     &mut self,
     next_task_id: usize,
-    tasks: Vec<(&snap::Task, TaskRegistration)>,
+    tasks: Vec<(Option<&snap::Task>, TaskRegistration)>,
   ) -> anyhow::Result<()> {
     self
       .graph
       .next_task_id
       .store(next_task_id, std::sync::atomic::Ordering::Relaxed);
     self.graph.now = Instant::now();
-    let slot: HashMap<usize, usize> = tasks
+    let slot: HashMap<TaskId, usize> = tasks
       .iter()
       .enumerate()
-      .map(|(i, (saved, _))| (saved.id, i))
+      .map(|(i, (_, registration))| (registration.task_id, i))
       .collect();
-    let mut missing_deps: Vec<usize> =
-      tasks.iter().map(|(saved, _)| saved.deps.len()).collect();
+    let mut missing_deps: Vec<usize> = vec![0; tasks.len()];
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
-    for (i, (saved, _)) in tasks.iter().enumerate() {
-      for dep in &saved.deps {
+    for (i, (_, registration)) in tasks.iter().enumerate() {
+      for dep in &registration.def.deps {
+        let dep = match dep {
+          TaskSelector::Id(dep) => dep,
+          TaskSelector::Glob(_, _) | TaskSelector::Tag(_, _) => continue,
+        };
         let Some(&j) = slot.get(dep) else {
           anyhow::bail!(
             "task {} has a dependency that is not in the snapshot",
-            saved.id
+            registration.task_id.0
           );
         };
+        missing_deps[i] += 1;
         dependents[j].push(i);
       }
     }
     let mut ready: Vec<usize> =
       (0..tasks.len()).filter(|i| missing_deps[*i] == 0).collect();
-    let mut tasks: Vec<Option<(&snap::Task, TaskRegistration)>> =
+    let mut tasks: Vec<Option<(Option<&snap::Task>, TaskRegistration)>> =
       tasks.into_iter().map(Some).collect();
     let mut registered = 0;
     while let Some(i) = ready.pop() {
       let (saved, registration) = tasks[i].take().expect("ready once");
+      let id = registration.task_id;
       self
         .graph
         .register_task_with_id(
           registration.task_id,
           registration.def,
           registration.factory,
-          Some(saved),
+          saved,
         )
-        .map_err(|err| anyhow::anyhow!("restoring task {}: {err}", saved.id))?;
+        .map_err(|err| anyhow::anyhow!("restoring task {}: {err}", id.0))?;
       registered += 1;
       for &dependent in &dependents[i] {
         missing_deps[dependent] -= 1;

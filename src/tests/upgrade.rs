@@ -53,6 +53,10 @@ impl TestRunner {
     path
   }
 
+  fn yaml(&self, body: &str) {
+    std::fs::write(self.work.path.join("dekit.yaml"), body).unwrap();
+  }
+
   fn snapshot_files(&self) -> Vec<String> {
     std::fs::read_dir(self.runtime.path.join("dekit"))
       .into_iter()
@@ -74,11 +78,24 @@ fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
 
 /// The ticker prints its own pid first; `screen` shows the task's terminal.
 fn child_pid(runner: &TestRunner) -> u32 {
-  let screen = runner.ok(&["screen", "ticker"]);
+  pid_of(runner, "ticker")
+}
+
+fn pid_of(runner: &TestRunner, task: &str) -> u32 {
+  let screen = runner.ok(&["screen", task]);
   screen
     .lines()
     .find_map(|line| line.trim().strip_prefix("pid ")?.trim().parse().ok())
-    .expect("ticker printed its pid")
+    .unwrap_or_else(|| panic!("{task} printed no pid: {screen}"))
+}
+
+fn task_line(runner: &TestRunner, task: &str) -> String {
+  runner
+    .ok(&["ls"])
+    .lines()
+    .find(|line| line.split_whitespace().any(|word| word == task))
+    .map(str::to_string)
+    .unwrap_or_default()
 }
 
 fn last_tick(runner: &TestRunner) -> Option<u64> {
@@ -141,6 +158,52 @@ async fn upgrade_keeps_child_client_and_identity() {
   });
   drop(sender);
   drop(receiver);
+
+  runner.stop();
+}
+
+/// A restart is an upgrade into the same binary that re-reads
+/// `dekit.yaml`: a running task keeps its child and takes the new command
+/// at its next start, and a task added to the config appears.
+#[tokio::test]
+async fn restart_reloads_config() {
+  let runner = TestRunner::new("rs");
+  runner.yaml(
+    "tasks:\n  alpha:\n    cmd: [sh, -c, 'echo pid $$; echo one; sleep 60']\n    autostart: true\n",
+  );
+  runner.start_runner();
+  wait_until("alpha ready", || {
+    task_line(&runner, "alpha").contains("ready")
+  });
+  let pid = pid_of(&runner, "alpha");
+
+  runner.yaml(
+    "tasks:\n  alpha:\n    cmd: [sh, -c, 'echo pid $$; echo two; sleep 60']\n    autostart: true\n  beta:\n    cmd: [sleep, '60']\n    autostart: true\n    deps: [alpha]\n",
+  );
+  let out = runner.run(&["runner", "restart"]);
+  assert!(out.status.success(), "restart: {}", stderr(&out));
+  assert!(
+    String::from_utf8_lossy(&out.stdout).contains("restarted live"),
+    "{out:?}"
+  );
+
+  // The running child is untouched; the added task starts.
+  assert_eq!(pid_of(&runner, "alpha"), pid);
+  let screen = runner.ok(&["screen", "alpha"]);
+  assert!(
+    screen.contains("one") && !screen.contains("two"),
+    "{screen}"
+  );
+  wait_until("beta ready", || {
+    task_line(&runner, "beta").contains("ready")
+  });
+
+  // The new command applies at the next start.
+  runner.ok(&["restart", "alpha"]);
+  wait_until("alpha runs the new command", || {
+    runner.ok(&["screen", "alpha"]).contains("two")
+  });
+  assert_ne!(pid_of(&runner, "alpha"), pid);
 
   runner.stop();
 }

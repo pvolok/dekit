@@ -2085,7 +2085,7 @@ async fn restore_rebuilds_graph_and_drives_only_what_changed() {
         ..Default::default()
       };
       (
-        saved,
+        Some(saved),
         TaskRegistration {
           task_id: TaskId(saved.id),
           def,

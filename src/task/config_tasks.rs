@@ -82,7 +82,7 @@ pub fn spawn_config_task(
   (task_id, ack)
 }
 
-fn config_task_registration(
+pub fn config_task_registration(
   config: &Config,
   space: TaskSpaceId,
   cfg: TaskConfig,
@@ -90,12 +90,49 @@ fn config_task_registration(
   deps: Vec<TaskSelector>,
   pinned: bool,
 ) -> TaskRegistration {
+  let (key, process) =
+    config_task_parts(config, space, cfg, task_id, deps, pinned);
+  process_task_registration(task_id, key, process)
+}
+
+/// A config task continued from a snapshot: the config's spec around the
+/// saved screen and child. A changed command applies at the next start.
+#[cfg(unix)]
+pub fn config_task_resumed(
+  config: &Config,
+  cfg: TaskConfig,
+  task_id: TaskId,
+  deps: Vec<TaskSelector>,
+  pinned: bool,
+  screen: &crate::upgrade::snapshot::Screen,
+  instance: Option<crate::upgrade::snapshot::Instance>,
+) -> anyhow::Result<TaskRegistration> {
+  let (key, process) = config_task_parts(
+    config,
+    TaskSpaceId::default_space(),
+    cfg,
+    task_id,
+    deps,
+    pinned,
+  );
+  crate::task::process_task::process_task_resumed(
+    task_id, key, process, screen, instance,
+  )
+}
+
+fn config_task_parts(
+  config: &Config,
+  space: TaskSpaceId,
+  cfg: TaskConfig,
+  task_id: TaskId,
+  deps: Vec<TaskSelector>,
+  pinned: bool,
+) -> (Option<TaskKey>, ProcessTaskConfig) {
   let merged = config.defaults.clone().overlay(cfg);
   let path = TaskPath::new(&merged.path)
     .or_else(|_| TaskPath::new(task_id.0.to_string()))
     .ok();
-  process_task_registration(
-    task_id,
+  (
     path.map(|path| TaskKey::new(space, path)),
     process_task_config(&merged, config.runner.as_ref(), deps, pinned),
   )
@@ -136,7 +173,7 @@ fn process_task_config(
   }
 }
 
-fn resolve_task_deps(
+pub fn resolve_task_deps(
   task_configs: &[TaskConfig],
   task_ids: &[TaskId],
 ) -> anyhow::Result<Vec<Vec<TaskId>>> {

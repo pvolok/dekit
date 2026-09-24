@@ -264,6 +264,48 @@ fn runner_json(info: &lockfile::RunnerInfo) -> serde_json::Value {
   serde_json::Value::Object(map)
 }
 
+fn running_record(
+  runner: &RunnerSpec,
+) -> anyhow::Result<lockfile::RunnerRecord> {
+  match lockfile::get_runner_state(runner)? {
+    lockfile::RunnerState::Ready(record) => Ok(record),
+    lockfile::RunnerState::Absent
+    | lockfile::RunnerState::Starting
+    | lockfile::RunnerState::Stale(_)
+    | lockfile::RunnerState::Failed(_) => {
+      anyhow::bail!("Runner is not running. Start it with `dekit up`.")
+    }
+  }
+}
+
+/// Replaces the runner live with `binary`; the reply comes from the new
+/// image. A resume that fails after the switch records why, then exits.
+async fn switch_runner(
+  runner: &RunnerSpec,
+  binary: &Path,
+) -> anyhow::Result<serde_json::Value> {
+  let request = RpcRequest::Upgrade {
+    binary: binary.to_string_lossy().into_owned(),
+  };
+  match rpc_request(runner, request, false).await {
+    Ok(result) => Ok(result),
+    Err(err) => match lockfile::get_runner_state(runner)? {
+      lockfile::RunnerState::Failed(error) => anyhow::bail!("{error}"),
+      lockfile::RunnerState::Absent
+      | lockfile::RunnerState::Starting
+      | lockfile::RunnerState::Ready(_)
+      | lockfile::RunnerState::Stale(_) => Err(err),
+    },
+  }
+}
+
+fn result_version(result: &serde_json::Value) -> &str {
+  result
+    .get("version")
+    .and_then(|v| v.as_str())
+    .unwrap_or("?")
+}
+
 async fn start_runner(runner: &RunnerSpec) -> anyhow::Result<()> {
   match lockfile::get_runner_state(runner)? {
     lockfile::RunnerState::Ready(record) => {
@@ -534,6 +576,9 @@ pub async fn dekit_main() -> anyhow::Result<()> {
             .long("binary")
             .help("Binary to switch to (default: the selected kernel)"),
         ),
+      ClapCommand::new("restart")
+        .about("Restart the runner live, reloading dekit.yaml")
+        .arg(runner_ref_arg()),
       ClapCommand::new("status")
         .about("Show selected runner status")
         .arg(runner_ref_arg()),
@@ -823,51 +868,34 @@ pub async fn dekit_main() -> anyhow::Result<()> {
             .map_err(|err| anyhow!("invalid binary `{path}`: {err}"))?,
           None => resolve_kernel_binary(&runner)?,
         };
-        match lockfile::get_runner_state(&runner)? {
-          lockfile::RunnerState::Ready(record) => {
-            if Path::new(&record.binary) == binary {
-              println!(
-                "Runner already runs {}; switching live anyway.",
-                binary.display()
-              );
-            }
-          }
-          lockfile::RunnerState::Absent
-          | lockfile::RunnerState::Starting
-          | lockfile::RunnerState::Stale(_)
-          | lockfile::RunnerState::Failed(_) => {
-            anyhow::bail!("Runner is not running. Start it with `dekit up`.")
-          }
+        let record = running_record(&runner)?;
+        if Path::new(&record.binary) == binary {
+          println!(
+            "Runner already runs {}; switching live anyway.",
+            binary.display()
+          );
         }
-        let result = match rpc_request(
-          &runner,
-          RpcRequest::Upgrade {
-            binary: binary.to_string_lossy().into_owned(),
-          },
-          false,
-        )
-        .await
-        {
-          Ok(result) => result,
-          // A resume that fails after the switch records why, then exits.
-          Err(err) => match lockfile::get_runner_state(&runner)? {
-            lockfile::RunnerState::Failed(error) => anyhow::bail!("{error}"),
-            lockfile::RunnerState::Absent
-            | lockfile::RunnerState::Starting
-            | lockfile::RunnerState::Ready(_)
-            | lockfile::RunnerState::Stale(_) => return Err(err),
-          },
-        };
+        let result = switch_runner(&runner, &binary).await?;
         if matches.get_flag("json") {
           println!("{}", serde_json::to_string(&result)?);
         } else {
-          let version = result
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
           println!(
-            "Runner upgraded live to dekit {version} ({}).",
+            "Runner upgraded live to dekit {} ({}).",
+            result_version(&result),
             binary.display()
+          );
+        }
+      }
+      Some(("restart", sub_m)) => {
+        let runner = arg_runner(&matches, sub_m)?;
+        let binary = PathBuf::from(running_record(&runner)?.binary);
+        let result = switch_runner(&runner, &binary).await?;
+        if matches.get_flag("json") {
+          println!("{}", serde_json::to_string(&result)?);
+        } else {
+          println!(
+            "Runner restarted live (dekit {}).",
+            result_version(&result)
           );
         }
       }

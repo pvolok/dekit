@@ -212,14 +212,27 @@ pub fn process_task_from_snapshot(
     tags: saved.tags.clone(),
     pinned: saved.pinned,
   };
-  let vt = SharedVt::new(Screen::from_snapshot(&process.screen)?);
-  Ok(registration(
+  process_task_resumed(
     task_id,
     key,
     config,
-    vt,
+    &process.screen,
     process.instance.clone(),
-  ))
+  )
+}
+
+/// A process task around a saved screen and, if the child is still this
+/// runner's, its inherited PTY; the config may be newer than the child.
+#[cfg(unix)]
+pub fn process_task_resumed(
+  task_id: TaskId,
+  key: Option<TaskKey>,
+  config: ProcessTaskConfig,
+  screen: &snap::Screen,
+  instance: Option<snap::Instance>,
+) -> anyhow::Result<TaskRegistration> {
+  let vt = SharedVt::new(Screen::from_snapshot(screen)?);
+  Ok(registration(task_id, key, config, vt, instance))
 }
 
 fn registration(
@@ -1128,7 +1141,9 @@ mod tests {
 
     let mut kernel = Kernel::new();
     let pc = kernel.context();
-    kernel.restore(2, vec![(&saved, registration)]).unwrap();
+    kernel
+      .restore(2, vec![(Some(&saved), registration)])
+      .unwrap();
     let kernel_task = tokio::spawn(kernel.run());
 
     let deadline = Instant::now() + Duration::from_secs(2);

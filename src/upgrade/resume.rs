@@ -3,7 +3,11 @@
 //! a target binary through first. The arguments, the check's answer, and
 //! the snapshot header are frozen.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+  collections::{HashMap, HashSet},
+  path::PathBuf,
+  sync::Arc,
+};
 
 use anyhow::Context;
 use futures::future::BoxFuture;
@@ -33,7 +37,12 @@ use crate::{
     lockfile::{LockFileGuard, runner_paths},
     socket::{ServerSocket, adopt_connection},
   },
-  task::process_task::process_task_from_snapshot,
+  task::{
+    config_tasks::{
+      config_task_registration, config_task_resumed, resolve_task_deps,
+    },
+    process_task::process_task_from_snapshot,
+  },
   term::Size,
   upgrade::{set_cloexec, snapshot as snap},
 };
@@ -215,7 +224,7 @@ fn check_graph(
       )
     })
     .collect();
-  Kernel::new().restore(snapshot.next_task_id, tasks)
+  Kernel::new().restore(prepared.next_task_id, tasks)
 }
 
 /// Holds a task's place in the graph `--check` restores and drops.
@@ -227,8 +236,16 @@ impl Task for Unstarted {
 
 /// Everything a resume builds from the snapshot before it touches an
 /// inherited fd; `--check` builds exactly this.
+///
+/// The graph is the snapshot's reconciled with the config just loaded: a
+/// config task the snapshot also has is built from the config's spec
+/// around the saved child and screen, a config task the snapshot lacks
+/// is added idle, and a saved task the config lacks stays as saved. So a
+/// restart or upgrade applies an edited `dekit.yaml` without touching a
+/// running child; its new command is used at the next start.
 struct Prepared<'a> {
-  tasks: Vec<(&'a snap::Task, TaskRegistration)>,
+  next_task_id: usize,
+  tasks: Vec<(Option<&'a snap::Task>, TaskRegistration)>,
   console: TaskId,
   connections: Vec<Connection>,
 }
@@ -256,7 +273,68 @@ fn prepare<'a>(
 ) -> anyhow::Result<Prepared<'a>> {
   let mut tasks = Vec::with_capacity(snapshot.tasks.len());
   let mut console = None;
+
+  // Config tasks first: a saved one keeps its id, a new one takes the
+  // next, so the config's own dependencies resolve among them.
+  let saved_by_path: HashMap<&str, &snap::Task> = snapshot
+    .tasks
+    .iter()
+    .filter(|task| task.space.is_empty())
+    .filter_map(|task| Some((task.path.as_deref()?, task)))
+    .collect();
+  let mut next_task_id = snapshot.next_task_id;
+  let ids: Vec<TaskId> = config
+    .tasks
+    .iter()
+    .map(|cfg| match saved_by_path.get(cfg.path.as_str()) {
+      Some(saved) => TaskId(saved.id),
+      None => {
+        next_task_id += 1;
+        TaskId(next_task_id - 1)
+      }
+    })
+    .collect();
+  let deps_by_task = resolve_task_deps(&config.tasks, &ids)?;
+  let mut from_config = HashSet::new();
+  for (i, cfg) in config.tasks.iter().enumerate() {
+    let deps = deps_by_task[i]
+      .iter()
+      .copied()
+      .map(TaskSelector::Id)
+      .collect();
+    let saved = saved_by_path.get(cfg.path.as_str()).copied();
+    let registration = match saved {
+      Some(saved) => {
+        let snap::TaskKind::Process(process) = &saved.kind else {
+          anyhow::bail!("task {} is not a process task", cfg.path);
+        };
+        from_config.insert(saved.id);
+        config_task_resumed(
+          config,
+          cfg.clone(),
+          ids[i],
+          deps,
+          saved.pinned,
+          &process.screen,
+          process.instance.clone(),
+        )?
+      }
+      None => config_task_registration(
+        config,
+        TaskSpaceId::default_space(),
+        cfg.clone(),
+        ids[i],
+        deps,
+        cfg.autostart(),
+      ),
+    };
+    tasks.push((saved, registration));
+  }
+
   for task in &snapshot.tasks {
+    if from_config.contains(&task.id) {
+      continue;
+    }
     let space = if task.space.is_empty() {
       TaskSpaceId::default_space()
     } else {
@@ -294,7 +372,7 @@ fn prepare<'a>(
         )
       }
     };
-    tasks.push((task, registration));
+    tasks.push((Some(task), registration));
   }
   let console =
     console.ok_or_else(|| anyhow::anyhow!("snapshot has no console"))?;
@@ -332,6 +410,7 @@ fn prepare<'a>(
     });
   }
   Ok(Prepared {
+    next_task_id,
     tasks,
     console,
     connections,
@@ -355,7 +434,7 @@ fn take_over(
   let server_socket = ServerSocket::adopt(snapshot.listener_fd)?;
   UnixProcessesWaiter::init_paused()?;
   let mut kernel = Kernel::new();
-  kernel.restore(snapshot.next_task_id, prepared.tasks)?;
+  kernel.restore(prepared.next_task_id, prepared.tasks)?;
   // Before the upgrade is answered: its requester reads the record next.
   lock_guard.publish(runner, &config.warnings)?;
   Ok((
