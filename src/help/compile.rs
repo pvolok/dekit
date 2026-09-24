@@ -211,6 +211,25 @@ pub fn compile(
     Some(_) => {}
   }
 
+  // Nav order is depth-first: a topic sorts by (order, name) at each
+  // level of its path, so children follow their parent and siblings
+  // follow their own order.
+  let order_of = |id: &str| -> f64 {
+    parsed
+      .iter()
+      .find(|topic| topic.id == id)
+      .map(|topic| topic.order)
+      .unwrap_or(0.0)
+  };
+  let nav_key = |id: &str| -> Vec<(f64, String)> {
+    let segments: Vec<&str> = id.split('/').collect();
+    (1..=segments.len())
+      .map(|depth| {
+        let prefix = segments[..depth].join("/");
+        (order_of(&prefix), segments[depth - 1].to_string())
+      })
+      .collect()
+  };
   let mut nav = Vec::new();
   for section in &sections {
     let mut members: Vec<(&ParsedTopic, &Topic)> = parsed
@@ -219,10 +238,16 @@ pub fn compile(
       .filter(|(p, t)| p.section == section.dir && !t.hidden)
       .collect();
     members.sort_by(|(a, _), (b, _)| {
-      a.order
-        .partial_cmp(&b.order)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| a.path.cmp(&b.path))
+      let (ka, kb) = (nav_key(&a.id), nav_key(&b.id));
+      ka.iter()
+        .zip(kb.iter())
+        .map(|((oa, na), (ob, nb))| {
+          oa.partial_cmp(ob)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| na.cmp(nb))
+        })
+        .find(|ordering| ordering.is_ne())
+        .unwrap_or_else(|| ka.len().cmp(&kb.len()))
     });
     if members.is_empty() {
       continue;
