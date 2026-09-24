@@ -44,9 +44,10 @@ impl Task for RecordingTask {
         fx.stopped(ExitInfo::signal(9));
       }
       TaskCmd::Duplicate(_) | TaskCmd::Thaw => (),
-      TaskCmd::Freeze(number) => self
-        .ctx
-        .send(KernelCommand::TaskFrozen(number, TaskKindSnapshot::Console)),
+      TaskCmd::Freeze(number) => self.ctx.send(KernelCommand::TaskFrozen(
+        number,
+        TaskKindSnapshot::Console {},
+      )),
       TaskCmd::Msg(m) => match m.downcast::<Report>() {
         Ok(report) => match *report {
           Report::Started => fx.started(),
@@ -137,9 +138,10 @@ impl Task for StubbornTask {
         self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
       }
       TaskCmd::Duplicate(_) | TaskCmd::Thaw => (),
-      TaskCmd::Freeze(number) => self
-        .ctx
-        .send(KernelCommand::TaskFrozen(number, TaskKindSnapshot::Console)),
+      TaskCmd::Freeze(number) => self.ctx.send(KernelCommand::TaskFrozen(
+        number,
+        TaskKindSnapshot::Console {},
+      )),
       TaskCmd::Msg(_) => (),
     }
   }
@@ -1847,7 +1849,7 @@ async fn freeze_defers_intent_until_thaw() {
 
   let snapshot = freeze(&fx).await;
   assert_eq!(snapshot.tasks.len(), 1);
-  assert_eq!(snapshot.tasks[0].state, snap::TaskState::Ready);
+  assert_eq!(snapshot.tasks[0].state, snap::TaskState::Ready {});
   assert!(snapshot.tasks[0].pinned);
 
   // Intent waits; reads still work.
@@ -1975,14 +1977,14 @@ async fn a_late_answer_to_an_earlier_freeze_is_ignored() {
 
   let (tx, mut second) = tokio::sync::oneshot::channel();
   fx.pc.send(KernelCommand::Freeze(tx));
-  task_ctx.send(KernelCommand::TaskFrozen(1, TaskKindSnapshot::Console));
+  task_ctx.send(KernelCommand::TaskFrozen(1, TaskKindSnapshot::Console {}));
   fx.flush().await;
   assert!(
     second.try_recv().is_err(),
     "a stale answer completed freeze 2"
   );
 
-  task_ctx.send(KernelCommand::TaskFrozen(2, TaskKindSnapshot::Console));
+  task_ctx.send(KernelCommand::TaskFrozen(2, TaskKindSnapshot::Console {}));
   let snapshot = tokio::time::timeout(Duration::from_secs(1), second)
     .await
     .expect("timed out waiting for the freeze")
@@ -2034,7 +2036,7 @@ async fn stopping_task_keeps_its_deadline_in_the_snapshot() {
 
   let snapshot = freeze(&fx).await;
   let task = &snapshot.tasks[0];
-  assert_eq!(task.state, snap::TaskState::Stopping);
+  assert_eq!(task.state, snap::TaskState::Stopping {});
   let remaining = task.timer_ms.expect("stop grace remaining");
   assert!(remaining > 0 && remaining <= STOP_GRACE.as_millis() as u64);
 

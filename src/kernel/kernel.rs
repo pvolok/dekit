@@ -230,12 +230,12 @@ impl Graph {
     };
     if let Some(saved) = saved {
       handle.state = match saved.state {
-        snap::TaskState::Idle => TaskState::Idle,
-        snap::TaskState::Starting => TaskState::Starting,
-        snap::TaskState::Running => TaskState::Running,
-        snap::TaskState::Ready => TaskState::Ready,
-        snap::TaskState::Stopping => TaskState::Stopping,
-        snap::TaskState::Backoff => TaskState::Backoff,
+        snap::TaskState::Idle {} => TaskState::Idle,
+        snap::TaskState::Starting {} => TaskState::Starting,
+        snap::TaskState::Running {} => TaskState::Running,
+        snap::TaskState::Ready {} => TaskState::Ready,
+        snap::TaskState::Stopping {} => TaskState::Stopping,
+        snap::TaskState::Backoff {} => TaskState::Backoff,
         snap::TaskState::Done(info) => TaskState::Done(info.into()),
         snap::TaskState::Exited(info) => TaskState::Exited(info.into()),
       };
@@ -1422,12 +1422,12 @@ impl Graph {
         continue;
       };
       let state = match task.state {
-        TaskState::Idle => snap::TaskState::Idle,
-        TaskState::Starting => snap::TaskState::Starting,
-        TaskState::Running => snap::TaskState::Running,
-        TaskState::Ready => snap::TaskState::Ready,
-        TaskState::Stopping => snap::TaskState::Stopping,
-        TaskState::Backoff => snap::TaskState::Backoff,
+        TaskState::Idle => snap::TaskState::Idle {},
+        TaskState::Starting => snap::TaskState::Starting {},
+        TaskState::Running => snap::TaskState::Running {},
+        TaskState::Ready => snap::TaskState::Ready {},
+        TaskState::Stopping => snap::TaskState::Stopping {},
+        TaskState::Backoff => snap::TaskState::Backoff {},
         TaskState::Done(info) => snap::TaskState::Done(info.into()),
         TaskState::Exited(info) => snap::TaskState::Exited(info.into()),
       };

@@ -277,7 +277,7 @@ fn prepare<'a>(
         task,
         process,
       )?,
-      snap::TaskKind::Console => {
+      snap::TaskKind::Console {} => {
         console = Some(task_id);
         console_task_registration(
           task_id,

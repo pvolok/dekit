@@ -172,8 +172,8 @@ pub fn process_task_from_snapshot(
     env: process.spec.env.iter().cloned().collect(),
   };
   let stop = match &process.stop {
-    snap::StopSignal::Shutdown => StopSignal::Shutdown,
-    snap::StopSignal::Kill => StopSignal::Kill,
+    snap::StopSignal::Shutdown {} => StopSignal::Shutdown,
+    snap::StopSignal::Kill {} => StopSignal::Kill,
     snap::StopSignal::Signal { sig, group } => StopSignal::Signal {
       sig: Sig::from_name(sig)
         .ok_or_else(|| anyhow::anyhow!("unknown stop signal {sig}"))?,
@@ -289,8 +289,8 @@ fn snapshot(
   instance: &Instance,
 ) -> snap::ProcessTask {
   let stop = match &config.stop {
-    StopSignal::Shutdown => snap::StopSignal::Shutdown,
-    StopSignal::Kill => snap::StopSignal::Kill,
+    StopSignal::Shutdown => snap::StopSignal::Shutdown {},
+    StopSignal::Kill => snap::StopSignal::Kill {},
     StopSignal::Signal { sig, group } => snap::StopSignal::Signal {
       sig: sig.name().to_string(),
       group: *group,
@@ -1113,7 +1113,7 @@ mod tests {
       pinned: true,
       deps: Vec::new(),
       restart: snap::Restart::Never,
-      state: snap::TaskState::Running,
+      state: snap::TaskState::Running {},
       vetoed: false,
       killed: false,
       attempts: 1,

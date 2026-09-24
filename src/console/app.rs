@@ -347,9 +347,10 @@ impl App {
       // The console keeps no state worth carrying: attachments re-attach
       // and the task list is replayed on resume.
       TaskCmd::Freeze(number) => {
-        self
-          .pc
-          .send(KernelCommand::TaskFrozen(number, TaskKindSnapshot::Console));
+        self.pc.send(KernelCommand::TaskFrozen(
+          number,
+          TaskKindSnapshot::Console {},
+        ));
         return;
       }
       TaskCmd::Msg(msg) => msg,

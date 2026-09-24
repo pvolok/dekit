@@ -1,6 +1,13 @@
 //! The snapshot a runner writes before it execs its replacement.
 //!
-//! `v1` is frozen: a schema change adds `v2` next to it plus a pure
+//! `v1` grows by addition only. A new field carries
+//! `#[serde(default, skip_serializing_if = ...)]` with a default equal to
+//! the state an older runner had, so it is written only when a value the
+//! old code cannot reproduce is in use; every type refuses unknown
+//! fields, so an older binary accepts a newer snapshot exactly when none
+//! of that state is in use. A new variant is added freely; an older
+//! binary refuses it by name. Removing, renaming, retyping, or changing
+//! the meaning of a field is a new version: `v2` next to `v1` plus a pure
 //! `v1 -> v2` conversion, and `decode` walks the chain to the current
 //! version. The header fields checked in `decode` never change meaning.
 
@@ -15,6 +22,7 @@ pub mod v1 {
   use serde::{Deserialize, Serialize};
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct Snapshot {
     pub format: String,
     pub version: u32,
@@ -32,12 +40,14 @@ pub mod v1 {
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct Runner {
     pub kind: String,
     pub root: String,
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct Task {
     pub id: usize,
     pub space: String,
@@ -64,6 +74,7 @@ pub mod v1 {
   }
 
   #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   #[serde(rename_all = "snake_case")]
   pub enum Restart {
     Never,
@@ -72,19 +83,21 @@ pub mod v1 {
   }
 
   #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   #[serde(tag = "state", rename_all = "snake_case")]
   pub enum TaskState {
-    Idle,
-    Starting,
-    Running,
-    Ready,
-    Stopping,
-    Backoff,
+    Idle {},
+    Starting {},
+    Running {},
+    Ready {},
+    Stopping {},
+    Backoff {},
     Done(ExitInfo),
     Exited(ExitInfo),
   }
 
   #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct ExitInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<i32>,
@@ -93,13 +106,15 @@ pub mod v1 {
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   #[serde(tag = "kind", rename_all = "snake_case")]
   pub enum TaskKind {
     Process(ProcessTask),
-    Console,
+    Console {},
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct ProcessTask {
     pub spec: ProcessSpec,
     pub stop: StopSignal,
@@ -115,6 +130,7 @@ pub mod v1 {
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct ProcessSpec {
     pub prog: String,
     pub args: Vec<String>,
@@ -125,16 +141,18 @@ pub mod v1 {
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   #[serde(tag = "stop", rename_all = "snake_case")]
   pub enum StopSignal {
-    Shutdown,
-    Kill,
+    Shutdown {},
+    Kill {},
     Signal { sig: String, group: bool },
     SendKeys { keys: Vec<crate::term::key::Key> },
     Cmd { cmd: String },
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct LogSpec {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +165,7 @@ pub mod v1 {
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct Instance {
     pub pid: u32,
     pub master_fd: i32,
@@ -155,13 +174,14 @@ pub mod v1 {
     pub stdout_eof: bool,
     pub ready_sent: bool,
     /// Base64.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ready_line: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct Screen {
     pub grid: Grid,
     pub alt_grid: Grid,
@@ -178,13 +198,14 @@ pub mod v1 {
     pub alt_kitty_flags: Vec<u8>,
     pub title: String,
     /// Base64: an escape sequence the parser had started but not finished.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pending_input: String,
     /// Cell attributes referenced by index from every row.
     pub attrs_table: Vec<Attrs>,
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct Grid {
     pub width: u16,
     pub height: u16,
@@ -206,6 +227,7 @@ pub mod v1 {
   /// One allocation per row, not per cell: scrollback is most of a
   /// snapshot.
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct Row {
     /// The text of every cell, concatenated.
     pub text: String,
@@ -222,6 +244,7 @@ pub mod v1 {
   #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize,
   )]
+  #[serde(deny_unknown_fields)]
   pub struct Attrs {
     pub fg: Color,
     pub bg: Color,
@@ -231,6 +254,7 @@ pub mod v1 {
   #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize,
   )]
+  #[serde(deny_unknown_fields)]
   #[serde(rename_all = "snake_case")]
   pub enum Color {
     #[default]
@@ -240,6 +264,7 @@ pub mod v1 {
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct Connection {
     pub fd: i32,
     /// None until the client's hello has arrived.
@@ -247,16 +272,17 @@ pub mod v1 {
     pub hello: Option<Hello>,
     /// Base64: bytes read from the socket but not yet consumed. Starts at
     /// a frame boundary.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub buffered_input: String,
     /// Base64: bytes owed to the client, written first by the next image.
     /// May start in the middle of a frame.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub buffered_output: String,
     pub kind: ConnectionKind,
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   pub struct Hello {
     pub protocol: u32,
     pub version: String,
@@ -266,6 +292,7 @@ pub mod v1 {
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
   #[serde(tag = "kind", rename_all = "snake_case")]
   pub enum ConnectionKind {
     Rpc {
@@ -326,6 +353,8 @@ impl From<Restart> for crate::kernel::task::RestartMode {
 struct Header {
   format: String,
   version: u32,
+  #[serde(default)]
+  source_version: String,
 }
 
 /// Decodes any supported snapshot version into the current one.
@@ -336,8 +365,13 @@ pub fn decode(bytes: &[u8]) -> anyhow::Result<Snapshot> {
     bail!("not a dekit snapshot (format '{}')", header.format);
   }
   match header.version {
-    1 => serde_json::from_slice::<v1::Snapshot>(bytes)
-      .context("invalid v1 snapshot"),
+    1 => serde_json::from_slice::<v1::Snapshot>(bytes).with_context(|| {
+      format!(
+        "cannot read the v1 snapshot written by dekit {} with dekit {}",
+        header.source_version,
+        env!("CARGO_PKG_VERSION")
+      )
+    }),
     version => bail!(
       "snapshot version {version} is newer than this binary supports ({CURRENT_VERSION})"
     ),
@@ -393,6 +427,91 @@ mod tests {
     let mut reencoded = Vec::new();
     encode(&snapshot, &mut reencoded).unwrap();
     assert_eq!(decode(&reencoded).unwrap(), snapshot);
+  }
+
+  /// Every object in the fixture, as a path of keys and indexes.
+  fn objects(
+    value: &serde_json::Value,
+    path: Vec<String>,
+    out: &mut Vec<Vec<String>>,
+  ) {
+    match value {
+      serde_json::Value::Object(map) => {
+        out.push(path.clone());
+        for (key, value) in map {
+          let mut path = path.clone();
+          path.push(key.clone());
+          objects(value, path, out);
+        }
+      }
+      serde_json::Value::Array(items) => {
+        for (i, item) in items.iter().enumerate() {
+          let mut path = path.clone();
+          path.push(i.to_string());
+          objects(item, path, out);
+        }
+      }
+      _ => (),
+    }
+  }
+
+  fn at_path<'a>(
+    value: &'a mut serde_json::Value,
+    path: &[String],
+  ) -> &'a mut serde_json::Value {
+    let mut cur = value;
+    for key in path {
+      cur = match cur {
+        serde_json::Value::Object(map) => map.get_mut(key).unwrap(),
+        serde_json::Value::Array(items) => {
+          &mut items[key.parse::<usize>().unwrap()]
+        }
+        _ => unreachable!(),
+      };
+    }
+    cur
+  }
+
+  /// A newer binary's field, unknown here, is refused wherever it is.
+  #[test]
+  fn unknown_field_is_refused_everywhere() {
+    let fixture: serde_json::Value =
+      serde_json::from_slice(include_bytes!("fixtures/v1.json")).unwrap();
+    let mut paths = Vec::new();
+    objects(&fixture, Vec::new(), &mut paths);
+    assert!(paths.len() > 20, "{}", paths.len());
+    for path in paths {
+      let mut planted = fixture.clone();
+      at_path(&mut planted, &path)
+        .as_object_mut()
+        .unwrap()
+        .insert("from_the_future".to_string(), serde_json::json!(1));
+      let err = decode(&serde_json::to_vec(&planted).unwrap())
+        .err()
+        .unwrap_or_else(|| panic!("accepted an unknown field at {path:?}"))
+        .to_string();
+      assert!(err.contains("written by dekit 0.9.6"), "{err}");
+    }
+  }
+
+  /// The writer emits no key the first v1 fixture lacks: every field
+  /// added since is skipped at its default.
+  #[test]
+  fn golden_v1_reencodes_without_new_keys() {
+    let fixture: serde_json::Value =
+      serde_json::from_slice(include_bytes!("fixtures/v1.json")).unwrap();
+    let snapshot = decode(include_bytes!("fixtures/v1.json")).unwrap();
+    let reencoded: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
+    let mut paths = Vec::new();
+    objects(&reencoded, Vec::new(), &mut paths);
+    let mut fixture = fixture;
+    for path in paths {
+      let expected = at_path(&mut fixture, &path).as_object().unwrap().clone();
+      let mut reencoded = reencoded.clone();
+      for key in at_path(&mut reencoded, &path).as_object().unwrap().keys() {
+        assert!(expected.contains_key(key), "new key {key} at {path:?}");
+      }
+    }
   }
 
   #[test]
