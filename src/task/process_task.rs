@@ -165,6 +165,26 @@ pub fn process_task_from_snapshot(
   saved: &snap::Task,
   process: &snap::ProcessTask,
 ) -> anyhow::Result<TaskRegistration> {
+  let deps = saved
+    .deps
+    .iter()
+    .map(|id| TaskSelector::Id(TaskId(*id)))
+    .collect();
+  let config = process_task_config_from_snapshot(saved, process, deps)?;
+  process_task_resumed(
+    task_id,
+    key,
+    config,
+    &process.screen,
+    process.instance.clone(),
+  )
+}
+
+pub fn process_task_config_from_snapshot(
+  saved: &snap::Task,
+  process: &snap::ProcessTask,
+  deps: Vec<TaskSelector>,
+) -> anyhow::Result<ProcessTaskConfig> {
   let spec = ProcessSpec {
     prog: process.spec.prog.clone(),
     args: process.spec.args.clone(),
@@ -195,7 +215,7 @@ pub fn process_task_from_snapshot(
     },
     name: log.name.clone(),
   });
-  let config = ProcessTaskConfig {
+  Ok(ProcessTaskConfig {
     spec,
     label: saved.label.clone(),
     stop,
@@ -204,26 +224,14 @@ pub fn process_task_from_snapshot(
     ready_log: process.ready_log.clone(),
     scrollback_len: process.scrollback_len,
     mouse_scroll_speed: process.mouse_scroll_speed,
-    deps: saved
-      .deps
-      .iter()
-      .map(|id| TaskSelector::Id(TaskId(*id)))
-      .collect(),
+    deps,
     tags: saved.tags.clone(),
     pinned: saved.pinned,
-  };
-  process_task_resumed(
-    task_id,
-    key,
-    config,
-    &process.screen,
-    process.instance.clone(),
-  )
+  })
 }
 
 /// A process task around a saved screen and, if the child is still this
 /// runner's, its inherited PTY; the config may be newer than the child.
-#[cfg(unix)]
 pub fn process_task_resumed(
   task_id: TaskId,
   key: Option<TaskKey>,

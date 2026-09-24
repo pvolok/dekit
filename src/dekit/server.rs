@@ -45,7 +45,7 @@ use crate::{
     socket::{ServerSocket, bind_server_socket},
   },
   target::Target,
-  task::config_tasks::register_config_tasks,
+  task::config_tasks::{register_config_tasks, register_paused_tasks},
   term::Size,
   upgrade::snapshot as snap,
 };
@@ -279,7 +279,8 @@ async fn run_locked(
   }
 
   let bootstrap = async {
-    register_config_tasks(&config, &pc).await?;
+    let mut warnings = config.warnings.clone();
+    warnings.extend(register_tasks(&config, &pc, runner).await?);
     if let Some(hook) = &config.on_init {
       let Hook::Command(command) = hook else {
         anyhow::bail!("dekit on_init hook is not a command")
@@ -287,7 +288,7 @@ async fn run_locked(
       execute(&pc, &config, command).await?;
     }
     let socket = bind_server_socket(&socket_path).await?;
-    lock_guard.publish(runner, &config.warnings)?;
+    lock_guard.publish(runner, &warnings)?;
     log::info!("Server is listening.");
     anyhow::Ok(socket)
   }
@@ -310,6 +311,40 @@ async fn run_locked(
     runner: Some(runner_handle(runner, lock_guard, &server_socket, log_level)),
   });
   serve(ctx, server_socket, kernel_handle, Vec::new()).await
+}
+
+/// The config tasks, or after a pause the saved tasks reconciled with the
+/// config. A paused file that cannot be read is dropped with a warning
+/// rather than keep the runner from starting.
+async fn register_tasks(
+  config: &Config,
+  pc: &TaskContext,
+  runner: &RunnerSpec,
+) -> anyhow::Result<Vec<String>> {
+  let path = lockfile::paused_path(runner)?;
+  let bytes = match std::fs::read(&path) {
+    Ok(bytes) => bytes,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+      register_config_tasks(config, pc).await?;
+      return Ok(Vec::new());
+    }
+    Err(err) => {
+      anyhow::bail!("reading {}: {err}", path.display());
+    }
+  };
+  let warnings = match snap::decode(&bytes) {
+    Ok(snapshot) => {
+      log::info!("Resuming paused tasks from {}", path.display());
+      register_paused_tasks(config, pc, &snapshot).await?
+    }
+    Err(err) => {
+      register_config_tasks(config, pc).await?;
+      vec![format!("ignoring the paused tasks: {err:#}")]
+    }
+  };
+  std::fs::remove_file(&path)
+    .map_err(|err| anyhow::anyhow!("removing {}: {err}", path.display()))?;
+  Ok(warnings)
 }
 
 pub fn init_logging(
@@ -443,9 +478,19 @@ pub async fn dispatch_connection(
   let mut closing = false;
   // An `upgrade` in flight: its request id and where its failure lands.
   let mut upgrade: Option<(u64, oneshot::Receiver<RpcError>)> = None;
+  // A `pause` in flight: its request id and where its outcome lands.
+  let mut pause: Option<(u64, oneshot::Receiver<Result<(), RpcError>>)> = None;
+  // A pause succeeded: the runner quits once its reply is written.
+  let mut quit_when_flushed = false;
   while !(closing && replies.is_empty()) {
     let upgrade_failed = async {
       match upgrade.as_mut() {
+        Some((_, rx)) => rx.await,
+        None => std::future::pending().await,
+      }
+    };
+    let pause_done = async {
+      match pause.as_mut() {
         Some((_, rx)) => rx.await,
         None => std::future::pending().await,
       }
@@ -525,9 +570,24 @@ pub async fn dispatch_connection(
             .await;
             return;
           }
+          Ok(RpcRequest::Pause {}) => {
+            if upgrade.is_some() || pause.is_some() {
+              let error = RpcError::new(codes::BUSY, "an upgrade or pause is in progress");
+              if sender.queue_ctl(CtlMsg::err(request.id, error)).is_err() {
+                return;
+              }
+              continue;
+            }
+            let (tx, rx) = oneshot::channel();
+            pause = Some((request.id, rx));
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+              let _ = tx.send(crate::upgrade::pause(ctx).await);
+            });
+          }
           Ok(RpcRequest::Upgrade { binary }) => {
-            if upgrade.is_some() {
-              let error = RpcError::new(codes::BUSY, "an upgrade is in progress");
+            if upgrade.is_some() || pause.is_some() {
+              let error = RpcError::new(codes::BUSY, "an upgrade or pause is in progress");
               if sender.queue_ctl(CtlMsg::err(request.id, error)).is_err() {
                 return;
               }
@@ -569,10 +629,34 @@ pub async fn dispatch_connection(
           return;
         }
       }
+      result = pause_done, if !frozen => {
+        let (id, _) = pause.take().expect("pause in flight");
+        let reply = match result {
+          Ok(Ok(())) => {
+            quit_when_flushed = true;
+            CtlMsg::ok(id, ok_result())
+          }
+          Ok(Err(error)) => CtlMsg::err(id, error),
+          Err(_) => CtlMsg::err(id, RpcError::internal("pause task ended")),
+        };
+        if sender.queue_ctl(reply).is_err() {
+          if quit_when_flushed {
+            ctx.pc.send(KernelCommand::Quit);
+          }
+          return;
+        }
+      }
       written = sender.flush(), if !frozen && !sender.pending().is_empty() => {
         if let Err(err) = written {
           log::debug!("Client connection closed: {err}");
+          if quit_when_flushed {
+            ctx.pc.send(KernelCommand::Quit);
+          }
           return;
+        }
+        if quit_when_flushed && sender.pending().is_empty() {
+          quit_when_flushed = false;
+          ctx.pc.send(KernelCommand::Quit);
         }
       }
       ctl = reg.ctl.recv() => match ctl {
@@ -710,7 +794,9 @@ async fn handle_rpc(
   req: RpcRequest,
 ) -> Result<Value, RpcError> {
   match req {
-    RpcRequest::Attach { .. } | RpcRequest::Upgrade { .. } => {
+    RpcRequest::Attach { .. }
+    | RpcRequest::Upgrade { .. }
+    | RpcRequest::Pause {} => {
       Err(RpcError::internal("handled by the connection loop"))
     }
 

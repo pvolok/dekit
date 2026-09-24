@@ -234,6 +234,16 @@ fn runner_hash(runner: &RunnerSpec) -> String {
   URL_SAFE_NO_PAD.encode(&digest[..12])
 }
 
+/// Where `pause` leaves the runner's tasks for its next start: under the
+/// user data dir, which outlives the runtime dir and a reboot.
+pub fn paused_path(runner: &RunnerSpec) -> anyhow::Result<PathBuf> {
+  Ok(
+    crate::runner::user_data_dir()?
+      .join("paused")
+      .join(format!("{}.json", runner_hash(runner))),
+  )
+}
+
 pub fn get_runtime_dir() -> anyhow::Result<PathBuf> {
   #[cfg(unix)]
   {

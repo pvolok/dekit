@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::bail;
 use futures::future::try_join_all;
@@ -18,38 +18,171 @@ use crate::{
   },
   task::{
     logger::LogSpec,
-    process_task::{ProcessTaskConfig, process_task_registration},
+    process_task::{
+      ProcessTaskConfig, process_task_config_from_snapshot,
+      process_task_registration, process_task_resumed,
+    },
   },
+  upgrade::snapshot as snap,
 };
 
 pub async fn register_config_tasks(
   config: &Config,
   pc: &TaskContext,
 ) -> anyhow::Result<()> {
+  register_config(config, pc, &HashMap::new()).await?;
+  Ok(())
+}
+
+/// The tasks of a paused runner, every one idle with a fresh id: the
+/// config tasks first, each around its saved screen and with its saved
+/// pin when the snapshot has it, then the saved tasks the config lacks.
+/// Returns what could not be restored.
+pub async fn register_paused_tasks(
+  config: &Config,
+  pc: &TaskContext,
+  snapshot: &snap::Snapshot,
+) -> anyhow::Result<Vec<String>> {
+  let saved_by_path: HashMap<&str, &snap::Task> = snapshot
+    .tasks
+    .iter()
+    .filter(|task| task.space.is_empty())
+    .filter_map(|task| Some((task.path.as_deref()?, task)))
+    .collect();
+  let mut new_id = register_config(config, pc, &saved_by_path).await?;
+
+  let mut warnings = Vec::new();
+  let mut pending: Vec<&snap::Task> = snapshot
+    .tasks
+    .iter()
+    .filter(|task| !new_id.contains_key(&task.id))
+    .filter(|task| match task.kind {
+      snap::TaskKind::Process(_) => true,
+      snap::TaskKind::Console {} => false,
+    })
+    .collect();
+  // Only these ever get a new id; a dependency on anything else is
+  // dropped.
+  let restorable: HashSet<usize> = pending
+    .iter()
+    .map(|task| task.id)
+    .chain(new_id.keys().copied())
+    .collect();
+  // Dependencies first.
+  while !pending.is_empty() {
+    let (ready, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|t| {
+      t.deps
+        .iter()
+        .all(|dep| new_id.contains_key(dep) || !restorable.contains(dep))
+    });
+    if ready.is_empty() {
+      bail!("the paused tasks depend on each other in a cycle");
+    }
+    pending = rest;
+    for saved in ready {
+      let snap::TaskKind::Process(process) = &saved.kind else {
+        continue;
+      };
+      let name = saved.path.clone().unwrap_or_else(|| saved.id.to_string());
+      let mut deps = Vec::new();
+      for dep in &saved.deps {
+        match new_id.get(dep) {
+          Some(id) => deps.push(TaskSelector::Id(*id)),
+          None => warnings.push(format!(
+            "paused task {name}: dropped a dependency that was not restored"
+          )),
+        }
+      }
+      let id = pc.alloc_id();
+      let registration = process_task_config_from_snapshot(
+        saved, process, deps,
+      )
+      .and_then(|config| {
+        let space = if saved.space.is_empty() {
+          TaskSpaceId::default_space()
+        } else {
+          TaskSpaceId::new(saved.space.clone())
+            .map_err(|err| anyhow::anyhow!("{err}"))?
+        };
+        let key = saved
+          .path
+          .as_deref()
+          .map(TaskPath::new)
+          .transpose()?
+          .map(|path| TaskKey::new(space, path));
+        process_task_resumed(id, key, config, &process.screen, None)
+      });
+      let registered = match registration {
+        Ok(registration) => match pc.register_task(registration).await {
+          Ok(registered) => registered.map_err(|err| err.to_string()),
+          Err(_) => bail!("the kernel has stopped"),
+        },
+        Err(err) => Err(format!("{err:#}")),
+      };
+      match registered {
+        Ok(()) => {
+          new_id.insert(saved.id, id);
+        }
+        Err(err) => {
+          warnings.push(format!("paused task {name} not restored: {err}"))
+        }
+      }
+    }
+  }
+  Ok(warnings)
+}
+
+/// Registers the config tasks, around their saved screens where
+/// `saved_by_path` has them. Returns the new id of every saved task used.
+async fn register_config(
+  config: &Config,
+  pc: &TaskContext,
+  saved_by_path: &HashMap<&str, &snap::Task>,
+) -> anyhow::Result<HashMap<usize, TaskId>> {
   let task_ids: Vec<TaskId> =
     config.tasks.iter().map(|_| pc.alloc_id()).collect();
   let deps_by_task = resolve_task_deps(&config.tasks, &task_ids)?;
   let order = dep_order(&task_ids, &deps_by_task)?;
 
-  let replies = order
-    .iter()
-    .map(|&i| {
-      let cfg = config.tasks[i].clone();
-      let pinned = cfg.autostart();
-      pc.register_task(config_task_registration(
-        config,
-        TaskSpaceId::default_space(),
-        cfg,
-        task_ids[i],
-        deps_by_task[i]
-          .iter()
-          .copied()
-          .map(TaskSelector::Id)
-          .collect(),
-        pinned,
-      ))
-    })
-    .collect::<Vec<_>>();
+  let mut new_id = HashMap::new();
+  let mut replies = Vec::with_capacity(order.len());
+  for &i in &order {
+    let cfg = config.tasks[i].clone();
+    let deps = deps_by_task[i]
+      .iter()
+      .copied()
+      .map(TaskSelector::Id)
+      .collect();
+    let registration = match saved_by_path.get(cfg.path.as_str()) {
+      Some(saved) => {
+        let snap::TaskKind::Process(process) = &saved.kind else {
+          bail!("paused task {} is not a process task", cfg.path);
+        };
+        new_id.insert(saved.id, task_ids[i]);
+        config_task_resumed(
+          config,
+          cfg,
+          task_ids[i],
+          deps,
+          saved.pinned,
+          &process.screen,
+          None,
+        )?
+      }
+      None => {
+        let pinned = cfg.autostart();
+        config_task_registration(
+          config,
+          TaskSpaceId::default_space(),
+          cfg,
+          task_ids[i],
+          deps,
+          pinned,
+        )
+      }
+    };
+    replies.push(pc.register_task(registration));
+  }
   let outcomes = try_join_all(replies).await?;
   for (i, registered) in order.into_iter().zip(outcomes) {
     if let Err(err) = registered {
@@ -60,8 +193,7 @@ pub async fn register_config_tasks(
       );
     }
   }
-
-  Ok(())
+  Ok(new_id)
 }
 
 pub fn spawn_config_task(
@@ -97,15 +229,14 @@ pub fn config_task_registration(
 
 /// A config task continued from a snapshot: the config's spec around the
 /// saved screen and child. A changed command applies at the next start.
-#[cfg(unix)]
 pub fn config_task_resumed(
   config: &Config,
   cfg: TaskConfig,
   task_id: TaskId,
   deps: Vec<TaskSelector>,
   pinned: bool,
-  screen: &crate::upgrade::snapshot::Screen,
-  instance: Option<crate::upgrade::snapshot::Instance>,
+  screen: &snap::Screen,
+  instance: Option<snap::Instance>,
 ) -> anyhow::Result<TaskRegistration> {
   let (key, process) = config_task_parts(
     config,
@@ -115,9 +246,7 @@ pub fn config_task_resumed(
     deps,
     pinned,
   );
-  crate::task::process_task::process_task_resumed(
-    task_id, key, process, screen, instance,
-  )
+  process_task_resumed(task_id, key, process, screen, instance)
 }
 
 fn config_task_parts(

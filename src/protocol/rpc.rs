@@ -42,12 +42,16 @@ pub enum RpcRequest {
   Upgrade {
     binary: String,
   },
+  /// Save every task and its screen for the next start, then quit. The
+  /// reply `{}` comes before the runner stops.
+  Pause {},
 }
 
 /// Gate for `from_wire`: methods not listed here are `unknown_method`
 /// instead of `invalid_params`. Kept in sync with the enum by tests.
-const METHODS: &[&str] =
-  &["command", "ls", "why", "screen", "attach", "upgrade"];
+const METHODS: &[&str] = &[
+  "command", "ls", "why", "screen", "attach", "upgrade", "pause",
+];
 
 impl RpcRequest {
   pub fn to_wire(&self) -> (String, Value) {
@@ -206,6 +210,7 @@ mod tests {
       RpcRequest::Upgrade {
         binary: "/opt/dekit/bin/dekit".to_string(),
       },
+      RpcRequest::Pause {},
     ]
   }
 
@@ -232,6 +237,7 @@ mod tests {
         r#"{"height":24,"target":"web/dev","until_exit":true,"width":80}"#,
       ),
       ("upgrade", r#"{"binary":"/opt/dekit/bin/dekit"}"#),
+      ("pause", r#"null"#),
     ];
     let samples = samples();
     assert_eq!(samples.len(), expected.len());

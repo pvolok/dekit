@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Output};
+use std::time::{Duration, Instant};
 
 pub const DEKIT: &str = env!("CARGO_BIN_EXE_dekit");
 
@@ -83,6 +84,34 @@ impl TestRunner {
     let out = self.run(&["runner", "stop"]);
     assert!(out.status.success(), "runner stop: {}", stderr_of(&out));
   }
+
+  pub fn ok(&self, args: &[&str]) -> String {
+    let out = self.run(args);
+    assert!(out.status.success(), "{:?}: {}", args, stderr_of(&out));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+  }
+
+  pub fn yaml(&self, body: &str) {
+    std::fs::write(self.work.path.join("dekit.yaml"), body).unwrap();
+  }
+}
+
+pub fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while !check() {
+    assert!(Instant::now() < deadline, "timed out waiting for {what}");
+    std::thread::sleep(Duration::from_millis(50));
+  }
+}
+
+/// The `ls` line of one task, empty when it is not listed.
+pub fn task_line(runner: &TestRunner, task: &str) -> String {
+  runner
+    .ok(&["ls"])
+    .lines()
+    .find(|line| line.split_whitespace().any(|word| word == task))
+    .map(str::to_string)
+    .unwrap_or_default()
 }
 
 impl Drop for TestRunner {

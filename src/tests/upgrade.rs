@@ -18,15 +18,9 @@ use lib::runner::socket::connect_socket;
 use lib::term::{TermEvent, key::Key};
 
 mod common;
-use common::{DEKIT, TestRunner, stderr_of as stderr};
+use common::{DEKIT, TestRunner, stderr_of as stderr, task_line, wait_until};
 
 impl TestRunner {
-  fn ok(&self, args: &[&str]) -> String {
-    let out = self.run(args);
-    assert!(out.status.success(), "{:?}: {}", args, stderr(&out));
-    String::from_utf8_lossy(&out.stdout).into_owned()
-  }
-
   /// The published record, as `runner status --json` reports it.
   fn record(&self) -> serde_json::Value {
     let out = self.ok(&["--json", "runner", "status"]);
@@ -53,10 +47,6 @@ impl TestRunner {
     path
   }
 
-  fn yaml(&self, body: &str) {
-    std::fs::write(self.work.path.join("dekit.yaml"), body).unwrap();
-  }
-
   fn snapshot_files(&self) -> Vec<String> {
     std::fs::read_dir(self.runtime.path.join("dekit"))
       .into_iter()
@@ -65,14 +55,6 @@ impl TestRunner {
       .map(|entry| entry.file_name().to_string_lossy().into_owned())
       .filter(|name| name.ends_with(".snapshot"))
       .collect()
-  }
-}
-
-fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
-  let deadline = Instant::now() + Duration::from_secs(10);
-  while !check() {
-    assert!(Instant::now() < deadline, "timed out waiting for {what}");
-    std::thread::sleep(Duration::from_millis(50));
   }
 }
 
@@ -87,15 +69,6 @@ fn pid_of(runner: &TestRunner, task: &str) -> u32 {
     .lines()
     .find_map(|line| line.trim().strip_prefix("pid ")?.trim().parse().ok())
     .unwrap_or_else(|| panic!("{task} printed no pid: {screen}"))
-}
-
-fn task_line(runner: &TestRunner, task: &str) -> String {
-  runner
-    .ok(&["ls"])
-    .lines()
-    .find(|line| line.split_whitespace().any(|word| word == task))
-    .map(str::to_string)
-    .unwrap_or_default()
 }
 
 fn last_tick(runner: &TestRunner) -> Option<u64> {

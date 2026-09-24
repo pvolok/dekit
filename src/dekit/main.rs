@@ -207,6 +207,27 @@ async fn shutdown_runner(runner: &RunnerSpec) -> anyhow::Result<()> {
   }
 }
 
+/// Waits for a runner that is quitting on its own to release its record.
+async fn wait_runner_gone(runner: &RunnerSpec) -> anyhow::Result<()> {
+  let paths = lockfile::runner_paths(runner)?;
+  let deadline =
+    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+  loop {
+    match lockfile::runner_state(runner, &paths)? {
+      lockfile::RunnerState::Absent => return Ok(()),
+      lockfile::RunnerState::Stale(_) | lockfile::RunnerState::Failed(_) => {
+        lockfile::cleanup_paths(&paths)?;
+        return Ok(());
+      }
+      lockfile::RunnerState::Ready(_) | lockfile::RunnerState::Starting => {}
+    }
+    if tokio::time::Instant::now() >= deadline {
+      anyhow::bail!("the runner did not stop within 30s after pausing");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+  }
+}
+
 /// Force-kill a runner by verified identity and reap its task session.
 fn force_kill_runner(owner: &lockfile::OwnerInfo) -> anyhow::Result<()> {
   let lockfile::OwnerInfo {
@@ -579,6 +600,9 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       ClapCommand::new("restart")
         .about("Restart the runner live, reloading dekit.yaml")
         .arg(runner_ref_arg()),
+      ClapCommand::new("pause")
+        .about("Save the tasks and their screens, then stop the runner; the next start resumes them")
+        .arg(runner_ref_arg()),
       ClapCommand::new("status")
         .about("Show selected runner status")
         .arg(runner_ref_arg()),
@@ -903,6 +927,13 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         let runner = arg_runner(&matches, sub_m)?;
         shutdown_runner(&runner).await?;
         println!("Runner stopped.");
+      }
+      Some(("pause", sub_m)) => {
+        let runner = arg_runner(&matches, sub_m)?;
+        running_record(&runner)?;
+        rpc_request(&runner, RpcRequest::Pause {}, false).await?;
+        wait_runner_gone(&runner).await?;
+        println!("Runner paused; its next start resumes the tasks.");
       }
       Some(("status", sub_m)) => {
         let runner = arg_runner(&matches, sub_m)?;

@@ -147,7 +147,7 @@ pub fn user_config_dir() -> anyhow::Result<PathBuf> {
   user_dir("config", "APPDATA", "XDG_CONFIG_HOME", ".config")
 }
 
-fn user_data_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn user_data_dir() -> anyhow::Result<PathBuf> {
   user_dir("data", "LOCALAPPDATA", "XDG_DATA_HOME", ".local/share")
 }
 
