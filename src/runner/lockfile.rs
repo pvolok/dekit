@@ -70,7 +70,9 @@ impl RunnerPaths {
 
 pub struct LockFileGuard {
   paths: RunnerPaths,
+  #[cfg_attr(windows, allow(dead_code))]
   lock: std::fs::File,
+  #[cfg_attr(windows, allow(dead_code))]
   live: std::fs::File,
   /// Published in the record; survives an upgrade with the process.
   started_at: u64,

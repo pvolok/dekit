@@ -176,6 +176,7 @@ impl Scanner {
   }
 
   /// True while a lone ESC is waiting to see whether more bytes follow.
+  #[cfg_attr(windows, allow(dead_code))]
   pub fn esc_pending(&self) -> bool {
     self.state == State::Esc
   }

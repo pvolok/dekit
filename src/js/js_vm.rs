@@ -20,7 +20,7 @@ impl JsVm {
     let runtime = AsyncRuntime::new()?;
     let context = AsyncContext::full(&runtime).await?;
 
-    rquickjs::async_with!(context => |ctx| {
+    AsyncContext::async_with(&context, async |ctx| {
       if let Some(runner) = runner {
         ctx.store_userdata(super::lib::dekit::RunnerStore(runner))?;
       }
@@ -38,7 +38,7 @@ impl JsVm {
   ) -> anyhow::Result<Persistent<Object<'static>>> {
     let src = src.to_vec();
     let path = path.to_path_buf();
-    let module = rquickjs::async_with!(self.context => |ctx| {
+    let module = AsyncContext::async_with(&self.context, async |ctx| {
       eval_module(&ctx, &path, src)
         .catch(&ctx)
         .map_err(|err| anyhow!("JavaScript module evaluation failed:\n{err}"))

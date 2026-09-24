@@ -378,6 +378,7 @@ pub fn decode(bytes: &[u8]) -> anyhow::Result<Snapshot> {
   }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub fn encode(
   snapshot: &Snapshot,
   out: impl std::io::Write,
@@ -386,6 +387,7 @@ pub fn encode(
 }
 
 /// Every inherited descriptor the snapshot names.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn fds(snapshot: &Snapshot) -> Vec<i32> {
   let mut fds = vec![snapshot.lock_fd, snapshot.live_fd, snapshot.listener_fd];
   for task in &snapshot.tasks {

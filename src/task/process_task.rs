@@ -17,7 +17,9 @@ use crate::kernel::task_screen::{
 use crate::process::NativeProcess;
 use crate::process::process::Process as _;
 use crate::process::process_spec::ProcessSpec;
-use crate::task::logger::{LogSink, LogSpec, spawn_logger};
+#[cfg(unix)]
+use crate::task::logger::LogSink;
+use crate::task::logger::{LogSpec, spawn_logger};
 use crate::term::key::Key;
 use crate::term::vt::emit::{self, KeyEncodeModes};
 use crate::term::{Screen, Winsize};
@@ -146,6 +148,25 @@ pub struct ProcessTaskConfig {
   /// Pin to init at registration, so a registered task is already
   /// started with no separate `Start` command.
   pub pinned: bool,
+}
+
+#[cfg(test)]
+impl ProcessTaskConfig {
+  pub fn new(spec: ProcessSpec) -> Self {
+    Self {
+      spec,
+      label: None,
+      stop: StopSignal::default(),
+      log: None,
+      restart: RestartMode::Never,
+      ready_log: None,
+      scrollback_len: 1000,
+      mouse_scroll_speed: 5,
+      deps: Vec::new(),
+      tags: Vec::new(),
+      pinned: false,
+    }
+  }
 }
 
 pub fn process_task_registration(
@@ -861,24 +882,6 @@ mod tests {
   use crate::kernel::task::TaskId;
 
   use super::*;
-
-  impl ProcessTaskConfig {
-    pub fn new(spec: ProcessSpec) -> Self {
-      Self {
-        spec,
-        label: None,
-        stop: StopSignal::default(),
-        log: None,
-        restart: RestartMode::Never,
-        ready_log: None,
-        scrollback_len: 1000,
-        mouse_scroll_speed: 5,
-        deps: Vec::new(),
-        tags: Vec::new(),
-        pinned: false,
-      }
-    }
-  }
 
   fn spawn_process_task(
     parent: &TaskContext,

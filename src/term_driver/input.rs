@@ -47,6 +47,7 @@ impl EventDecoder {
     self.scanner = scanner;
   }
 
+  #[cfg_attr(windows, allow(dead_code))]
   pub fn esc_pending(&self) -> bool {
     self.scanner.esc_pending()
   }
@@ -558,6 +559,9 @@ mod tests {
     );
   }
 
+  // Windows encodes keys as win32-input-mode records, which this decoder
+  // does not read back (console input is decoded from KEY_EVENT_RECORDs).
+  #[cfg(not(windows))]
   mod round_trip {
     use super::*;
     use crate::term::vt::emit::{self, KeyEncodeModes};

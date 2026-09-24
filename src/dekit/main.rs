@@ -1130,7 +1130,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
             .eval_file(Path::new(first.as_str()), src.as_bytes())
             .await?;
 
-          rquickjs::async_with!(vm.context => |ctx| {
+          rquickjs::AsyncContext::async_with(&vm.context, async |ctx| {
             run_module_main(&ctx, &root).await
           })
           .await?;

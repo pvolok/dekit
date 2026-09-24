@@ -1571,6 +1571,7 @@ impl Kernel {
   /// its saved lifecycle state; a task without one (added from the config
   /// since the snapshot) starts idle. The kernel registers them
   /// dependencies first.
+  #[cfg_attr(windows, allow(dead_code))]
   pub fn restore(
     &mut self,
     next_task_id: usize,

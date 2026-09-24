@@ -18,6 +18,7 @@ pub enum InternalTermEvent {
 #[derive(Debug)]
 pub enum KeyboardMode {
   Unknown,
+  #[cfg_attr(windows, allow(dead_code))]
   ModifyOtherKeys,
   Kitty,
   #[cfg_attr(not(windows), allow(dead_code))]

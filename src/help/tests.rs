@@ -606,11 +606,14 @@ async fn every_js_member_has_a_record() {
   let docs =
     load().unwrap_or_else(|errors| panic!("{}", super::error::join(&errors)));
   let vm = crate::js::js_vm::JsVm::new(None).await.unwrap();
-  let json: String = rquickjs::async_with!(vm.context => |ctx| {
-    ctx.eval::<String, _>(JS_MEMBERS).map_err(|err| err.to_string())
-  })
-  .await
-  .unwrap();
+  let json: String =
+    rquickjs::AsyncContext::async_with(&vm.context, async |ctx| {
+      ctx
+        .eval::<String, _>(JS_MEMBERS)
+        .map_err(|err| err.to_string())
+    })
+    .await
+    .unwrap();
   let runtime: BTreeSet<String> = serde_json::from_str::<Vec<String>>(&json)
     .unwrap()
     .into_iter()

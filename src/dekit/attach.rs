@@ -441,9 +441,7 @@ mod tests {
     },
     protocol::{
       ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request, RpcRequest,
-      ScreenCommand, client_handshake,
-      ctl::{EVENT_INPUT, EVENT_SCREEN},
-      screen,
+      client_handshake, ctl::EVENT_INPUT,
     },
     term::{
       TermEvent,
@@ -781,6 +779,7 @@ mod tests {
   async fn screen_commands_drive_copy_mode_on_a_process() {
     use crate::{
       process::process_spec::ProcessSpec,
+      protocol::{ScreenCommand, ctl::EVENT_SCREEN, screen},
       task::process_task::{ProcessTaskConfig, process_task_registration},
     };
 

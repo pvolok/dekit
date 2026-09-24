@@ -17,6 +17,8 @@ pub const SAVE_CURSOR: &str = "\x1b7";
 pub const RESTORE_CURSOR: &str = "\x1b8";
 pub const CLEAR_ALL: &str = "\x1b[2J";
 pub const DA1_QUERY: &str = "\x1b[c";
+// Kitty keyboard protocol is not queried on Windows (issue #215).
+#[cfg_attr(windows, allow(dead_code))]
 pub const KITTY_QUERY: &str = "\x1b[?u";
 pub const KITTY_POP: &str = "\x1b[<1u";
 
@@ -674,6 +676,8 @@ mod tests {
     assert_eq!(out, b"\x1b[>4;2m");
   }
 
+  // On Windows `key` always emits win32-input-mode (see `key_win32`).
+  #[cfg(not(windows))]
   #[test]
   fn key_kitty_disambiguate() {
     fn enc(spec: &str, csi_u: bool) -> Vec<u8> {
