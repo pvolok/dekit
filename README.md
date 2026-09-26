@@ -1,48 +1,65 @@
 <h1 align="center">dekit</h1>
 
-<p align="center"><b>Process runner and scripting toolkit with CLI and TUI</b></p>
+<p align="center"><b>Process manager for dev and prod</b></p>
 
-**dekit** is the next evolution of **mprocs**, a TUI tool for running multiple
-commands, viewing their output separately, and interacting with each process.
-The project continues in this repository under its new name.
+<p align="center">
+  <a href="https://dekit.run">Website</a> ·
+  <a href="https://dekit.run/docs">Docs</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
-While **mprocs** is a foreground TUI app, **dekit** uses client-server
-architecture, similar to tmux. This allows dekit to be controlled via TUI, CLI,
-or by agents.
+**dekit is a process manager.** It runs your project's tasks, such as servers,
+databases and workers, in development and in production.
 
-> **In development:** the first dekit release is not available yet. The CLI,
-> configuration format, and scripting API are still being designed and may change.
-> Published mprocs releases remain available for use today.
+- Define your project's tasks in a config file
+- dekit handles dependencies, crashes and restarts
+- Watch and control tasks in a terminal UI
+- A full CLI for humans and agents
+- Built-in JavaScript for writing scripts
 
-## What dekit adds
+<img src="img/mprocs1.png" alt="dekit terminal UI" width="900" />
 
-mprocs brings your project's commands into one terminal interface. dekit builds
-on that foundation with a broader process runner and scripting toolkit:
-
-- Keep processes running independently of the terminal, and reconnect when needed.
-- Coordinate services and tasks through dependencies and readiness checks.
-- Automate workflows with scripts, alongside interactive control through a CLI and TUI.
-
-## TODOs before first dekit release
-
-- [ ] Finalize the CLI, config format, and JavaScript API.
-- [ ] Live upgrade.
-- [ ] Finalize per-project dekit versioning.
-- [ ] Fix Windows bugs and missing features.
-
-## Use mprocs for now
-
-Before dekit is released you can still use mprocs.
-
-Development builds of dekit support (and will support after release) mprocs CLI
-via:
+## Install
 
 ```sh
-dekit mprocs ...
+curl -fsSL https://dekit.run/install.sh | sh     # macOS, Linux
+iwr -useb https://dekit.run/install.ps1 | iex    # Windows (PowerShell)
+npm install -g dekit
+cargo install dekit
 ```
 
-- [mprocs v0.9.6 release and binaries](https://github.com/pvolok/dekit/releases/tag/v0.9.6)
-- [mprocs installation and usage](README-mprocs.md)
-- [Release history](CHANGELOG.md)
+## Quick start
 
-<img src="img/mprocs1.png" alt="mprocs terminal interface" width="900" />
+`dekit.yaml` at the project root:
+
+```yaml
+tasks:
+  db:
+    cmd: ["postgres", "-D", ".data/db"]
+    ready_log: "ready to accept connections"
+  api:
+    cmd: ["cargo", "run", "-p", "api"]
+    deps: [db]
+    autostart: true
+```
+
+```sh
+dekit up        # start the runner and the autostart tasks
+dekit ls        # see what is running
+dekit attach    # open the terminal UI
+dekit down      # stop for the day; `dekit up` brings everything back
+```
+
+The tasks keep running after you close the terminal. `dekit help` shows the
+docs in your terminal.
+
+## Coming from mprocs
+
+dekit is the next version of [mprocs](README-mprocs.md). `dekit mprocs` runs
+your `mprocs.yaml` with the same flags and keys. See
+[Coming from mprocs](https://dekit.run/docs/start/from-mprocs) to switch to
+`dekit.yaml`.
+
+## License
+
+MIT
