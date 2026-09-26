@@ -5,12 +5,10 @@ order: 12
 related: [cli/run, cli/rm, config/tasks]
 ---
 
-Adds a process task at a path and starts it, without touching
-`dekit.yaml`. The command comes after `--`; `--cwd` defaults to the
-current directory, `--env` sets variables, `--dep` makes the task wait on
-existing tasks, and `--tag` tags it. Tasks added this way carry the
-`dynamic` tag, so `dekit rm +dynamic` removes all of them. They are not
-autostart, and they are gone once the runner stops unless it was paused.
+Adds a task at a path and starts it, without touching `dekit.yaml`. The
+command comes after `--`. The task gets the `dynamic` tag, so
+`dekit rm +dynamic` removes every task added this way. It survives
+|cli/down| like any other task.
 
 :::usage
 

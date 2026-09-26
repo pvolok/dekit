@@ -42,16 +42,12 @@ pub enum RpcRequest {
   Upgrade {
     binary: String,
   },
-  /// Save every task and its screen for the next start, then quit. The
-  /// reply `{}` comes before the runner stops.
-  Pause {},
 }
 
 /// Gate for `from_wire`: methods not listed here are `unknown_method`
 /// instead of `invalid_params`. Kept in sync with the enum by tests.
-const METHODS: &[&str] = &[
-  "command", "ls", "why", "screen", "attach", "upgrade", "pause",
-];
+const METHODS: &[&str] =
+  &["command", "ls", "why", "screen", "attach", "upgrade"];
 
 impl RpcRequest {
   pub fn to_wire(&self) -> (String, Value) {
@@ -184,7 +180,8 @@ mod tests {
         deps: vec![Target::glob("db")],
         tags: vec!["backend".to_string()],
       }),
-      RpcRequest::Command(Command::Quit),
+      RpcRequest::Command(Command::Quit { save: true }),
+      RpcRequest::Command(Command::Quit { save: false }),
       RpcRequest::Ls { target: None },
       RpcRequest::Ls {
         target: Some(Target::glob("services/*")),
@@ -210,7 +207,6 @@ mod tests {
       RpcRequest::Upgrade {
         binary: "/opt/dekit/bin/dekit".to_string(),
       },
-      RpcRequest::Pause {},
     ]
   }
 
@@ -224,6 +220,7 @@ mod tests {
         r#"{"cmd":["./api"],"command":"add","cwd":"/repo","deps":["db"],"tags":["backend"],"target":"api"}"#,
       ),
       ("command", r#"{"command":"quit"}"#),
+      ("command", r#"{"command":"quit","save":false}"#),
       ("ls", r#"null"#),
       ("ls", r#"{"target":"services/*"}"#),
       ("why", r#"{"target":"web"}"#),
@@ -237,7 +234,6 @@ mod tests {
         r#"{"height":24,"target":"web/dev","until_exit":true,"width":80}"#,
       ),
       ("upgrade", r#"{"binary":"/opt/dekit/bin/dekit"}"#),
-      ("pause", r#"null"#),
     ];
     let samples = samples();
     assert_eq!(samples.len(), expected.len());

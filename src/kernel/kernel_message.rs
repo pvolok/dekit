@@ -51,6 +51,8 @@ pub type Ack = Option<tokio::sync::oneshot::Sender<usize>>;
 
 pub enum KernelCommand {
   Quit,
+  /// Quits without saving, dropping a save a quit has begun.
+  QuitWithoutSave,
 
   /// Registration is atomic: deps are resolved, the path claimed, and the
   /// task inserted in one dispatch, or nothing happens.
@@ -67,7 +69,7 @@ pub enum KernelCommand {
   Kill(TaskSelector, Ack),
   Restart(TaskSelector, Ack),
   ForceRestart(TaskSelector, Ack),
-  Down(TaskSelector, Ack),
+  Unpin(TaskSelector, Ack),
   Veto(TaskSelector, Ack),
   /// Total: removes matching tasks in any state, killing running ones.
   Remove(TaskSelector, Ack),
@@ -105,6 +107,9 @@ pub enum KernelCommand {
   Freeze(tokio::sync::oneshot::Sender<Result<KernelSnapshot, String>>),
   /// A task's answer to `TaskCmd::Freeze`, with that freeze's number.
   TaskFrozen(u64, TaskKindSnapshot),
+  /// The freeze a quit began has waited long enough for its tasks; the
+  /// runner quits without saving.
+  FreezeTimeout(u64),
   /// Resumes driving; what the freeze deferred is then handled one message
   /// at a time, ahead of anything newer.
   Thaw,

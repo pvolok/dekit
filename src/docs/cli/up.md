@@ -1,43 +1,27 @@
 ---
 title: dekit up
 cli: dekit up
-related: [cli, start/targets, config]
+related: [cli, cli/down, cli/start, config]
 order: 2
 ---
 
-`dekit up` is the workday start verb. With no target it starts every task
-tagged `autostart` (the ones with `autostart: true` in |config|), pulling
-dependencies up first and waiting on each `ready_log` before dependents
-start.
+The workday start verb. It starts the project's runner if it is not
+running and then starts every task with `autostart: true` (|config|).
+Dependencies come up first, and a dependency with a `ready_log` is waited
+on before its dependents start.
 
-:::callout note
-If the runner for this project is not running, `up` starts it. Close the
-terminal: the runner keeps going. Attach later with `dekit attach`.
-:::
+A runner that starts after |cli/down| first brings back what it had: the
+tasks from the current `dekit.yaml` and tasks added with `spawn`. The ones
+you had started run again; the rest keep their last screen. So `up` restores
+yesterday's state and adds the autostart set, including an autostart task
+you stopped before `down`. To start other tasks, use |cli/start|.
+
+The runner keeps going after you close the terminal; `dekit attach` gets
+you back in.
 
 :::usage
 
 ```sh
 dekit up
-dekit up +ci
-dekit up 'services/*'
 dekit up -C ~/src/api
 ```
-
-## What it actually does {#semantics}
-
-Bare `up` is `dekit start +autostart`. With a target it is `dekit start`
-with that target: the matching tasks are pinned and started, and every
-dependency they need comes up with them. Surgical control of single tasks is
-the same verb, `dekit start`.
-
-:::callout warning
-`up` is not `run`. `dekit run <path> -- <cmd>` runs a fresh command in the
-foreground and removes it when it exits. `up` is for the long-lived graph.
-:::
-
-## See also
-
-Stop versus down versus veto is on |start/targets|. Config for `autostart`
-and `ready_log` is on |config|. Bare `down` unpins every task; it does
-**not** stop the runner, which is `dekit runner stop`.

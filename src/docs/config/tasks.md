@@ -6,115 +6,102 @@ order: 10
 ---
 
 Each entry under `tasks` is a task: a command to run, what it depends on,
-and how dekit treats it. The `defaults` section holds the same settings
-for every task; a task's own value wins.
+and how dekit treats it.
+
+```yaml
+tasks:
+  db:
+    cmd: ["postgres", "-D", ".data/db"]
+    ready_log: "ready to accept connections"
+  api:
+    cmd: ["cargo", "run", "-p", "api"]
+    deps: [db]
+    autostart: true
+  logs:
+    shell: tail -f var/log/*.log | grep -v healthz
+  repl:
+    cmd: node
+    stop: {send-keys: [".exit", "<Enter>"]}
+```
 
 :::fields kind=config
 - key: tasks.*.cmd
   type: "string | string[]"
-  desc: Command to run. An array is argv; a string is split like a shell would. One of cmd, shell, or script is required.
+  desc: The program to run. An array is the exact argv; a string is split into words like a shell would, without running one.
 - key: tasks.*.shell
   type: string
-  desc: Run this line through the shell (`/bin/sh -c`, PowerShell on Windows).
+  desc: A line to run through `/bin/sh -c` (PowerShell on Windows), so pipes and variables work.
 - key: tasks.*.script
   type: string
-  desc: A `.js` or `.mjs` file to run on the embedded runtime.
+  desc: A `.js` or `.mjs` file to run on dekit's built-in JavaScript runtime (|js|).
 - key: tasks.*.label
   type: string
-  desc: Display name in the TUI. Defaults to the path.
+  desc: The name shown in the TUI. Defaults to the task path.
 - key: tasks.*.deps
   type: string[]
   default: "[]"
-  desc: Task paths this task waits on. Fragment mounts rebase local names; prefix `/` to address the project root.
+  desc: Tasks that must be up before this one starts. Starting this task starts them too.
 - key: tasks.*.tags
   type: string[]
   default: "[]"
-  desc: "Tags for `+tag` targets. `autostart: true` adds the autostart tag."
+  desc: Tags for `+tag` targets (|start/targets|).
 - key: tasks.*.cwd
   type: path
-  desc: Working directory. Relative paths resolve from the declaring file.
+  desc: Working directory. Defaults to the project root.
 - key: tasks.*.env
   type: object
-  desc: Extra environment variables. A null value unsets the variable.
+  desc: Extra environment variables. A null value removes the variable.
 - key: tasks.*.add_path
   type: string[]
-  desc: Directories prepended to PATH.
+  desc: Directories to put in front of PATH.
 - key: tasks.*.autostart
   type: boolean
   default: "false"
-  desc: Start with `dekit up` and whenever the runner starts.
+  desc: Start the task on `dekit up` and when the runner starts fresh. It adds the `autostart` tag.
 - key: tasks.*.autorestart
   type: boolean
   default: "false"
-  desc: Restart the task after it exits, with backoff between attempts.
+  desc: Restart the task when it exits with an error, waiting longer after each quick failure.
 - key: tasks.*.ready_log
   type: string
-  desc: Dependents wait until an output line contains this string.
+  desc: Dependents wait until a line of the task's output contains this string. Without it, the task counts as up once it starts.
 - key: tasks.*.stop
   type: "shutdown | kill | SIGNAME | {signal, group} | {send-keys} | {cmd}"
   default: shutdown
-  desc: How to stop the task. `shutdown` sends SIGTERM to the process group (terminates the process on Windows), a signal name targets the group too, `send-keys` types keys into the pty, and `cmd` runs a shell command.
+  desc: How to stop the task (|config/tasks#stopping|).
 - key: tasks.*.log
   type: "boolean | path | {enabled, dir, file, mode}"
-  desc: Write the task's output to a file. A string is the directory; `mode` is append or truncate.
+  desc: Also write the task's output to a file (|config/tasks#logs|).
 - key: tasks.*.scrollback_len
   type: integer
   default: "1000"
-  desc: Lines of scrollback kept for the task's screen.
+  desc: Lines of output kept for scrolling back.
 - key: tasks.*.mouse_scroll_speed
   type: integer
   default: "5"
-  desc: Lines per mouse-wheel tick in the TUI.
+  desc: Lines per mouse-wheel step in the TUI.
 :::
 
-## Commands
+Exactly one of `cmd`, `shell`, or `script` is required. The `defaults`
+section (|config|) takes the same settings, from `cwd` down, for every
+task; a task's own value wins.
 
-`cmd` runs a program directly. As an array it is the exact argv; as a
-string it is split the way a shell splits words, without running one.
-`shell` hands the line to `/bin/sh -c` (PowerShell on Windows), so
-pipes and variables work. `script` runs a JavaScript file on dekit's
-embedded runtime, with the runner's identity in its environment.
+## Stopping {#stopping}
 
-```yaml
-tasks:
-  api:
-    cmd: ["cargo", "run", "-p", "api"]
-  logs:
-    shell: tail -f var/log/*.log | grep -v healthz
-  watcher:
-    script: scripts/watch.js
-```
+The default `shutdown` sends SIGTERM to the task's whole process group. A
+signal name such as `SIGINT` sends that signal instead, and
+`{signal: SIGINT, group: false}` sends it to the main process only.
+`kill` sends SIGKILL. `{send-keys: ["<C-c>"]}` types keys into the task's
+terminal, and `{cmd: "docker compose stop"}` runs a shell command. A task
+that is still running 10 seconds later is killed.
 
-## Dependencies and readiness
+On Windows, `shutdown`, `kill`, and `SIGINT`/`SIGTERM`/`SIGKILL` all end
+the process.
 
-`deps` lists the tasks that must be up first. Starting a task starts its
-dependencies; stopping a dependency while something still needs it brings
-it back (|start/targets|). A dependency counts as up once it is running,
-or, when it declares `ready_log`, once a line of its output contains that
-string.
+## Logs {#logs}
 
-`autostart: true` tags the task `autostart`, the set that bare `dekit up`
-starts and that comes up with the runner.
-
-## Stopping
-
-`stop` decides what a stop sends. The default `shutdown` is SIGTERM to the
-whole process group. A signal name (`SIGINT`, `SIGHUP`, ...) does the
-same with that signal; `{signal: SIGINT, group: false}` signals only the
-leader. `{send-keys: ["<C-c>"]}` types keys into the task's terminal, and
-`{cmd: "docker compose stop"}` runs a command. A task that ignores its
-stop is killed after a grace period; `dekit kill` skips straight to that.
-
-```yaml
-tasks:
-  repl:
-    cmd: ["node"]
-    stop: {send-keys: [".exit", "<Enter>"]}
-```
-
-## Logs
-
-`log: true` writes the task's output to a file named after the task in
-the default log directory; a string names the directory; the object form
-sets `dir`, `file`, and `mode` (`append` or `truncate`). `{name}`,
-`{id}`, `{pid}`, and `{ts}` in `dir` and `file` expand per run.
+A string is a directory: the output goes to a file named after the task,
+such as `api.log`. The object form sets `dir`, `file`, and `mode`
+(`append`, the default, or `truncate`); `{name}`, `{pid}`, and `{ts}` in
+`dir` or `file` are filled in on each run. `true` and `false` turn
+logging on or off, which is handy when `defaults` sets the directory.

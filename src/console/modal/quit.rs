@@ -17,9 +17,7 @@ impl Modal for QuitModal {
       return ModalResult::Keep;
     }
     match key.code {
-      KeyCode::Char('e') => ModalResult::Run(Action::Command {
-        command: crate::command::Command::Quit,
-      }),
+      KeyCode::Char('e') => ModalResult::Run(Action::Quit),
       KeyCode::Char('d') => ModalResult::Detach,
       KeyCode::Char('n') | KeyCode::Esc => ModalResult::Close,
       _ => ModalResult::Keep,
@@ -36,7 +34,7 @@ impl Modal for QuitModal {
     let inner = area.inner(1);
     grid.fill_area(inner, ' ', Attrs::default());
     let lines = [
-      "<e>   - exit client and runner",
+      "<e>   - stop the runner",
       "<d>   - detach client",
       "<Esc> - cancel",
     ];

@@ -2,14 +2,13 @@
 title: dekit veto
 cli: dekit veto
 order: 10
-related: [cli/stop, cli/down, cli/start, start/targets]
+related: [cli/stop, cli/kill, cli/start, start/targets]
 ---
 
-Forces the matching tasks down and holds them there, whatever depends on
-them, until they are started again with |cli/start| or |cli/up|. A veto is
-the one way to keep a task down while its dependents stay pinned: they are
-blocked, not restarted, and `dekit why` shows the dependency as not
-satisfied.
+Stops the matching tasks and keeps them stopped, even when pinned tasks
+depend on them. Those dependents stop too and wait. The veto ends when a
+start reaches the task: `dekit start` on it or on a task that depends on
+it, or `dekit up` when an autostart task needs it.
 
 :::usage
 

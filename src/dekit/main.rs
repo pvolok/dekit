@@ -129,15 +129,20 @@ fn resolve_runner(matches: &clap::ArgMatches) -> anyhow::Result<RunnerSpec> {
   RunnerSpec::discover(&std::env::current_dir()?)
 }
 
-async fn shutdown_runner(runner: &RunnerSpec) -> anyhow::Result<()> {
+/// Stops the runner, saving its tasks for its next start when `save` is
+/// set. Returns false when it was not running.
+async fn shutdown_runner(
+  runner: &RunnerSpec,
+  save: bool,
+) -> anyhow::Result<bool> {
   let paths = lockfile::runner_paths(runner)?;
   match lockfile::runner_state(runner, &paths)? {
     lockfile::RunnerState::Ready(_) | lockfile::RunnerState::Starting => {}
     lockfile::RunnerState::Stale(_) | lockfile::RunnerState::Failed(_) => {
       lockfile::cleanup_paths(&paths)?;
-      anyhow::bail!("Runner is not running (stale runtime state cleaned up)")
+      return Ok(false);
     }
-    lockfile::RunnerState::Absent => anyhow::bail!("No runner found"),
+    lockfile::RunnerState::Absent => return Ok(false),
   }
   // The loop's first `Ready` read captures the target and sends Quit.
   let mut target = None;
@@ -151,18 +156,18 @@ async fn shutdown_runner(runner: &RunnerSpec) -> anyhow::Result<()> {
   let mut killed = None;
   loop {
     match lockfile::runner_state(runner, &paths)? {
-      lockfile::RunnerState::Absent => return Ok(()),
+      lockfile::RunnerState::Absent => return Ok(true),
       lockfile::RunnerState::Stale(_) | lockfile::RunnerState::Failed(_) => {
         lockfile::cleanup_paths(&paths)?;
-        return Ok(());
+        return Ok(true);
       }
       lockfile::RunnerState::Ready(record) => {
         if target.as_ref().is_some_and(|owner| owner != &record.owner) {
-          return Ok(());
+          return Ok(true);
         }
         if target.is_none() {
           target = Some(record.owner.clone());
-          quit_error = request_runner_quit(runner).await;
+          quit_error = request_runner_quit(runner, save).await;
         }
         if killed.is_none() && tokio::time::Instant::now() >= quit_deadline {
           force_kill_runner(&record.owner)?;
@@ -207,27 +212,6 @@ async fn shutdown_runner(runner: &RunnerSpec) -> anyhow::Result<()> {
   }
 }
 
-/// Waits for a runner that is quitting on its own to release its record.
-async fn wait_runner_gone(runner: &RunnerSpec) -> anyhow::Result<()> {
-  let paths = lockfile::runner_paths(runner)?;
-  let deadline =
-    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-  loop {
-    match lockfile::runner_state(runner, &paths)? {
-      lockfile::RunnerState::Absent => return Ok(()),
-      lockfile::RunnerState::Stale(_) | lockfile::RunnerState::Failed(_) => {
-        lockfile::cleanup_paths(&paths)?;
-        return Ok(());
-      }
-      lockfile::RunnerState::Ready(_) | lockfile::RunnerState::Starting => {}
-    }
-    if tokio::time::Instant::now() >= deadline {
-      anyhow::bail!("the runner did not stop within 30s after pausing");
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-  }
-}
-
 /// Force-kill a runner by verified identity and reap its task session.
 fn force_kill_runner(owner: &lockfile::OwnerInfo) -> anyhow::Result<()> {
   let lockfile::OwnerInfo {
@@ -254,10 +238,13 @@ fn force_kill_runner(owner: &lockfile::OwnerInfo) -> anyhow::Result<()> {
   Ok(())
 }
 
-async fn request_runner_quit(runner: &RunnerSpec) -> Option<anyhow::Error> {
+async fn request_runner_quit(
+  runner: &RunnerSpec,
+  save: bool,
+) -> Option<anyhow::Error> {
   match tokio::time::timeout(
     std::time::Duration::from_secs(2),
-    rpc_request(runner, RpcRequest::Command(Command::Quit), false),
+    rpc_request(runner, RpcRequest::Command(Command::Quit { save }), false),
   )
   .await
   {
@@ -474,7 +461,7 @@ fn runner_from_ref(runner: &Runner) -> anyhow::Result<RunnerSpec> {
 }
 
 /// Runner selection for `dekit runner` subcommands: an explicit runner
-/// reference (`home`, `project`, a path), else the discovered runner.
+/// reference (`host`, `project`, a path), else the discovered runner.
 fn arg_runner(
   matches: &clap::ArgMatches,
   sub_m: &clap::ArgMatches,
@@ -589,7 +576,7 @@ pub fn cli() -> ClapCommand {
         .about("Start the selected runner")
         .arg(runner_ref_arg()),
       ClapCommand::new("stop")
-        .about("Stop the selected runner")
+        .about("Stop the selected runner without saving its tasks")
         .arg(runner_ref_arg()),
       ClapCommand::new("upgrade")
         .about("Replace the running runner live with its selected kernel")
@@ -601,9 +588,6 @@ pub fn cli() -> ClapCommand {
         ),
       ClapCommand::new("restart")
         .about("Restart the runner live, reloading dekit.yaml")
-        .arg(runner_ref_arg()),
-      ClapCommand::new("pause")
-        .about("Save the tasks and their screens, then stop the runner; the next start resumes them")
         .arg(runner_ref_arg()),
       ClapCommand::new("status")
         .about("Show selected runner status")
@@ -624,11 +608,10 @@ pub fn cli() -> ClapCommand {
             .help("Fail if the runner is not running instead of starting it"),
         ),
       ClapCommand::new("up")
-        .about("Start autostart tasks, or tasks matching a target")
-        .arg(target_arg("Task path, glob, or +tag")),
+        .about("Start the runner if needed and the autostart tasks"),
       ClapCommand::new("down")
-        .about("Unpin tasks (bare: all); each stops unless something still needs it")
-        .arg(target_arg("Task path, glob, or +tag")),
+        .about("Stop the runner, keeping the tasks for the next up")
+        .arg(runner_ref_arg()),
       task_args(
         ClapCommand::new("spawn").about("Add a task at a path and start it"),
       ),
@@ -648,7 +631,7 @@ pub fn cli() -> ClapCommand {
         .about("Like stop, but with an immediate hard kill")
         .arg(required_target()),
       ClapCommand::new("veto")
-        .about("Force tasks down and keep them down until started again")
+        .about("Stop tasks and keep them stopped until started again")
         .arg(required_target()),
       ClapCommand::new("restart")
         .about("Restart tasks matching a target")
@@ -825,28 +808,28 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         println!("{}", crate::term::vt::emit::SGR_RESET);
       }
     }
-    Some(("up", sub_m)) => {
-      let target =
-        arg_target(sub_m)?.unwrap_or_else(|| Target::tag(AUTOSTART_TAG));
-      let (runner, target) = resolve_target(&matches, target)?;
+    Some(("up", _)) => {
+      let runner = resolve_runner(&matches)?;
       let result = rpc_request(
         &runner,
-        RpcRequest::Command(Command::Start { target }),
+        RpcRequest::Command(Command::Start {
+          target: Target::tag(AUTOSTART_TAG),
+        }),
         true,
       )
       .await?;
-      print_acted(result, json, "Started", "No tasks matched.")?;
+      print_acted(result, json, "Started", "No autostart tasks.")?;
     }
     Some(("down", sub_m)) => {
-      let target = arg_target(sub_m)?.unwrap_or_else(|| Target::glob("**"));
-      let (runner, target) = resolve_target(&matches, target)?;
-      let result = rpc_request(
-        &runner,
-        RpcRequest::Command(Command::Down { target }),
-        false,
-      )
-      .await?;
-      print_acted(result, json, "Put down", "No tasks matched.")?;
+      let runner = arg_runner(&matches, sub_m)?;
+      let stopped = shutdown_runner(&runner, true).await?;
+      if json {
+        println!("{}", serde_json::json!({ "stopped": stopped }));
+      } else if stopped {
+        println!("Runner stopped; `dekit up` brings the tasks back.");
+      } else {
+        println!("Runner is not running.");
+      }
     }
     Some(("help", sub_m)) => {
       let words: Vec<String> = sub_m
@@ -931,15 +914,35 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       }
       Some(("stop", sub_m)) => {
         let runner = arg_runner(&matches, sub_m)?;
-        shutdown_runner(&runner).await?;
-        println!("Runner stopped.");
-      }
-      Some(("pause", sub_m)) => {
-        let runner = arg_runner(&matches, sub_m)?;
-        running_record(&runner)?;
-        rpc_request(&runner, RpcRequest::Pause {}, false).await?;
-        wait_runner_gone(&runner).await?;
-        println!("Runner paused; its next start resumes the tasks.");
+        let stopped = shutdown_runner(&runner, false).await?;
+        // A save left by an earlier down would bring the tasks back.
+        let mut removed_saved = false;
+        if !stopped {
+          match std::fs::remove_file(lockfile::saved_path(&runner)?) {
+            Ok(()) => removed_saved = true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+              anyhow::bail!("Runner is not running.")
+            }
+            Err(err) => anyhow::bail!("cannot remove the saved tasks: {err}"),
+          }
+        }
+        if json {
+          println!(
+            "{}",
+            serde_json::json!({
+              "stopped": stopped,
+              "removed_saved": removed_saved,
+            })
+          );
+        } else if stopped {
+          println!(
+            "Runner stopped. Tasks were not saved; `dekit down` keeps them."
+          );
+        } else {
+          println!(
+            "Runner is not running; removed its saved tasks, so the next start is fresh."
+          );
+        }
       }
       Some(("status", sub_m)) => {
         let runner = arg_runner(&matches, sub_m)?;

@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+use crate::command::Command;
 use crate::console::action::{Action, CopyMove as ActionCopyMove, ScrollUnit};
 use crate::kernel::task::TaskId;
+use crate::target::Target;
 use crate::term::key::{Key, key_spec};
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -82,8 +84,20 @@ impl AppEvent {
         cmds: cmds.into_iter().map(AppEvent::to_action).collect(),
       },
       AppEvent::QuitOrAsk => Action::QuitOrAsk,
+      // mprocs is foreground: quitting it quits its in-process runner,
+      // by key or over `--ctl`.
       AppEvent::Quit => Action::Quit,
-      AppEvent::ForceQuit => Action::ForceQuit,
+      // mprocs force-quit: a hard kill of everything, then quit.
+      AppEvent::ForceQuit => Action::Command {
+        command: Command::Batch {
+          commands: vec![
+            Command::Kill {
+              target: Target::glob("**"),
+            },
+            Command::Quit { save: true },
+          ],
+        },
+      },
       AppEvent::ToggleFocus => Action::ToggleFocus,
       AppEvent::FocusProcs => Action::FocusTasks,
       AppEvent::FocusTerm => Action::FocusTerm,

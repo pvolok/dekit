@@ -227,7 +227,7 @@ fn path_def(path: &str) -> TaskDef {
 }
 
 #[tokio::test]
-async fn start_starts_and_down_stops() {
+async fn start_starts_and_unpin_stops() {
   let mut fx = Fixture::new();
   let a = fx.add("a", path_def("a"));
   let handle = fx.run();
@@ -235,7 +235,7 @@ async fn start_starts_and_down_stops() {
   fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
-  fx.pc.send(KernelCommand::Down(TaskSelector::Id(a), None));
+  fx.pc.send(KernelCommand::Unpin(TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
   fx.quit(handle).await;
@@ -455,7 +455,7 @@ async fn start_of_dependent_does_not_rerun_done_job() {
 }
 
 #[tokio::test]
-async fn down_keeps_task_wanted_by_another() {
+async fn unpin_keeps_task_wanted_by_another() {
   let mut fx = Fixture::new();
   let dep = fx.add("dep", path_def("dep"));
   let app = fx.add(
@@ -475,12 +475,14 @@ async fn down_keeps_task_wanted_by_another() {
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
   // Unpinning the dep is a no-op while the app still wants it.
-  fx.pc.send(KernelCommand::Down(TaskSelector::Id(dep), None));
+  fx.pc
+    .send(KernelCommand::Unpin(TaskSelector::Id(dep), None));
   fx.flush().await;
   fx.assert_no_cmd();
 
   // Unpinning the app winds both down, dependent first.
-  fx.pc.send(KernelCommand::Down(TaskSelector::Id(app), None));
+  fx.pc
+    .send(KernelCommand::Unpin(TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
 
@@ -1091,7 +1093,8 @@ async fn restart_pins_like_start() {
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
   // The restart pinned the dep, so it survives its dependent going away.
-  fx.pc.send(KernelCommand::Down(TaskSelector::Id(app), None));
+  fx.pc
+    .send(KernelCommand::Unpin(TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Stop));
   fx.flush().await;
   fx.assert_no_cmd();
@@ -1123,7 +1126,7 @@ async fn stop_unpins_so_revival_is_temporary() {
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
 
-  fx.pc.send(KernelCommand::Down(TaskSelector::Id(b), None));
+  fx.pc.send(KernelCommand::Unpin(TaskSelector::Id(b), None));
   assert_eq!(fx.recv().await, ("b", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
@@ -1476,7 +1479,7 @@ fn tag_and_all_selectors() {
   assert!(!pinned(&kernel, c));
 
   let n = turn_matching(&mut kernel, |ack| {
-    KernelCommand::Down(TaskSelector::all(), ack)
+    KernelCommand::Unpin(TaskSelector::all(), ack)
   });
   assert_eq!(n, 3);
   assert!(!pinned(&kernel, a));
@@ -1853,7 +1856,7 @@ async fn freeze_defers_intent_until_thaw() {
   assert!(snapshot.tasks[0].pinned);
 
   // Intent waits; reads still work.
-  fx.pc.send(KernelCommand::Down(TaskSelector::Id(a), None));
+  fx.pc.send(KernelCommand::Unpin(TaskSelector::Id(a), None));
   fx.flush().await;
   fx.assert_no_cmd();
 
@@ -1931,6 +1934,74 @@ async fn freeze_is_refused_while_shutting_down() {
     .unwrap();
 }
 
+/// Counts the saves a quit makes.
+fn count_saves(fx: &mut Fixture) -> Arc<AtomicUsize> {
+  let saves = Arc::new(AtomicUsize::new(0));
+  let counter = saves.clone();
+  fx.kernel.as_mut().unwrap().save_on_quit(Box::new(move |_| {
+    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+  }));
+  saves
+}
+
+#[tokio::test]
+async fn quit_saves_and_quit_without_save_does_not() {
+  for save in [true, false] {
+    let mut fx = Fixture::new();
+    let a = fx.add("a", path_def("a"));
+    let saves = count_saves(&mut fx);
+    let handle = fx.run();
+    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+    fx.pc.send(if save {
+      KernelCommand::Quit
+    } else {
+      KernelCommand::QuitWithoutSave
+    });
+    assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+    tokio::time::timeout(Duration::from_secs(2), handle)
+      .await
+      .expect("timed out waiting for kernel to quit")
+      .unwrap();
+    assert_eq!(
+      saves.load(std::sync::atomic::Ordering::SeqCst),
+      usize::from(save)
+    );
+  }
+}
+
+#[tokio::test]
+async fn quit_without_save_drops_a_save_under_way() {
+  let mut fx = Fixture::new();
+  let tx = fx.tx.clone();
+  // Never answers the freeze, so the quit's save waits on it.
+  let a = fx
+    .kernel
+    .as_mut()
+    .unwrap()
+    .register_task(path_def("a"), move |_| {
+      Box::new(SilentTask { name: "a", tx })
+    });
+  let saves = count_saves(&mut fx);
+  let handle = fx.run();
+  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+  fx.pc.send(KernelCommand::Quit);
+  fx.flush().await;
+  fx.assert_no_cmd();
+
+  fx.pc.send(KernelCommand::QuitWithoutSave);
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+  tokio::time::timeout(Duration::from_secs(2), handle)
+    .await
+    .expect("timed out waiting for kernel to quit")
+    .unwrap();
+  assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn freeze_names_a_task_whose_handler_stopped() {
   let mut fx = Fixture::new();
@@ -2004,9 +2075,9 @@ async fn thawed_intent_is_handled_one_message_at_a_time() {
   let _ = freeze(&fx).await;
 
   // Settled one message at a time, as without the freeze, the start
-  // happens before the down undoes it.
+  // happens before the unpin undoes it.
   fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
-  fx.pc.send(KernelCommand::Down(TaskSelector::Id(a), None));
+  fx.pc.send(KernelCommand::Unpin(TaskSelector::Id(a), None));
   fx.flush().await;
   fx.assert_no_cmd();
 
@@ -2031,7 +2102,7 @@ async fn stopping_task_keeps_its_deadline_in_the_snapshot() {
   let handle = fx.run();
   fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
-  fx.pc.send(KernelCommand::Down(TaskSelector::Id(a), None));
+  fx.pc.send(KernelCommand::Unpin(TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
   let snapshot = freeze(&fx).await;
@@ -2122,7 +2193,7 @@ async fn restore_rebuilds_graph_and_drives_only_what_changed() {
   // Dropping the pin now stops b first, then a: the edges survived.
   restored
     .pc
-    .send(KernelCommand::Down(TaskSelector::Id(b), None));
+    .send(KernelCommand::Unpin(TaskSelector::Id(b), None));
   assert_eq!(restored.recv().await, ("b", RecordedCmd::Stop));
   assert_eq!(restored.recv().await, ("a", RecordedCmd::Stop));
   restored.quit(handle).await;

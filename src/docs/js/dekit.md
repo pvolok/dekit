@@ -6,16 +6,17 @@ order: 10
 ---
 
 `std.dekit` sends commands to the runner the script belongs to: the
-project runner for a `script:` task, or the project found from the
-current directory for `dekit script.js`. Targets are written as on the
-command line (|start/targets|) but cannot name another runner. Every
-call resolves to the number of tasks it acted on, like the CLI's
-`{matched}`.
+project runner for a `script:` task, or the nearest project for
+`dekit script.js`. Targets are written as on the command line
+(|start/targets|) but cannot name another runner. Every call resolves to
+the number of tasks it acted on.
 
 ```js
-await std.dekit.add("tmp/build", ["npm", "run", "build"]);
-const started = await std.dekit.start("+workers");
-std.log(`started ${started} workers`);
+export async function main() {
+  await std.dekit.add("tmp/build", ["npm", "run", "build"]);
+  const started = await std.dekit.start("+workers");
+  std.log(`started ${started} workers`);
+}
 ```
 
 :::fields kind=js
@@ -27,16 +28,13 @@ std.log(`started ${started} workers`);
   desc: Force-restart the matching tasks, whether or not they are wanted.
 - key: std.dekit.stop
   signature: "(target: string) => Promise<number>"
-  desc: Unpin and stop; a task restarts if a dependent still needs it.
-- key: std.dekit.down
-  signature: "(target: string) => Promise<number>"
-  desc: Unpin only.
+  desc: Unpin and stop; a task restarts if something still needs it.
 - key: std.dekit.kill
   signature: "(target: string) => Promise<number>"
-  desc: Stop with an immediate hard kill.
+  desc: Like `stop`, but with an immediate hard kill.
 - key: std.dekit.veto
   signature: "(target: string) => Promise<number>"
-  desc: Force down and hold down until started again.
+  desc: Stop the tasks and keep them stopped until started again.
 - key: std.dekit.restart
   signature: "(target: string) => Promise<number>"
   desc: Restart the matching tasks.
@@ -45,5 +43,5 @@ std.log(`started ${started} workers`);
   desc: Remove the matching tasks, killing running ones.
 - key: std.dekit.add
   signature: "(path: string, cmd: string[]) => Promise<number>"
-  desc: Register a process task at an exact path with the given argv, tagged `dynamic`, and start it.
+  desc: Add a task at an exact path that runs `cmd`, tag it `dynamic`, and start it.
 :::

@@ -16,8 +16,10 @@ pub enum Action {
   },
 
   QuitOrAsk,
+  /// Detach the attachment that pressed the key.
+  Detach,
+  /// Stop the runner; it keeps the tasks for its next start.
   Quit,
-  ForceQuit,
   /// Execute a kernel command as-is.
   Command {
     command: Command,
@@ -99,9 +101,9 @@ impl Action {
   pub fn desc(&self) -> String {
     match self {
       Action::Batch { cmds: _ } => "Send multiple events".to_string(),
-      Action::QuitOrAsk => "Quit".to_string(),
-      Action::Quit => "Quit".to_string(),
-      Action::ForceQuit => "Force quit".to_string(),
+      Action::QuitOrAsk => "Detach or quit".to_string(),
+      Action::Detach => "Detach".to_string(),
+      Action::Quit => "Quit the runner".to_string(),
       Action::Command { command } => format!("Run {:?}", command),
       Action::ToggleFocus => "Toggle focus".to_string(),
       Action::FocusTasks => "Focus task list".to_string(),
@@ -114,7 +116,7 @@ impl Action {
       Action::StartTask => "Start".to_string(),
       Action::StopTask => "Stop".to_string(),
       Action::KillTask => "Kill".to_string(),
-      Action::VetoTask => "Veto (down until started)".to_string(),
+      Action::VetoTask => "Veto (stopped until started)".to_string(),
       Action::RestartTask => "Restart".to_string(),
       Action::RestartAll => "Restart all".to_string(),
       Action::RenameTask { name } => format!("Rename to \"{}\"", name),

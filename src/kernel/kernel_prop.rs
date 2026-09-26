@@ -101,7 +101,7 @@ enum Intent {
   Stop,
   Kill,
   Restart,
-  Down,
+  Unpin,
   Veto,
 }
 
@@ -122,7 +122,7 @@ enum Cmd {
   Stop(Sel),
   Kill(Sel),
   Restart(Sel),
-  Down(Sel),
+  Unpin(Sel),
   Veto(Sel),
   Register(usize),
   Remove(usize),
@@ -203,7 +203,7 @@ fn cmd(n: usize) -> impl Strategy<Value = Cmd> {
     2 => sel(n).prop_map(Cmd::Stop),
     1 => sel(n).prop_map(Cmd::Kill),
     2 => sel(n).prop_map(Cmd::Restart),
-    1 => sel(n).prop_map(Cmd::Down),
+    1 => sel(n).prop_map(Cmd::Unpin),
     1 => sel(n).prop_map(Cmd::Veto),
     2 => (0..n).prop_map(Cmd::Register),
     1 => (0..n).prop_map(Cmd::Remove),
@@ -396,7 +396,7 @@ impl Run {
       Intent::Stop => KernelCommand::Stop(selector, Some(tx)),
       Intent::Kill => KernelCommand::Kill(selector, Some(tx)),
       Intent::Restart => KernelCommand::Restart(selector, Some(tx)),
-      Intent::Down => KernelCommand::Down(selector, Some(tx)),
+      Intent::Unpin => KernelCommand::Unpin(selector, Some(tx)),
       Intent::Veto => KernelCommand::Veto(selector, Some(tx)),
     };
     let sent = self.turn(INIT_TASK_ID, command);
@@ -467,8 +467,8 @@ impl Run {
             );
           }
         }
-        Intent::Down => {
-          assert!(!self.pinned(t), "down left the pin on {:?}", t);
+        Intent::Unpin => {
+          assert!(!self.pinned(t), "unpin left the pin on {:?}", t);
         }
         Intent::Veto => {
           assert!(!self.pinned(t), "veto left the pin on {:?}", t);
@@ -488,7 +488,7 @@ impl Run {
       Cmd::Stop(sel) => self.exec_intent(world, sel, Intent::Stop),
       Cmd::Kill(sel) => self.exec_intent(world, sel, Intent::Kill),
       Cmd::Restart(sel) => self.exec_intent(world, sel, Intent::Restart),
-      Cmd::Down(sel) => self.exec_intent(world, sel, Intent::Down),
+      Cmd::Unpin(sel) => self.exec_intent(world, sel, Intent::Unpin),
       Cmd::Veto(sel) => self.exec_intent(world, sel, Intent::Veto),
       Cmd::Register(k) => self.register(world, k % n),
       Cmd::Remove(t) => {

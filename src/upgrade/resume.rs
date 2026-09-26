@@ -434,6 +434,7 @@ fn take_over(
   let server_socket = ServerSocket::adopt(snapshot.listener_fd)?;
   UnixProcessesWaiter::init_paused()?;
   let mut kernel = Kernel::new();
+  kernel.save_on_quit(crate::dekit::server::save_on_quit(runner));
   kernel.restore(prepared.next_task_id, prepared.tasks)?;
   // Before the upgrade is answered: its requester reads the record next.
   lock_guard.publish(runner, &config.warnings)?;

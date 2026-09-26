@@ -30,7 +30,7 @@ pub fn render_keymap(
   let items: &[Action] = match group {
     KeymapGroup::Tasks => &[
       Action::ToggleFocus,
-      Action::Quit,
+      Action::Detach,
       Action::NextTask,
       Action::PrevTask,
       Action::StartTask,

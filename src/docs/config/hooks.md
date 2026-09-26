@@ -5,50 +5,46 @@ related: [config, config/tasks]
 order: 40
 ---
 
-Both hooks hold a command in the same shape the JavaScript API and the
-RPC use: an object with a `command` verb and its fields.
+A hook runs a command. `on_init` runs once, after the runner has loaded
+the project. `on_idle` runs each time no task is left starting, running,
+stopping, or waiting to restart.
 
 ```yaml
 on_init: {command: start, target: +ci}
 on_idle: {command: quit}
 ```
 
-`on_init` runs once the runner has loaded the project. `on_idle` runs each
-time the number of active tasks drops to zero; starting, running, ready,
-stopping, and backing off all count as active, so a project whose last
-task finishes fires it once. `{command: quit}` on idle stops the runner
-when the work is done.
+This starts the tasks tagged `ci` and stops the runner when they are done.
 
-## Verbs
+## Commands
+
+A command is an object with a `command` name and its fields. `target` is
+written as on the command line: a path, a glob, or a `+tag`
+(|start/targets|).
 
 :::commands
 - cmd: "{command: start, target}"
-  desc: Pin and start the matching tasks and their dependencies.
+  desc: Start the tasks and their dependencies.
 - cmd: "{command: stop, target}"
-  desc: Unpin and stop; a task restarts if a dependent still needs it.
-- cmd: "{command: down, target}"
-  desc: Unpin only.
+  desc: Stop the tasks; a task comes back if another task still needs it.
 - cmd: "{command: kill, target}"
-  desc: Stop with an immediate hard kill.
+  desc: Stop the tasks right away with a hard kill.
 - cmd: "{command: veto, target}"
-  desc: Force down and hold down until started again.
+  desc: Stop the tasks and keep them stopped until started again.
 - cmd: "{command: restart, target}"
-  desc: Restart the matching tasks.
+  desc: Stop the tasks and start them again; stopped tasks start.
 - cmd: "{command: force-restart, target}"
-  desc: Restart even tasks that are not wanted.
-- cmd: "{command: add, target, cmd | shell, cwd, env, deps, tags}"
-  desc: Register a process task at an exact path and start it.
+  desc: Like restart, but with a hard kill instead of a normal stop.
+- cmd: "{command: add, target, cmd | shell | script, label, cwd, env, deps, tags}"
+  desc: Add a task at the path `target` and start it.
 - cmd: "{command: remove, target}"
-  desc: Remove the matching tasks, killing running ones.
+  desc: Remove the tasks, killing running ones.
 - cmd: "{command: rename, target, name}"
-  desc: Set a task's display label.
+  desc: Change the tasks' label.
 - cmd: "{command: duplicate, target, name}"
   desc: Copy a task under a new name.
-- cmd: "{command: quit}"
-  desc: Stop the runner.
+- cmd: "{command: quit, save}"
+  desc: Stop the runner; it saves its tasks for the next start unless `save` is false.
 - cmd: "{command: batch, commands}"
   desc: Run a list of commands in order.
 :::
-
-A `target` is written as in the CLI: a path, a glob, or a `+tag`
-(|start/targets|).

@@ -5,8 +5,7 @@ order: 4
 related: [cli/runner, cli/runner/status, cli/runner/clean]
 ---
 
-Lists every runner record on this machine, project and host, running or
-stale, with pid, root, socket, and version. With `--json` each record
-carries a `running` flag. Stale records go away with |cli/runner/clean|.
+Lists every runner record on this machine, running or stale, with pid, root,
+socket, and version. |cli/runner/clean| removes the stale ones.
 
 :::usage

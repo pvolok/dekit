@@ -5,8 +5,8 @@ order: 8
 related: [cli/runner, cli/runner/upgrade, cli/restart]
 ---
 
-Restarts the runner live with the binary it already runs, which reloads
-`dekit.yaml` while every task keeps running. To restart tasks rather than
-the runner, use |cli/restart|. Not available on Windows.
+Restarts the runner in place, which reloads `dekit.yaml`; running tasks keep
+running. To restart tasks instead, use |cli/restart|. Not available on
+Windows.
 
 :::usage

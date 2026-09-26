@@ -5,9 +5,9 @@ order: 11
 related: [cli/start, cli/stop, cli/runner/restart]
 ---
 
-Pins and bounces the matching tasks: each one that is running stops and
-starts again, and one that was down comes up. To restart the runner itself
-and reload `dekit.yaml`, use |cli/runner/restart|.
+Pins the matching tasks and restarts them: a running task stops and starts
+again, a stopped one starts. To reload `dekit.yaml`, restart the runner with
+|cli/runner/restart|.
 
 :::usage
 

@@ -23,14 +23,16 @@ pub enum Command {
   Batch {
     commands: Vec<Command>,
   },
-  Quit,
+  /// Stop the runner. It saves its tasks for its next start unless
+  /// `save` is false.
+  Quit {
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    save: bool,
+  },
   Start {
     target: Target,
   },
   Stop {
-    target: Target,
-  },
-  Down {
     target: Target,
   },
   Kill {
@@ -79,6 +81,14 @@ pub enum Command {
   },
 }
 
+fn yes() -> bool {
+  true
+}
+
+fn is_yes(value: &bool) -> bool {
+  *value
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandResult {
   None,
@@ -122,10 +132,9 @@ pub async fn execute(
   }
   match command {
     Command::Batch { .. } => Ok(CommandResult::None),
-    Command::Quit
+    Command::Quit { .. }
     | Command::Start { .. }
     | Command::Stop { .. }
-    | Command::Down { .. }
     | Command::Kill { .. }
     | Command::Veto { .. }
     | Command::Restart { .. }
@@ -194,15 +203,13 @@ fn dispatch(
         dispatch(pc, config, command, pending, acks)?;
       }
     }
-    Command::Quit => pc.send(KernelCommand::Quit),
+    Command::Quit { save: true } => pc.send(KernelCommand::Quit),
+    Command::Quit { save: false } => pc.send(KernelCommand::QuitWithoutSave),
     Command::Start { target } => {
       act(pc, target, KernelCommand::Start, pending, acks)?
     }
     Command::Stop { target } => {
       act(pc, target, KernelCommand::Stop, pending, acks)?
-    }
-    Command::Down { target } => {
-      act(pc, target, KernelCommand::Down, pending, acks)?
     }
     Command::Kill { target } => {
       act(pc, target, KernelCommand::Kill, pending, acks)?

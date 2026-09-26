@@ -6,13 +6,12 @@ related: [start/runners, cli/runner/stop, cli/kernel]
 ---
 
 A runner is the long-lived process that owns a project's tasks: one per
-project root, plus the optional host runner for machine-wide tasks. Every
-other command starts the project's runner on demand; these verbs manage the
-runner itself. |start/runners| explains how a runner is found and where its
-records live.
+project root, plus an optional host runner for machine-wide tasks. Commands
+that start tasks or attach start the runner if needed; these verbs manage
+the runner itself. See |start/runners|.
 
 :::usage
 
-Most verbs take an optional runner reference: `project` (the nearest
-project), `host`, or a path to a project root. Without one, the runner is
-the one discovered from the current directory, or from `-C`.
+Most verbs, and |cli/down|, take an optional runner: `project` (the nearest
+project), `host`, or a path to a project root starting with `/`, `~/`, or
+`./`. Without one it is the runner for the current directory, or for `-C`.

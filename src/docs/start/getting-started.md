@@ -1,7 +1,7 @@
 ---
 title: Getting started
 summary: Install dekit, write a dekit.yaml, and bring a stack up.
-related: [cli, config, cli/up]
+related: [start/targets, cli/up, config]
 order: 10
 ---
 
@@ -49,25 +49,22 @@ tasks:
 Then:
 
 ```sh
-dekit up        # start the runner and the autostart tasks, in dependency order
+dekit up        # start the autostart tasks and what they need
 dekit ls        # see what is running
 dekit why web   # explain why a task is (or is not) running
 dekit attach    # watch live output in the TUI
 ```
 
-Close the terminal and the stack keeps running: the runner is a separate
-process. `dekit down` unpins every task; `dekit runner stop` stops the runner
-itself. See |start/targets| for what stop, down, and veto mean.
+`db` has no `autostart`, but `api` needs it, so `up` starts it first and
+waits for its `ready_log` line.
+
+Close the terminal and the tasks keep running. `dekit down` stops
+everything for the day, and the next `dekit up` brings it back
+(|cli/down|).
 
 :::callout note
-The nearest `dekit.yaml` above the current directory defines the project; a
-git repository or a `package.json` also marks a project root. `-C <dir>`
-selects another root. Outside any project, dekit does not fall back to the
-host runner: name it explicitly with a `host::` target.
+The project root is the nearest directory above you with a `dekit.yaml`,
+else a git repository, else a `package.json`. `-C <dir>` names it
+explicitly (|start/runners|).
 :::
 
-## Next
-
-- |cli/up| — what bare `up` actually starts
-- |config| — `cmd`, `deps`, `ready_log`, `load`, `kernel`
-- |cli| — the rest of the verbs

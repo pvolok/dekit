@@ -6,21 +6,17 @@ related: [cli, config/user, cli/screen]
 ---
 
 Attaches your terminal to a task's screen. With no target that is the
-runner's console, `@dekit/console`: the task list beside the selected
-task's live terminal, driven by the keys in |config/user|. A task path
-attaches straight to that task's screen, with no console in between.
-`dekit` with no command does the same as `dekit attach`.
+console, `@dekit/console`: the task list next to the selected task's
+terminal. With a task path you get that task's screen alone.
 
-The runner is started if it is not running; `--no-start` fails instead.
-In the console, `q` detaches and leaves everything running, and `Q` kills
-every task and stops the runner. Several terminals may attach at once:
-they share one view, rendered at the smallest of their sizes.
+The runner is started if it is not running; `--no-start` fails instead. In
+the console, `q` detaches and leaves everything running, and `Q` stops the
+runner like |cli/down|. Other keys are in |config/user|.
 
 :::usage
 
 ```sh
 dekit attach
 dekit attach web
-dekit attach --no-start
 dekit attach host::@dekit/console
 ```

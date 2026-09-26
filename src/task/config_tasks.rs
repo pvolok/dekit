@@ -34,11 +34,11 @@ pub async fn register_config_tasks(
   Ok(())
 }
 
-/// The tasks of a paused runner, every one idle with a fresh id: the
-/// config tasks first, each around its saved screen and with its saved
-/// pin when the snapshot has it, then the saved tasks the config lacks.
-/// Returns what could not be restored.
-pub async fn register_paused_tasks(
+/// The tasks a runner saved when it quit, every one idle with a fresh
+/// id: the config tasks first, each around its saved screen and with its
+/// saved pin when the snapshot has it, then the saved tasks the config
+/// lacks. Returns what could not be restored.
+pub async fn register_saved_tasks(
   config: &Config,
   pc: &TaskContext,
   snapshot: &snap::Snapshot,
@@ -76,7 +76,7 @@ pub async fn register_paused_tasks(
         .all(|dep| new_id.contains_key(dep) || !restorable.contains(dep))
     });
     if ready.is_empty() {
-      bail!("the paused tasks depend on each other in a cycle");
+      bail!("the saved tasks depend on each other in a cycle");
     }
     pending = rest;
     for saved in ready {
@@ -89,7 +89,7 @@ pub async fn register_paused_tasks(
         match new_id.get(dep) {
           Some(id) => deps.push(TaskSelector::Id(*id)),
           None => warnings.push(format!(
-            "paused task {name}: dropped a dependency that was not restored"
+            "saved task {name}: dropped a dependency that was not restored"
           )),
         }
       }
@@ -124,7 +124,7 @@ pub async fn register_paused_tasks(
           new_id.insert(saved.id, id);
         }
         Err(err) => {
-          warnings.push(format!("paused task {name} not restored: {err}"))
+          warnings.push(format!("saved task {name} not restored: {err}"))
         }
       }
     }
@@ -156,7 +156,7 @@ async fn register_config(
     let registration = match saved_by_path.get(cfg.path.as_str()) {
       Some(saved) => {
         let snap::TaskKind::Process(process) = &saved.kind else {
-          bail!("paused task {} is not a process task", cfg.path);
+          bail!("saved task {} is not a process task", cfg.path);
         };
         new_id.insert(saved.id, task_ids[i]);
         config_task_resumed(

@@ -5,24 +5,21 @@ related: [config, config/tasks]
 order: 20
 ---
 
-`load` lists globs, relative to the declaring file. Each matched file is a
-fragment: it may contain `tasks` and further `load` entries, nothing else.
-Matches load in sorted order.
+`load` pulls tasks from other files, called fragments. Each entry is a
+glob relative to the declaring file. A fragment may contain only `tasks`
+and its own `load`.
 
 ```yaml
 load:
-  - services/*.dekit.yaml
+  - services/*.yaml
   - file: packages/web/tasks.yaml
     at: web
 ```
 
-`at` mounts the fragment's tasks under a path: a task `dev` in the second
-fragment becomes `web/dev`, and `deps` inside that fragment are rebased the
-same way, so `deps: [db]` there means `web/db`. A dep that starts with `/`
-addresses the project root instead: `deps: [/db]`.
+`at` puts the fragment's tasks under a path: a task `dev` there becomes
+`web/dev`. Its `deps` move the same way, so `deps: [db]` means `web/db`;
+write `deps: [/db]` for the project's own `db`.
 
-:::callout note
-A fragment must stay inside the project root, a glob that matches no file
-is an error, and so are load cycles and duplicate task paths. A file named
-`dekit.yaml` is never a fragment: it is another project.
-:::
+A glob that matches no file is an error, and so are two tasks with the
+same path. A fragment must be inside the project and must not be named
+`dekit.yaml`.

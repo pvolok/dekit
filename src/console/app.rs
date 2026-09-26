@@ -519,25 +519,14 @@ impl App {
       }
 
       Action::QuitOrAsk => self.modal = Some(Box::new(QuitModal)),
-      Action::Quit => match observer {
-        Some(observer) => {
+      Action::Detach => {
+        if let Some(observer) = observer {
           self.handle_screen_cmd(TaskScreenCmd::Detach { observer });
         }
-        None => {
-          self.state.quitting = true;
-          self.issue(Command::Quit);
-        }
-      },
-      Action::ForceQuit => {
+      }
+      Action::Quit => {
         self.state.quitting = true;
-        self.issue(Command::Batch {
-          commands: vec![
-            Command::Kill {
-              target: Target::glob("**"),
-            },
-            Command::Quit,
-          ],
-        });
+        self.issue(Command::Quit { save: true });
       }
       Action::Command { command } => self.issue(command),
 

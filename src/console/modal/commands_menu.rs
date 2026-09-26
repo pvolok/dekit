@@ -235,8 +235,8 @@ fn draw_highlighted(
 
 fn menu_items(search: &str) -> Vec<MenuItem> {
   let actions = [
+    Action::Detach,
     Action::Quit,
-    Action::ForceQuit,
     Action::ToggleFocus,
     Action::FocusTerm,
     Action::Zoom,

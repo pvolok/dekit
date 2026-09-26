@@ -27,21 +27,6 @@ pub async fn upgrade(ctx: Arc<ServerCtx>, binary: String) -> RpcError {
   }
 }
 
-/// Saves every task and its screen for the runner's next start and
-/// leaves it running; the caller quits the runner once the reply is out.
-#[cfg(not(unix))]
-pub async fn pause(_ctx: Arc<ServerCtx>) -> Result<(), RpcError> {
-  Err(RpcError::new(
-    crate::protocol::codes::UNSUPPORTED,
-    "pause is not available on this platform",
-  ))
-}
-
-#[cfg(unix)]
-pub async fn pause(ctx: Arc<ServerCtx>) -> Result<(), RpcError> {
-  unix::pause(ctx).await
-}
-
 #[cfg(unix)]
 pub(crate) fn set_cloexec(fds: &[i32], on: bool) -> anyhow::Result<()> {
   for fd in fds {
@@ -112,66 +97,6 @@ mod unix {
     // Only reached on failure: thaw everything the failed attempt froze.
     runner.upgrading.store(false, Ordering::SeqCst);
     result
-  }
-
-  pub async fn pause(ctx: Arc<ServerCtx>) -> Result<(), RpcError> {
-    let Some(runner) = ctx.runner.as_ref() else {
-      return Err(RpcError::new(
-        codes::UNSUPPORTED,
-        "this runner cannot be paused",
-      ));
-    };
-    if runner.upgrading.swap(true, Ordering::SeqCst) {
-      return Err(RpcError::new(
-        codes::BUSY,
-        "an upgrade or pause is in progress",
-      ));
-    }
-    let result = save(&ctx, runner).await;
-    runner.upgrading.store(false, Ordering::SeqCst);
-    result
-  }
-
-  /// Freezes, writes the paused file, and thaws. Nothing of this process
-  /// survives the quit that follows, so the file names no descriptor,
-  /// child, or client: the next start restores the tasks idle around
-  /// their screens and starts the pinned ones.
-  async fn save(
-    ctx: &Arc<ServerCtx>,
-    runner: &RunnerHandle,
-  ) -> Result<(), RpcError> {
-    let path = lockfile::paused_path(&runner.spec).map_err(failed)?;
-    let (kernel, connections) = match freeze(ctx).await {
-      Ok(frozen) => frozen,
-      Err(err) => {
-        thaw(ctx);
-        return Err(failed(err));
-      }
-    };
-    let mut snapshot = snapshot_of(runner, kernel, connections);
-    snapshot.lock_fd = -1;
-    snapshot.live_fd = -1;
-    snapshot.listener_fd = -1;
-    snapshot.connections.clear();
-    for task in &mut snapshot.tasks {
-      if let snap::TaskKind::Process(process) = &mut task.kind {
-        process.instance = None;
-      }
-    }
-    let written = path
-      .parent()
-      .map(std::fs::create_dir_all)
-      .unwrap_or(Ok(()))
-      .map_err(anyhow::Error::from)
-      .and_then(|()| {
-        atomic_write_with(&path, |out| snap::encode(&snapshot, out))
-      });
-    thaw(ctx);
-    written.map_err(|err| {
-      failed(format!("cannot write {}: {err}", path.display()))
-    })?;
-    log::info!("Paused into {}", path.display());
-    Ok(())
   }
 
   /// Freezes, writes the snapshot, checks it with the target, and execs.

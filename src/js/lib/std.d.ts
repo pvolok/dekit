@@ -60,11 +60,9 @@ declare const std: {
     run(target: string): Promise<number>;
     /** Unpin and stop; a task restarts if a dependent still needs it. */
     stop(target: string): Promise<number>;
-    /** Unpin only. */
-    down(target: string): Promise<number>;
     /** Stop with an immediate hard kill. */
     kill(target: string): Promise<number>;
-    /** Force down and hold down until started again. */
+    /** Stop and keep stopped until started again. */
     veto(target: string): Promise<number>;
     /** Restart the matching tasks. */
     restart(target: string): Promise<number>;

@@ -25,10 +25,10 @@ use crate::{
   console::app::console_task_registration,
   dekit::attach::attach_session,
   kernel::{
-    kernel::Kernel,
+    kernel::{Kernel, SaveFn},
     kernel_message::{
-      KernelCommand, KernelQuery, KernelQueryResponse, RegisterError, SharedVt,
-      TaskContext, TaskInfo, TaskSelector,
+      KernelCommand, KernelQuery, KernelQueryResponse, KernelSnapshot,
+      RegisterError, SharedVt, TaskContext, TaskInfo, TaskSelector,
     },
     task::{TaskDef, TaskState},
     task_key::TaskSpaceId,
@@ -40,12 +40,12 @@ use crate::{
     codes, ctl::Hello, ok_result, server_hello,
   },
   runner::{
-    RunnerSpec,
+    RunnerSpec, atomic_write_with,
     lockfile::{self, RunnerPaths},
     socket::{ServerSocket, bind_server_socket},
   },
   target::Target,
-  task::config_tasks::{register_config_tasks, register_paused_tasks},
+  task::config_tasks::{register_config_tasks, register_saved_tasks},
   term::Size,
   upgrade::snapshot as snap,
 };
@@ -251,6 +251,7 @@ async fn run_locked(
   #[cfg(unix)]
   crate::process::unix_processes_waiter::UnixProcessesWaiter::init()?;
   let mut kernel = Kernel::new();
+  kernel.save_on_quit(save_on_quit(runner));
   let pc = kernel.context();
   let socket_path = lock_guard.socket_path().to_path_buf();
   let console_id = pc.alloc_id();
@@ -313,15 +314,55 @@ async fn run_locked(
   serve(ctx, server_socket, kernel_handle, Vec::new()).await
 }
 
-/// The config tasks, or after a pause the saved tasks reconciled with the
-/// config. A paused file that cannot be read is dropped with a warning
-/// rather than keep the runner from starting.
+/// What a quitting runner writes for its next start: every task and its
+/// screen, with no descriptor, child, or client in it since nothing of
+/// the process survives. The next start restores the tasks idle around
+/// their screens and starts the pinned ones.
+pub fn save_on_quit(runner: &RunnerSpec) -> SaveFn {
+  let runner = runner.clone();
+  Box::new(move |kernel: KernelSnapshot| {
+    let path = lockfile::saved_path(&runner).map_err(|err| err.to_string())?;
+    let mut snapshot = snap::Snapshot {
+      format: snap::FORMAT.to_string(),
+      version: snap::CURRENT_VERSION,
+      source_version: env!("CARGO_PKG_VERSION").to_string(),
+      pid: std::process::id(),
+      runner: snap::Runner {
+        kind: runner.kind.as_str().to_string(),
+        root: runner.root.to_string_lossy().into_owned(),
+      },
+      started_at: 0,
+      lock_fd: -1,
+      live_fd: -1,
+      listener_fd: -1,
+      next_task_id: kernel.next_task_id,
+      tasks: kernel.tasks,
+      connections: Vec::new(),
+    };
+    for task in &mut snapshot.tasks {
+      if let snap::TaskKind::Process(process) = &mut task.kind {
+        process.instance = None;
+      }
+    }
+    if let Some(dir) = path.parent() {
+      std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+    }
+    atomic_write_with(&path, |out| snap::encode(&snapshot, out))
+      .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+    log::info!("Saved the tasks into {}", path.display());
+    Ok(())
+  })
+}
+
+/// The config tasks, or the tasks saved by the last quit reconciled with
+/// the config. A saved file that cannot be read is dropped with a
+/// warning rather than keep the runner from starting.
 async fn register_tasks(
   config: &Config,
   pc: &TaskContext,
   runner: &RunnerSpec,
 ) -> anyhow::Result<Vec<String>> {
-  let path = lockfile::paused_path(runner)?;
+  let path = lockfile::saved_path(runner)?;
   let bytes = match std::fs::read(&path) {
     Ok(bytes) => bytes,
     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -334,12 +375,12 @@ async fn register_tasks(
   };
   let warnings = match snap::decode(&bytes) {
     Ok(snapshot) => {
-      log::info!("Resuming paused tasks from {}", path.display());
-      register_paused_tasks(config, pc, &snapshot).await?
+      log::info!("Restoring the saved tasks from {}", path.display());
+      register_saved_tasks(config, pc, &snapshot).await?
     }
     Err(err) => {
       register_config_tasks(config, pc).await?;
-      vec![format!("ignoring the paused tasks: {err:#}")]
+      vec![format!("ignoring the saved tasks: {err:#}")]
     }
   };
   std::fs::remove_file(&path)
@@ -478,19 +519,9 @@ pub async fn dispatch_connection(
   let mut closing = false;
   // An `upgrade` in flight: its request id and where its failure lands.
   let mut upgrade: Option<(u64, oneshot::Receiver<RpcError>)> = None;
-  // A `pause` in flight: its request id and where its outcome lands.
-  let mut pause: Option<(u64, oneshot::Receiver<Result<(), RpcError>>)> = None;
-  // A pause succeeded: the runner quits once its reply is written.
-  let mut quit_when_flushed = false;
   while !(closing && replies.is_empty()) {
     let upgrade_failed = async {
       match upgrade.as_mut() {
-        Some((_, rx)) => rx.await,
-        None => std::future::pending().await,
-      }
-    };
-    let pause_done = async {
-      match pause.as_mut() {
         Some((_, rx)) => rx.await,
         None => std::future::pending().await,
       }
@@ -570,24 +601,9 @@ pub async fn dispatch_connection(
             .await;
             return;
           }
-          Ok(RpcRequest::Pause {}) => {
-            if upgrade.is_some() || pause.is_some() {
-              let error = RpcError::new(codes::BUSY, "an upgrade or pause is in progress");
-              if sender.queue_ctl(CtlMsg::err(request.id, error)).is_err() {
-                return;
-              }
-              continue;
-            }
-            let (tx, rx) = oneshot::channel();
-            pause = Some((request.id, rx));
-            let ctx = ctx.clone();
-            tokio::spawn(async move {
-              let _ = tx.send(crate::upgrade::pause(ctx).await);
-            });
-          }
           Ok(RpcRequest::Upgrade { binary }) => {
-            if upgrade.is_some() || pause.is_some() {
-              let error = RpcError::new(codes::BUSY, "an upgrade or pause is in progress");
+            if upgrade.is_some() {
+              let error = RpcError::new(codes::BUSY, "an upgrade is in progress");
               if sender.queue_ctl(CtlMsg::err(request.id, error)).is_err() {
                 return;
               }
@@ -629,34 +645,10 @@ pub async fn dispatch_connection(
           return;
         }
       }
-      result = pause_done, if !frozen => {
-        let (id, _) = pause.take().expect("pause in flight");
-        let reply = match result {
-          Ok(Ok(())) => {
-            quit_when_flushed = true;
-            CtlMsg::ok(id, ok_result())
-          }
-          Ok(Err(error)) => CtlMsg::err(id, error),
-          Err(_) => CtlMsg::err(id, RpcError::internal("pause task ended")),
-        };
-        if sender.queue_ctl(reply).is_err() {
-          if quit_when_flushed {
-            ctx.pc.send(KernelCommand::Quit);
-          }
-          return;
-        }
-      }
       written = sender.flush(), if !frozen && !sender.pending().is_empty() => {
         if let Err(err) = written {
           log::debug!("Client connection closed: {err}");
-          if quit_when_flushed {
-            ctx.pc.send(KernelCommand::Quit);
-          }
           return;
-        }
-        if quit_when_flushed && sender.pending().is_empty() {
-          quit_when_flushed = false;
-          ctx.pc.send(KernelCommand::Quit);
         }
       }
       ctl = reg.ctl.recv() => match ctl {
@@ -794,9 +786,7 @@ async fn handle_rpc(
   req: RpcRequest,
 ) -> Result<Value, RpcError> {
   match req {
-    RpcRequest::Attach { .. }
-    | RpcRequest::Upgrade { .. }
-    | RpcRequest::Pause {} => {
+    RpcRequest::Attach { .. } | RpcRequest::Upgrade { .. } => {
       Err(RpcError::internal("handled by the connection loop"))
     }
 

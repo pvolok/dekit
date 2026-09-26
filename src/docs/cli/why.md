@@ -2,17 +2,13 @@
 title: dekit why
 cli: dekit why
 order: 5
-related: [cli/ls, start/targets, start/agents]
+related: [cli/ls, start/targets]
 ---
 
-Explains one task: its state, whether it is wanted (pinned itself, or
-required by a pinned task), whether every dependency is satisfied, a veto,
-who requires it, restart attempts, and each dependency with its own state.
-The target must match exactly one task.
-
-With `--json` the fields are `id`, `path`, `state`, `wanted`,
-`supported`, `vetoed`, `pinned`, `required_by`, `attempts`, and `deps`,
-where each dependency has `path`, `state`, `wanted`, and `satisfied`.
+Explains why one task is or is not running: its state, whether something
+wants it up, whether it is pinned or vetoed, who depends on it, restart
+attempts, and the state of each dependency. The target must match exactly
+one task.
 
 :::usage
 

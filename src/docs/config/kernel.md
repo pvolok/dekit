@@ -5,22 +5,20 @@ related: [config, cli/kernel, cli/runner/upgrade]
 order: 30
 ---
 
-The kernel is the binary that runs a project's runner. The `dekit` you type
-is only a client; the runner it starts may be another build, so a project
-can stay on the version it was written for while you upgrade your global
-install.
-
-Selection, in order:
-
-1. `kernel: npm` in `dekit.yaml` resolves the project's native dekit package (`@dekit/dekit-<platform>`) through Node, so the version in `package.json` is the one that runs.
-2. `kernel: {path: ...}` points at a binary, relative to the file.
-3. Otherwise the default registered with |cli/kernel/set-default|.
-4. Otherwise the binary you invoked.
+The kernel is the dekit binary that runs a project's runner. It can differ
+from the `dekit` you type, so a project can stay on its own version while
+you upgrade your global install.
 
 ```yaml
 kernel: npm
 ```
 
-|cli/kernel/status| shows all three: selected, running, and default. When
-the selection changes while a runner is up, |cli/runner/upgrade| switches
-it live.
+dekit picks the first of:
+
+1. `kernel: npm`: the `dekit` npm package installed in the project, found through Node.
+2. `kernel: {path: bin/dekit}`: a binary, relative to `dekit.yaml`.
+3. The default set with |cli/kernel/set-default|.
+4. The `dekit` you ran.
+
+|cli/kernel/status| shows which one is selected and which one is running.
+|cli/runner/upgrade| switches a running runner to the selected one.

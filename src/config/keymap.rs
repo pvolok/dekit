@@ -71,8 +71,8 @@ impl KeymapConfig {
       Action::ToggleFocus,
     );
 
-    s.keymap_add_p(KeyCode::Char('q').into(), Action::Quit);
-    s.keymap_add_p(KeyCode::Char('Q').into(), Action::ForceQuit);
+    s.keymap_add_p(KeyCode::Char('q').into(), Action::Detach);
+    s.keymap_add_p(KeyCode::Char('Q').into(), Action::Quit);
     s.keymap_add_p(KeyCode::Char('p').into(), Action::ShowCommandsMenu);
     s.keymap_add_p(Key::new(KeyCode::Down, KeyMods::NONE), Action::NextTask);
     s.keymap_add_p(
@@ -295,7 +295,7 @@ mod tests {
     let yaml = r#"
 keymap:
   tasks:
-    <q>: quit
+    <q>: detach
     <C-d>: {action: scroll-down, n: 3, unit: line}
     <C-u>: scroll-up
     <j>: null
@@ -306,7 +306,7 @@ keymap:
     let mut config = KeymapConfig::default();
     config.merge(&doc.root().as_obj().unwrap()).unwrap();
     let key = |s: &str| KeySpec::parse(s).unwrap().key();
-    assert_eq!(config.keymap_tasks.get(&key("<q>")), Some(&Action::Quit));
+    assert_eq!(config.keymap_tasks.get(&key("<q>")), Some(&Action::Detach));
     assert_eq!(
       config.keymap_tasks.get(&key("<C-d>")),
       Some(&Action::ScrollDown {

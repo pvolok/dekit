@@ -5,7 +5,7 @@ order: 5
 related: [cli/runner, cli/runner/list]
 ---
 
-Removes runtime records whose runner is gone. Records are discovery hints;
-a live runner is never touched.
+Removes the records of runners that are no longer running. Running runners
+are never touched.
 
 :::usage

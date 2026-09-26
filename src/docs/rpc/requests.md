@@ -26,8 +26,6 @@ the same.
   desc: "Params `{target, width, height, until_exit?}`; result `{}`, then the connection is in session mode."
 - cmd: upgrade
   desc: "Params `{binary}`; result `{version}` from the new binary once it has taken over."
-- cmd: pause
-  desc: "No params; result `{}`, then the runner quits."
 :::
 
 A target is written as on the command line (|start/targets|): a path, a
@@ -39,7 +37,7 @@ sent to a kernel; a malformed target is `bad_target`.
 
 Every mutation is one `command` request whose params are the command
 itself: a `command` tag plus its fields. Task-directed verbs (start, stop,
-down, kill, veto, restart, force-restart, remove, rename, duplicate) carry
+kill, veto, restart, force-restart, remove, rename, duplicate) carry
 a `target`, act on the matches atomically in the kernel, and reply with
 `{matched}`, the count of tasks acted on. A task registered concurrently
 is either fully included or fully excluded. Zero matches is a normal
@@ -48,8 +46,9 @@ reply, not an error.
 `add {target, label?, cmd: [..] | shell, cwd?, env?, deps?, tags?}`
 registers a process task at an exact path and starts it; `env` values of
 `null` unset a variable, each `deps` target must match at least one task
-(else `no_match`), and a taken path is `path_taken`. `quit` stops the
-runner and `batch {commands}` runs a list in order; both reply `{}`.
+(else `no_match`), and a taken path is `path_taken`. `quit {save?}` stops
+the runner, which first saves its tasks for its next start unless `save`
+is `false`, and `batch {commands}` runs a list in order; both reply `{}`.
 
 `why`, `screen`, and `attach` need exactly one task: `no_match` when the
 target matches none, `ambiguous` when it matches several, `no_screen` when

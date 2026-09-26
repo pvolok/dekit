@@ -5,9 +5,8 @@ order: 9
 related: [cli/stop, cli/rm, config/tasks]
 ---
 
-Like |cli/stop|, but the task is killed at once instead of getting its
-configured `stop` and the grace period: SIGKILL to the process group on
-Unix.
+Like |cli/stop|, but the task is killed at once (SIGKILL on Unix) instead of
+getting its configured `stop` and a grace period.
 
 :::usage
 

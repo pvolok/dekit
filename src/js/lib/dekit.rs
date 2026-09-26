@@ -62,7 +62,6 @@ macro_rules! command_fn {
 command_fn!(start, Start, true);
 command_fn!(run_fresh, ForceRestart, true);
 command_fn!(stop, Stop, false);
-command_fn!(down, Down, false);
 command_fn!(kill, Kill, false);
 command_fn!(veto, Veto, false);
 command_fn!(restart, Restart, true);
@@ -95,7 +94,6 @@ pub fn init(ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> {
   obj.def_fn_async("start", start)?;
   obj.def_fn_async("run", run_fresh)?;
   obj.def_fn_async("stop", stop)?;
-  obj.def_fn_async("down", down)?;
   obj.def_fn_async("kill", kill)?;
   obj.def_fn_async("veto", veto)?;
   obj.def_fn_async("restart", restart)?;

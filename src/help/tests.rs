@@ -437,21 +437,10 @@ fn usage_expands_from_clap() {
     MANIFEST,
   );
   let up = ir.topic("cli/up").unwrap();
-  assert_eq!(
-    up.summary,
-    "Start autostart tasks, or tasks matching a target"
-  );
+  assert_eq!(up.summary, "Start the runner if needed and the autostart tasks");
   match &up.blocks[1] {
-    Block::Code { text, .. } => assert_eq!(text, "dekit up [OPTIONS] [target]"),
+    Block::Code { text, .. } => assert_eq!(text, "dekit up [OPTIONS]"),
     other => panic!("expected the usage line, got {other:?}"),
-  }
-  match &up.blocks[2] {
-    Block::Fields { kind, items } => {
-      assert_eq!(*kind, FieldKind::CliFlag);
-      let keys: Vec<&str> = items.iter().map(|f| f.key.as_str()).collect();
-      assert_eq!(keys, ["[target]"], "global flags stay on the cli page");
-    }
-    other => panic!("expected flags, got {other:?}"),
   }
   let root = ir.topic("cli").unwrap();
   match &root.blocks[2] {

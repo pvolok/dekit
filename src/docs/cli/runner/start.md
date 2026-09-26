@@ -5,9 +5,11 @@ order: 1
 related: [cli/runner, cli/runner/stop, cli/runner/status]
 ---
 
-Starts the selected runner without attaching to it, and prints the config
-warnings it published while loading. A runner that is already running is
-left alone. Tasks with `autostart: true` come up with the runner.
+Starts the selected runner without attaching, and prints any config
+warnings. A runner that stopped with |cli/down| comes
+back with its saved tasks, and the ones you had started run again;
+otherwise the tasks with `autostart: true` start. A runner that is already
+running is left alone.
 
 :::usage
 

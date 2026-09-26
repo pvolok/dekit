@@ -62,11 +62,21 @@ struct Frozen {
   /// taken for this one.
   number: u64,
   /// Taken once answered, with the snapshot or the reason it failed.
-  reply: Option<tokio::sync::oneshot::Sender<Result<KernelSnapshot, String>>>,
+  reply: Option<FreezeReply>,
   waiting: HashSet<TaskId>,
   snapshots: HashMap<TaskId, snap::TaskKind>,
   deferred: Vec<KernelMessage>,
 }
+
+enum FreezeReply {
+  Rpc(tokio::sync::oneshot::Sender<Result<KernelSnapshot, String>>),
+  /// The freeze a quit began: the snapshot goes to the save callback,
+  /// then the runner quits.
+  Quit,
+}
+
+/// Writes the graph somewhere the next start finds it.
+pub type SaveFn = Box<dyn FnMut(KernelSnapshot) -> Result<(), String> + Send>;
 
 /// A command the kernel sent to a task, logged for the property harness.
 #[cfg(test)]
@@ -1328,6 +1338,17 @@ impl Graph {
       let _ = reply.send(Err("the runner is shutting down".to_string()));
       return;
     }
+    self.freeze(FreezeReply::Rpc(reply));
+  }
+
+  /// Freezes so the graph can be saved before the quit stops anything.
+  /// Returns the freeze number to time out on.
+  fn begin_quit_freeze(&mut self) -> u64 {
+    self.freeze(FreezeReply::Quit);
+    self.freezes
+  }
+
+  fn freeze(&mut self, reply: FreezeReply) {
     self.freezes += 1;
     let number = self.freezes;
     let ids: Vec<TaskId> = self.tasks.keys().copied().collect();
@@ -1347,8 +1368,8 @@ impl Graph {
         self.pending_effects.push_back((*id, effect));
       }
     }
-    let reply = match dead {
-      Some(id) => {
+    let reply = match (dead, reply) {
+      (Some(id), FreezeReply::Rpc(reply)) => {
         let task = &self.tasks[&id];
         let name = task_name(id, &task.space, task.path.as_ref());
         let _ = reply.send(Err(format!(
@@ -1356,7 +1377,12 @@ impl Graph {
         )));
         None
       }
-      None => Some(reply),
+      // A dead handler never answers; the quit goes on without saving.
+      (Some(id), FreezeReply::Quit) => {
+        log::warn!("Not saving the tasks: task {:?} has stopped", id);
+        None
+      }
+      (None, reply) => Some(reply),
     };
     self.frozen = Some(Frozen {
       number,
@@ -1365,7 +1391,6 @@ impl Graph {
       snapshots: HashMap::new(),
       deferred: Vec::new(),
     });
-    self.finish_freeze_if_complete();
   }
 
   fn on_task_frozen(
@@ -1382,21 +1407,36 @@ impl Graph {
       return;
     }
     frozen.snapshots.insert(task_id, snapshot);
-    self.finish_freeze_if_complete();
   }
 
-  fn finish_freeze_if_complete(&mut self) {
-    let Some(frozen) = self.frozen.as_mut() else {
-      return;
-    };
+  /// Answers a complete freeze. A quit's freeze hands its snapshot back
+  /// for saving instead.
+  fn finish_freeze_if_complete(&mut self) -> Option<KernelSnapshot> {
+    let frozen = self.frozen.as_mut()?;
     if !frozen.waiting.is_empty() {
-      return;
+      return None;
     }
-    let Some(reply) = frozen.reply.take() else {
-      return;
-    };
+    let reply = frozen.reply.take()?;
     let kinds = std::mem::take(&mut frozen.snapshots);
-    let _ = reply.send(Ok(self.snapshot(kinds)));
+    let snapshot = self.snapshot(kinds);
+    match reply {
+      FreezeReply::Rpc(reply) => {
+        let _ = reply.send(Ok(snapshot));
+        None
+      }
+      FreezeReply::Quit => Some(snapshot),
+    }
+  }
+
+  /// Whether the current freeze belongs to a quit.
+  fn freezing_for_quit(&self) -> bool {
+    match &self.frozen {
+      Some(frozen) => match frozen.reply {
+        Some(FreezeReply::Quit) => true,
+        Some(FreezeReply::Rpc(_)) | None => false,
+      },
+      None => false,
+    }
   }
 
   fn thaw(&mut self) -> Vec<KernelMessage> {
@@ -1516,7 +1556,13 @@ pub struct Kernel {
   receiver: UnboundedReceiver<KernelMessage>,
   /// What a thaw handed back, handled before anything newer.
   replay: VecDeque<KernelMessage>,
+  /// Set by a runner: a quit first freezes and saves the graph.
+  save: Option<SaveFn>,
 }
+
+/// How long a quit waits for every task to freeze before giving up on
+/// saving.
+const SAVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Kernel {
   pub fn new() -> Self {
@@ -1527,11 +1573,18 @@ impl Kernel {
       sender,
       receiver,
       replay: VecDeque::new(),
+      save: None,
     }
   }
 
   pub fn context(&self) -> TaskContext {
     self.graph.context()
+  }
+
+  /// Every quit then saves the graph first, so the next start brings the
+  /// tasks back.
+  pub fn save_on_quit(&mut self, save: SaveFn) {
+    self.save = Some(save);
   }
 
   #[cfg(test)]
@@ -1684,6 +1737,7 @@ impl Kernel {
 
   /// Returns true when the loop should exit at once (a second quit).
   fn dispatch(&mut self, msg: KernelMessage) -> bool {
+    let for_quit = self.graph.freezing_for_quit();
     let Some(frozen) = self.graph.frozen.as_mut() else {
       return self.dispatch_now(msg);
     };
@@ -1695,16 +1749,23 @@ impl Kernel {
       | KernelCommand::Query(..)
       | KernelCommand::Freeze(_)
       | KernelCommand::TaskFrozen(..)
+      | KernelCommand::FreezeTimeout(_)
       | KernelCommand::Thaw => (),
+      // The quit under way covers this one; replaying it after the save
+      // would read as a second quit and skip the graceful stop.
+      KernelCommand::Quit if for_quit => return false,
+      // Drops the save under way.
+      KernelCommand::QuitWithoutSave if for_quit => (),
       // Intent and delivery wait for the thaw (or die with this image).
       KernelCommand::Quit
+      | KernelCommand::QuitWithoutSave
       | KernelCommand::RegisterTask(..)
       | KernelCommand::Start(..)
       | KernelCommand::Stop(..)
       | KernelCommand::Kill(..)
       | KernelCommand::Restart(..)
       | KernelCommand::ForceRestart(..)
-      | KernelCommand::Down(..)
+      | KernelCommand::Unpin(..)
       | KernelCommand::Veto(..)
       | KernelCommand::Remove(..)
       | KernelCommand::SetLabel(..)
@@ -1723,7 +1784,27 @@ impl Kernel {
 
   fn dispatch_now(&mut self, msg: KernelMessage) -> bool {
     match msg.command {
-      KernelCommand::Quit => return self.graph.begin_quit(),
+      KernelCommand::Quit => {
+        if self.save.is_none() || self.graph.quitting {
+          return self.graph.begin_quit();
+        }
+        let number = self.graph.begin_quit_freeze();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+          tokio::time::sleep(SAVE_TIMEOUT).await;
+          let _ = sender.send(KernelMessage {
+            from: INIT_TASK_ID,
+            command: KernelCommand::FreezeTimeout(number),
+          });
+        });
+      }
+
+      KernelCommand::QuitWithoutSave => {
+        if self.graph.freezing_for_quit() {
+          self.replay.extend(self.graph.thaw());
+        }
+        return self.graph.begin_quit();
+      }
 
       KernelCommand::RegisterTask(registration, ack) => {
         let registered =
@@ -1785,7 +1866,7 @@ impl Kernel {
           let _ = ack.send(ids.len());
         }
       }
-      KernelCommand::Down(selector, ack) => {
+      KernelCommand::Unpin(selector, ack) => {
         let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
           self.graph.remove_edge(INIT_TASK_ID, *id);
@@ -1863,7 +1944,25 @@ impl Kernel {
       KernelCommand::TaskFrozen(number, snapshot) => {
         self.graph.on_task_frozen(msg.from, number, snapshot)
       }
+      KernelCommand::FreezeTimeout(number) => {
+        let timed_out = self.graph.freezing_for_quit()
+          && self.graph.frozen.as_ref().is_some_and(|f| f.number == number);
+        if timed_out {
+          log::warn!("Not saving the tasks: a task did not freeze in time");
+          self.replay.extend(self.graph.thaw());
+          return self.graph.begin_quit();
+        }
+      }
       KernelCommand::Thaw => self.replay.extend(self.graph.thaw()),
+    }
+    if let Some(snapshot) = self.graph.finish_freeze_if_complete() {
+      if let Some(save) = self.save.as_mut()
+        && let Err(err) = save(snapshot)
+      {
+        log::warn!("Not saving the tasks: {err}");
+      }
+      self.replay.extend(self.graph.thaw());
+      return self.graph.begin_quit();
     }
     false
   }

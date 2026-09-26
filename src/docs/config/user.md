@@ -5,11 +5,11 @@ related: [config, cli/attach]
 order: 50
 ---
 
-Presentation settings are yours, not a project's, so `dekit.yaml` rejects
-them. They live in the user config: `$XDG_CONFIG_HOME/dekit/config.yaml`
-(by default `~/.config/dekit/config.yaml`; `%APPDATA%\dekit\config.yaml`
-on Windows). Every runner reads it. A broken user config is reported as a
-warning and skipped rather than stopping a runner.
+Key bindings and TUI settings are yours, so they live in your user config
+rather than in `dekit.yaml`: `~/.config/dekit/config.yaml`
+(`$XDG_CONFIG_HOME/dekit/config.yaml` when that is set,
+`%APPDATA%\dekit\config.yaml` on Windows). A runner reads it when it
+starts. If the file has an error, dekit warns and skips that part.
 
 ```yaml
 tui:
@@ -37,21 +37,20 @@ keymap:
 - key: tui.tips.show
   type: boolean
   default: "true"
-  desc: Show the key tips line.
+  desc: Show the key hints at the bottom. `<?>` toggles them.
 - key: tui.zoom_tip
   type: boolean
   default: "true"
-  desc: Show the hint about zooming.
+  desc: Show the hint line while a task is zoomed.
 :::
 
 ## Keymap
 
-`keymap` has three groups: `tasks` (the task list has focus), `term` (the
-task's terminal has focus), and `term_copy` (copy mode). Each maps a key
-to an action: a bare name for actions without arguments, or an object with
-`action` and its fields. `null` unbinds a key, and `reset: true` at the
-top of a group drops the defaults before yours apply. Keys are written as
-`<q>`, `<C-a>`, `<M-1>`, `<Down>`, `<F5>`.
+`keymap` has three groups: `tasks` when the task list has focus, `term`
+when the task's terminal has focus, and `term_copy` in copy mode. Each
+maps a key to an action: a name, or an object with `action` and its
+fields. `null` removes a binding, and `reset: true` drops a group's
+defaults. Keys look like `<q>`, `<C-a>`, `<M-1>`, `<Down>`, `<F5>`.
 
 Default bindings in `tasks`:
 
@@ -59,7 +58,7 @@ Default bindings in `tasks`:
 - cmd: <C-a>
   desc: toggle-focus, between the task list and the terminal (in every group)
 - cmd: <q>, <Q>
-  desc: quit, force-quit
+  desc: detach, quit
 - cmd: <j> <Down>, <k> <Up>
   desc: next-task, prev-task
 - cmd: <M-1> ... <M-8>
@@ -89,8 +88,8 @@ Default bindings in `tasks`:
 :::
 
 In `term_copy`: `<Esc>` copy-mode-leave, `<v>` copy-mode-end, `<c>`
-copy-mode-copy, and `<h>` `<j>` `<k>` `<l>` or the arrows copy-mode-move.
-The scroll bindings work there too. Other actions available to a binding:
-focus-tasks, focus-term, restart-all, force-restart-all, veto-task,
-close-current-modal, quit-or-ask, and `{action: command, command: {...}}`
-to run any kernel command (|config/hooks|).
+copy-mode-copy, `<h>` `<j>` `<k>` `<l>` or the arrows copy-mode-move, and
+the same scroll keys. Other actions: focus-tasks, focus-term, restart-all,
+force-restart-all, veto-task, close-current-modal, quit-or-ask, and
+`{action: command, command: {...}}` to run any command from
+|config/hooks|.

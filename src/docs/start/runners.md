@@ -7,36 +7,35 @@ order: 30
 
 Every project has its own runner: a separate process that owns the
 project's tasks, their terminals, and their logs, and outlives the
-terminal you started it from. Clients, whether `dekit`, the TUI, or a
-script, connect to it over a socket. Projects are independent: each runner
-runs the kernel selected for its project (|config/kernel|), so two
-projects can be on different dekit versions.
+terminal you started it from. The CLI, the TUI, and scripts connect to it
+over a socket. Each runner runs the dekit version selected for its project
+(|config/kernel|).
 
 ## Finding the project
 
-A command looks upward from the current directory for `dekit.yaml`;
-failing that, for a git repository, then for a `package.json`. A
-`dekit.yaml` wins even when another marker is closer. `-C <dir>` names the
-root explicitly. The first command that needs a runner starts it;
-|cli/runner/start| starts one without doing anything else.
+A command looks upward from the current directory for `dekit.yaml`, then
+for a git repository, then for a `package.json`. A `dekit.yaml` wins even
+when another marker is closer. `-C <dir>` names the root explicitly.
+
+Commands that start tasks (`up`, `start`, `restart`, `run`, `spawn`,
+`attach`) start the runner when it is not running;
+|cli/runner/start| starts it without doing anything else.
 
 ## The host runner
 
 Tasks that are yours rather than a project's, such as a database you
-always want up or an editor server, belong to the host runner. Its config
-is `~/.config/dekit/host/dekit.yaml`, and it is always addressed
-explicitly: `host::` in a target, or `host` on a `dekit runner` verb.
-Outside a project dekit reports an error rather than quietly using it, so
-a bare `down` cannot reach machine-wide tasks by accident.
+always want up, belong to the host runner. Its config is
+`~/.config/dekit/host/dekit.yaml`. Name it with `host::` in a target or
+`host` on `dekit down` or a `dekit runner` command. Outside a project dekit
+reports an error instead of falling back to it, so `down` cannot stop
+machine-wide tasks by accident.
 
-## Records
+## Stopping a runner
 
-A running runner publishes a record with its pid, socket, root, version,
-and kernel, under `$XDG_RUNTIME_DIR/dekit` when that variable is set and
-otherwise in the user data directory (`~/.local/share/dekit`). Records
-are discovery hints: |cli/runner/list| shows them, |cli/runner/clean|
-drops stale ones, and a runner whose record is stale is simply started
-again.
+`dekit down` stops the runner and saves its tasks and screens; the next
+start brings them back. `dekit runner stop` stops it without saving, so
+the next start begins from `dekit.yaml`.
 
-Script tasks learn their runner from `DEKIT_RUNNER_ROOT` and
-`DEKIT_RUNNER_KIND` in their environment.
+Script tasks (`script:` in `dekit.yaml`) get `DEKIT_RUNNER_ROOT` and
+`DEKIT_RUNNER_KIND` in their environment, so the script talks to the runner
+that started it.

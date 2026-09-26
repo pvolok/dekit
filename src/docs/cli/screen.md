@@ -2,14 +2,12 @@
 title: dekit screen
 cli: dekit screen
 order: 6
-related: [cli/attach, cli/ls, start/agents]
+related: [cli/attach, cli/ls]
 ---
 
-Prints a task's current screen as text with its colors, the same cells the
-TUI shows, and resets the terminal attributes afterwards. Use it in a pipe
-or from an agent to read what a task is showing without attaching. With
-`--json` the result is `{"screen": "..."}`. The target must match exactly
-one task.
+Prints what a task's terminal shows right now, with colors, without
+attaching. Handy in a pipe or for an agent. With `--json` the result is
+`{"screen": "..."}`. The target must match exactly one task.
 
 :::usage
 

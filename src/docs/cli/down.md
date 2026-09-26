@@ -2,21 +2,25 @@
 title: dekit down
 cli: dekit down
 order: 3
-related: [cli/up, cli/stop, start/targets]
+related: [cli/up, cli/stop, cli/runner/stop, start/targets]
 ---
 
-Unpins the matching tasks; with no target, every task in the project. A
-task that nothing needs any more stops; one that a pinned dependent still
-needs keeps running. Nothing is forced: |cli/veto| holds a task down and
-|cli/kill| ends it now.
+The workday end verb. It stops every task and the project's runner, and
+saves the tasks, their screens, and which ones you had started for the
+next |cli/up|. Running it when the runner is not running does nothing.
+A runner that crashed or was killed saved nothing, and one stopped with
+|cli/runner/stop| saves nothing, so its next start begins from
+`dekit.yaml`.
 
-Bare `down` is the end-of-day counterpart of |cli/up|. It does not stop
-the runner; that is |cli/runner/stop|.
+`down` takes a runner, not a target: `host`, `project`, or a path to a
+project root (|cli/runner|). To stop tasks and keep the runner, use
+|cli/stop|; `dekit stop '**'` stops all of them. How `stop` differs from
+`veto` and `kill` is on |start/targets|.
 
 :::usage
 
 ```sh
 dekit down
-dekit down +ci
-dekit down 'services/*'
+dekit down ~/src/api
+dekit down host
 ```

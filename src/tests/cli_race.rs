@@ -10,9 +10,11 @@ use common::{TestRunner, TmpDir, stderr_of};
 fn assert_dir_has_no_lock(runtime: &Path) {
   let dekit_dir = runtime.join("dekit");
   if let Ok(entries) = std::fs::read_dir(dekit_dir) {
+    // A quitting runner leaves its saved tasks there on purpose.
     let leftover: Vec<_> = entries
       .filter_map(|e| e.ok())
       .map(|e| e.file_name().to_string_lossy().into_owned())
+      .filter(|name| name != "saved")
       .collect();
     assert!(
       leftover.is_empty(),
