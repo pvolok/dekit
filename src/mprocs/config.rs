@@ -330,6 +330,13 @@ impl ProcConfig {
               .map(|(k, v)| {
                 let v = match v.raw() {
                   Value::Null => Ok(None),
+                  Value::String(v) if v.starts_with("<CONFIG_DIR>") => {
+                    Ok(Some(
+                      resolve_config_path(v, ctx)?
+                        .to_string_lossy()
+                        .into_owned(),
+                    ))
+                  }
                   Value::String(v) => Ok(Some(v.to_owned())),
                   _ => Err(v.error_at("Expected string or null")),
                 };
@@ -419,4 +426,44 @@ impl ServerConfig {
 pub enum CmdConfig {
   Cmd { cmd: Vec<String> },
   Shell { shell: String },
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn env_resolves_config_dir_prefix() {
+    let yaml = r#"
+procs:
+  test:
+    cmd: ["echo"]
+    env:
+      FOO_DIR: <CONFIG_DIR>/foo/bar
+      ROOT: <CONFIG_DIR>
+      PLAIN: ./relative
+      NOT_PREFIX: prefix/<CONFIG_DIR>
+      EMPTY: ''
+      REMOVE: null
+"#;
+    let value = serde_yaml::from_str(yaml).unwrap();
+    let ctx = ConfigContext {
+      path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+    };
+    let config =
+      Config::from_value(&value, &ctx, &Settings::default()).unwrap();
+    let env = config.procs[0].env.as_ref().unwrap();
+    let config_path = dunce::canonicalize(&ctx.path).unwrap();
+    let config_dir = config_path.parent().unwrap();
+
+    assert_eq!(
+      env["FOO_DIR"],
+      Some(config_dir.join("foo/bar").to_string_lossy().into_owned())
+    );
+    assert_eq!(PathBuf::from(env["ROOT"].as_ref().unwrap()), config_dir);
+    assert_eq!(env["PLAIN"].as_deref(), Some("./relative"));
+    assert_eq!(env["NOT_PREFIX"].as_deref(), Some("prefix/<CONFIG_DIR>"));
+    assert_eq!(env["EMPTY"].as_deref(), Some(""));
+    assert_eq!(env["REMOVE"], None);
+  }
 }

@@ -139,7 +139,8 @@ settings in the _global_ config.
     config is located.
   - **env**: _object<string, string|null>_ - Set env variables. Object keys are
     variable names. Assign variable to null, to clear variables inherited from
-    parent process.
+    parent process. Prefix `<CONFIG_DIR>` in values will be replaced with the
+    path of the directory where the config is located.
   - **add_path**: _string|array<string>_ - Add entries to the _PATH_
     environment variable.
   - **autostart**: _bool_ - Start process when mprocs starts. Default: _true_.

@@ -159,6 +159,13 @@ fn parse_task_settings_unchecked(
     p.cwd = Some(cx.resolve_path(cwd.as_str()?).into_os_string());
   }
   p.env = obj.optional("env", cx)?;
+  if let Some(env) = &mut p.env {
+    for value in env.values_mut().flatten() {
+      if value.starts_with("<CONFIG_DIR>") {
+        *value = cx.resolve_path(value).to_string_lossy().into_owned();
+      }
+    }
+  }
   p.add_path = obj.optional("add_path", cx)?;
   p.autostart = obj.optional("autostart", cx)?;
   p.autorestart = obj.optional("autorestart", cx)?;
@@ -362,6 +369,35 @@ cwd: /tmp
       Err(e) => e.to_string(),
     };
     assert!(err.contains("unknown field 'cmd'"), "err={err}");
+  }
+
+  #[test]
+  fn env_resolves_config_dir_prefix() {
+    let yaml = r#"
+env:
+  FOO_DIR: <CONFIG_DIR>/foo/bar
+  ROOT: <CONFIG_DIR>
+  PLAIN: ./relative
+  NOT_PREFIX: prefix/<CONFIG_DIR>
+  EMPTY: ''
+  REMOVE: null
+"#;
+    let value = serde_yaml::from_str(yaml).unwrap();
+    let cx = CfgCx::new(PathBuf::from("project"));
+    let doc = CfgDoc::from_value(value, &cx).unwrap();
+    let config =
+      parse_task_settings(&doc.root().as_obj().unwrap(), &cx).unwrap();
+    let env = config.env.unwrap();
+
+    assert_eq!(
+      env["FOO_DIR"],
+      Some(cx.config_dir.join("foo/bar").to_string_lossy().into_owned())
+    );
+    assert_eq!(PathBuf::from(env["ROOT"].as_ref().unwrap()), cx.config_dir);
+    assert_eq!(env["PLAIN"].as_deref(), Some("./relative"));
+    assert_eq!(env["NOT_PREFIX"].as_deref(), Some("prefix/<CONFIG_DIR>"));
+    assert_eq!(env["EMPTY"].as_deref(), Some(""));
+    assert_eq!(env["REMOVE"], None);
   }
 
   #[test]
