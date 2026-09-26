@@ -4,6 +4,8 @@ mod fs;
 mod log;
 mod path;
 mod process;
+// Being redesigned; only in debug builds until then.
+#[cfg(debug_assertions)]
 mod tui;
 
 use rquickjs::{Ctx, Object, function::This, object::Accessor};
@@ -18,6 +20,7 @@ pub fn init(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
   register_lazy(&obj, "env", env::init)?;
   register_lazy(&obj, "dekit", dekit::init)?;
   register_lazy(&obj, "process", process::init)?;
+  #[cfg(debug_assertions)]
   register_lazy(&obj, "tui", tui::init)?;
 
   ctx.globals().set("std", obj)?;

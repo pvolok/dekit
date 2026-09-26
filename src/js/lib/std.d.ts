@@ -95,7 +95,7 @@ declare const std: {
     readonly pid: number;
   };
 
-  /** Terminal UI API (uses alternate screen + raw input). */
+  /** Terminal UI API (uses alternate screen + raw input). Debug builds only. */
   readonly tui: {
     /** Open terminal UI mode. Safe to call multiple times. */
     open(): void;

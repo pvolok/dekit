@@ -1,35 +1,37 @@
 ---
 title: JavaScript
 summary: Run scripts on dekit's embedded runtime, with the std API for files, processes, the terminal, and the runner.
-related: [js/dekit, js/fs, js/tui, config/tasks]
+related: [js/dekit, js/fs, config/tasks]
 ---
 
-dekit embeds a JavaScript engine. `dekit script.js` runs a file as an ES
-module, and a task with `script:` in `dekit.yaml` runs one under the
-runner (|config/tasks|). Scripts see one global, `std`, whose modules are
-documented in this section; there is no Node.js API and no `node_modules`
-resolution. `std.dekit` drives the runner the script belongs to.
+dekit has a built-in JavaScript engine. `dekit script.js` runs a file as
+an ES module, and a task with `script:` in `dekit.yaml` runs one under the
+runner (|config/tasks|). The module exports a `main` function; dekit calls
+it and waits for the promise it returns. Scripts see one global, `std`,
+described in this section. There is no Node.js API.
 
 ```js
-const result = await std.process.exec("git", ["status", "--short"]);
-if (result.stdout.trim() !== "") {
-  std.warn("working tree is dirty");
+export async function main() {
+  const result = await std.process.exec("git", ["status", "--short"]);
+  if (result.stdout.trim() !== "") {
+    std.warn("working tree is dirty");
+  }
+  await std.dekit.start("+workers");
 }
-await std.dekit.start("+workers");
 ```
 
 ## Logging
 
 :::fields kind=js
 - key: std.log
-  signature: "(...args: unknown[]) => void"
-  desc: Log a message to stderr at info level.
+  signature: "(...args: string[]) => void"
+  desc: Print the strings to stderr, separated by spaces.
 - key: std.warn
-  signature: "(...args: unknown[]) => void"
-  desc: Log a message to stderr at warn level.
+  signature: "(...args: string[]) => void"
+  desc: Print to stderr, like `std.log`.
 - key: std.error
-  signature: "(...args: unknown[]) => void"
-  desc: Log a message to stderr at error level.
+  signature: "(...args: string[]) => void"
+  desc: Print to stderr, like `std.log`.
 :::
 
 :::callout warning
