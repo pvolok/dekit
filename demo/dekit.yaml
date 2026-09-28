@@ -1,0 +1,59 @@
+tasks:
+  db:
+    script: scripts/db.js
+    ready: {log: "ready to accept connections"}
+    tags: [backend]
+
+  cache:
+    script: scripts/cache.js
+    ready: {log: "Ready to accept connections"}
+    tags: [backend]
+
+  migrate:
+    type: job
+    script: scripts/migrate.js
+    deps: [db]
+    tags: [backend]
+
+  api:
+    script: scripts/api.js
+    deps: [db, cache, migrate]
+    ready: {log: "listening on"}
+    env: {PORT: "4000"}
+    autorestart: on-failure
+    autostart: true
+    tags: [backend]
+
+  worker:
+    script: scripts/worker.js
+    deps: [db, cache, migrate]
+    autorestart: always
+    autostart: true
+    tags: [backend]
+
+  web:
+    script: scripts/web.js
+    deps: [api]
+    ready: {log: "ready in"}
+    env: {PORT: "5173"}
+    autostart: true
+    tags: [frontend]
+
+  lint:
+    type: job
+    script: scripts/lint.js
+    autostart: true
+    tags: [check]
+
+  test:
+    type: job
+    script: scripts/test.js
+    deps: [migrate]
+    autostart: true
+    tags: [check]
+
+  e2e:
+    type: job
+    script: scripts/e2e.js
+    deps: [web]
+    tags: [check]
