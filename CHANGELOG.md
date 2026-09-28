@@ -1,5 +1,7 @@
 ## Unreleased
 
+## 0.10.0 - 2026-09-28
+
 First release of dekit, the next version of mprocs under a new name. It
 keeps the mprocs terminal UI and adds a runner that keeps tasks running
 after you close the terminal, a CLI to control them, dependencies and
