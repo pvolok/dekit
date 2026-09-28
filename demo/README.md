@@ -22,3 +22,22 @@ seconds so a recording looks alive. For still screenshots, start the
 runner with `DEMO_STILL=1 dekit up` and the services stop after their
 first screen. Your own `~/.config/dekit/config.yaml` also changes the TUI;
 `XDG_CONFIG_HOME=/nonexistent dekit up` leaves it out.
+
+## Screenshots
+
+`screenshots.sh` renders the two pictures of the README into `img/` at the
+repo root: `dekit-tui.png`, the TUI with `api` selected, and
+`dekit-up.png`, `dekit up` followed by `dekit ls`. Both are PNGs at twice
+the terminal's size, the same bytes on every run. It needs Python 3 and
+[freeze](https://github.com/charmbracelet/freeze), and runs the `dekit`
+named by `DEKIT` (default: `dekit` on PATH):
+
+```sh
+cargo build -p dekit --locked
+DEKIT=target/debug/dekit demo/screenshots.sh
+```
+
+It starts the demo in still mode without your config or saved tasks,
+waits for the tasks to settle, and stops the runner with
+`dekit runner stop` at the end, also when it fails. It refuses to run
+while a runner for `demo/` is already up.

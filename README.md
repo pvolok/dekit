@@ -17,7 +17,7 @@ databases and workers, in development and in production.
 - A full CLI for humans and agents
 - Built-in JavaScript for writing scripts
 
-<img src="img/mprocs1.png" alt="dekit terminal UI" width="900" />
+<img src="img/dekit-tui.png" alt="dekit terminal UI" width="900" />
 
 ## Install
 
@@ -49,6 +49,8 @@ dekit ls        # see what is running
 dekit attach    # open the terminal UI
 dekit down      # stop for the day; `dekit up` brings everything back
 ```
+
+<img src="img/dekit-up.png" alt="dekit up and dekit ls in a terminal" width="360" />
 
 The tasks keep running after you close the terminal. `dekit help` shows the
 docs in your terminal.
