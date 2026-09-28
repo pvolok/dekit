@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::anyhow;
 use clap::{Arg, Command as ClapCommand};
 use rquickjs::CatchResultExt;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
   attach_client::{AttachEnd, client_main},
@@ -100,6 +101,7 @@ fn print_why(result: serde_json::Value, json: bool) -> anyhow::Result<()> {
   }
   if !why.deps.is_empty() {
     println!("  deps:");
+    let pad = why.deps.iter().map(|d| d.path.width()).max().unwrap_or(0) + 2;
     for dep in &why.deps {
       let mut notes = Vec::new();
       if !dep.wanted {
@@ -113,7 +115,13 @@ fn print_why(result: serde_json::Value, json: bool) -> anyhow::Result<()> {
       } else {
         format!(" ({})", notes.join(", "))
       };
-      println!("    {}\t{}{}", dep.path, human_state(&dep.state), notes);
+      println!(
+        "    {}{}{}{}",
+        dep.path,
+        " ".repeat(pad - dep.path.width()),
+        human_state(&dep.state),
+        notes
+      );
     }
   }
   Ok(())
