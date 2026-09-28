@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
@@ -24,6 +24,10 @@ use super::task_path::TaskPath;
 pub struct TaskId(pub usize);
 
 pub const INIT_TASK_ID: TaskId = TaskId(0);
+
+/// How long a stopping task may take before it is hard-killed, unless the
+/// task sets its own.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub trait Task: Send + 'static {
   fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects);
@@ -97,6 +101,8 @@ impl fmt::Debug for TaskCmd {
 pub struct ExitInfo {
   pub code: Option<i32>,
   pub signal: Option<i32>,
+  /// Stopped because it was not ready within its ready timeout.
+  pub ready_timeout: bool,
 }
 
 impl ExitInfo {
@@ -104,6 +110,7 @@ impl ExitInfo {
     Self {
       code: Some(code),
       signal: None,
+      ready_timeout: false,
     }
   }
 
@@ -111,6 +118,7 @@ impl ExitInfo {
     Self {
       code: None,
       signal: Some(signal),
+      ready_timeout: false,
     }
   }
 
@@ -119,16 +127,20 @@ impl ExitInfo {
     Self {
       code: None,
       signal: None,
+      ready_timeout: false,
     }
   }
 
   pub fn success(&self) -> bool {
-    self.code == Some(0)
+    self.code == Some(0) && !self.ready_timeout
   }
 }
 
 impl fmt::Display for ExitInfo {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if self.ready_timeout {
+      return write!(f, "ready-timeout");
+    }
     match (self.code, self.signal) {
       (Some(code), _) => write!(f, "exited:{}", code),
       (None, Some(signal)) => write!(f, "signal:{}", signal),
@@ -144,8 +156,8 @@ pub enum TaskState {
   Running,
   Ready,
   Stopping,
-  /// Crashed; waiting out the restart delay.
-  Backoff,
+  /// Ended with this exit; waiting out the restart delay.
+  Backoff(ExitInfo),
   /// Ran to successful completion (jobs). Satisfies dependents.
   Done(ExitInfo),
   /// Exited and will not be brought back automatically.
@@ -161,16 +173,17 @@ impl TaskState {
       | TaskState::Ready
       | TaskState::Stopping => true,
       TaskState::Idle
-      | TaskState::Backoff
+      | TaskState::Backoff(_)
       | TaskState::Done(_)
       | TaskState::Exited(_) => false,
     }
   }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TaskKind {
   /// Long-running; satisfies dependents while `Ready`.
+  #[default]
   Service,
   /// Run-to-completion; satisfies dependents once `Done`.
   Job,
@@ -180,8 +193,18 @@ pub enum TaskKind {
 pub enum ReadyMode {
   /// Ready as soon as the task reports started.
   Immediate,
-  /// Ready only when the task reports it (readiness probe).
-  Reported,
+  /// Ready only when the task reports it (readiness probe); not ready
+  /// `timeout` after starting fails the start.
+  Reported { timeout: Option<Duration> },
+}
+
+impl ReadyMode {
+  pub fn timeout(self) -> Option<Duration> {
+    match self {
+      ReadyMode::Immediate => None,
+      ReadyMode::Reported { timeout } => timeout,
+    }
+  }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,8 +302,9 @@ pub struct TaskHandle {
   pub killed: bool,
   pub attempts: u32,
   pub last_start: Option<Instant>,
-  /// When the running stop grace or backoff delay ends; cleared with the
-  /// epoch bump that invalidates the timer.
+  /// When the timer on the current state (stop grace, kill wait, backoff
+  /// delay, ready timeout) runs out; cleared when the state changes or
+  /// the timer runs out.
   pub deadline: Option<Instant>,
 
   /// Cached reconciler state, maintained incrementally.
@@ -294,9 +318,17 @@ pub struct TaskHandle {
   /// Count of active tasks that require this one (the shutdown gate).
   pub active_dependents: u32,
 
+  /// Not ready within the ready timeout: the stop under way lands as a
+  /// failed exit. Only set in `Stopping`.
+  pub start_failed: bool,
+  /// Started when the tasks were last saved: `up` starts it again. Only
+  /// on an unpinned task; any verb that pins or unpins it clears it.
+  pub saved_pin: bool,
+
   pub kind: TaskKind,
   pub ready: ReadyMode,
   pub restart: RestartMode,
+  pub stop_timeout: Duration,
 
   pub space: TaskSpaceId,
   pub path: Option<TaskPath>,
@@ -317,9 +349,27 @@ impl TaskHandle {
         | TaskState::Running
         | TaskState::Ready
         | TaskState::Stopping
-        | TaskState::Backoff
+        | TaskState::Backoff(_)
         | TaskState::Exited(_) => false,
       },
+    }
+  }
+
+  /// Where an exit lands, as the task is configured: a job's success is
+  /// done; otherwise it backs off if the restart mode retries it.
+  pub fn exit_state(&self, info: ExitInfo) -> TaskState {
+    if self.kind == TaskKind::Job && info.success() {
+      return TaskState::Done(info);
+    }
+    let retry = match self.restart {
+      RestartMode::Never => false,
+      RestartMode::OnFailure => !info.success(),
+      RestartMode::Always => true,
+    };
+    if retry {
+      TaskState::Backoff(info)
+    } else {
+      TaskState::Exited(info)
     }
   }
 }
@@ -328,11 +378,16 @@ pub struct TaskDef {
   pub kind: TaskKind,
   pub ready: ReadyMode,
   pub restart: RestartMode,
+  /// How long a stop may take before the hard kill.
+  pub stop_timeout: Duration,
   /// Resolved at registration; each selector must match at least one
   /// registered task, so the graph stays acyclic by construction.
   pub deps: Vec<TaskSelector>,
-  /// aka autostart
+  /// Pinned at registration, so it starts at once.
   pub pinned: bool,
+  /// Registered unpinned, and `up` pins it (see `TaskHandle::saved_pin`).
+  /// Never together with `pinned`.
+  pub saved_pin: bool,
   pub space: TaskSpaceId,
   pub path: Option<TaskPath>,
   pub label: Option<String>,
@@ -346,8 +401,10 @@ impl Default for TaskDef {
       kind: TaskKind::Service,
       ready: ReadyMode::Immediate,
       restart: RestartMode::Never,
+      stop_timeout: STOP_TIMEOUT,
       deps: Vec::new(),
       pinned: false,
+      saved_pin: false,
       space: TaskSpaceId::default_space(),
       path: None,
       label: None,

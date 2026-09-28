@@ -8,7 +8,8 @@ related: [cli/run, cli/rm, config/tasks]
 Adds a task at a path and starts it, without touching `dekit.yaml`. The
 command comes after `--`. The task gets the `dynamic` tag, so
 `dekit rm +dynamic` removes every task added this way. It survives
-|cli/down| like any other task.
+|cli/down| like any other task. It takes the project's `defaults`
+(|config|) except `autorestart`: it is never started again by itself.
 
 :::usage
 

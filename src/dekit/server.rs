@@ -35,9 +35,9 @@ use crate::{
     task_path::TaskPath,
   },
   protocol::{
-    ActResult, ConnReceiver, ConnSender, CtlMsg, RpcError, RpcRequest,
-    RpcState, RpcTaskInfo, RpcWhy, RpcWhyDep, ScreenResult, TaskListResult,
-    codes, ctl::Hello, ok_result, server_hello,
+    ActResult, ConnReceiver, ConnSender, CtlMsg, QuitResult, RpcError,
+    RpcRequest, RpcState, RpcTaskInfo, RpcWhy, RpcWhyDep, ScreenResult,
+    TaskListResult, codes, ctl::Hello, ok_result, server_hello,
   },
   runner::{
     RunnerSpec, atomic_write_with,
@@ -45,7 +45,7 @@ use crate::{
     socket::{ServerSocket, bind_server_socket},
   },
   target::Target,
-  task::config_tasks::{register_config_tasks, register_saved_tasks},
+  task::config_tasks::{register_idle_config_tasks, register_saved_tasks},
   term::Size,
   upgrade::snapshot as snap,
 };
@@ -317,7 +317,7 @@ async fn run_locked(
 /// What a quitting runner writes for its next start: every task and its
 /// screen, with no descriptor, child, or client in it since nothing of
 /// the process survives. The next start restores the tasks idle around
-/// their screens and starts the pinned ones.
+/// their screens; `up` starts the ones that were started.
 pub fn save_on_quit(runner: &RunnerSpec) -> SaveFn {
   let runner = runner.clone();
   Box::new(move |kernel: KernelSnapshot| {
@@ -366,7 +366,7 @@ async fn register_tasks(
   let bytes = match std::fs::read(&path) {
     Ok(bytes) => bytes,
     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-      register_config_tasks(config, pc).await?;
+      register_idle_config_tasks(config, pc).await?;
       return Ok(Vec::new());
     }
     Err(err) => {
@@ -379,7 +379,7 @@ async fn register_tasks(
       register_saved_tasks(config, pc, &snapshot).await?
     }
     Err(err) => {
-      register_config_tasks(config, pc).await?;
+      register_idle_config_tasks(config, pc).await?;
       vec![format!("ignoring the saved tasks: {err:#}")]
     }
   };
@@ -721,7 +721,7 @@ pub(crate) fn task_state(state: TaskState) -> RpcState {
     TaskState::Running => ("running", None),
     TaskState::Ready => ("ready", None),
     TaskState::Stopping => ("stopping", None),
-    TaskState::Backoff => ("backoff", None),
+    TaskState::Backoff(info) => ("backoff", Some(info)),
     TaskState::Done(info) => ("done", Some(info)),
     TaskState::Exited(info) => ("exited", Some(info)),
   };
@@ -729,6 +729,9 @@ pub(crate) fn task_state(state: TaskState) -> RpcState {
     state: token.to_string(),
     exit_code: info.and_then(|i| i.code),
     signal: info.and_then(|i| i.signal),
+    reason: info
+      .filter(|i| i.ready_timeout)
+      .map(|_| "ready_timeout".to_string()),
   }
 }
 
@@ -815,6 +818,10 @@ async fn handle_rpc(
             .map_err(RpcError::internal)
         }
         CommandResult::None => Ok(ok_result()),
+        CommandResult::Quitting(within) => serde_json::to_value(QuitResult {
+          stop_within_ms: within.as_millis() as u64,
+        })
+        .map_err(RpcError::internal),
       }
     }
 
@@ -850,6 +857,7 @@ async fn handle_rpc(
         supported: explain.supported,
         vetoed: explain.vetoed,
         pinned: explain.pinned,
+        saved_pin: explain.saved_pin,
         required_by: explain.required_by,
         deps: explain
           .deps
@@ -888,6 +896,26 @@ mod tests {
     kernel::kernel::Kernel,
     protocol::{Request, client_handshake},
   };
+
+  /// A task backing off says why, as an exited one does.
+  #[test]
+  fn backoff_carries_the_exit_on_the_wire() {
+    use crate::kernel::task::ExitInfo;
+    let state = |state| serde_json::to_value(task_state(state)).unwrap();
+    assert_eq!(
+      state(TaskState::Backoff(ExitInfo {
+        ready_timeout: true,
+        ..ExitInfo::code(0)
+      })),
+      serde_json::json!({
+        "state": "backoff", "exit_code": 0, "reason": "ready_timeout"
+      })
+    );
+    assert_eq!(
+      state(TaskState::Backoff(ExitInfo::signal(9))),
+      serde_json::json!({"state": "backoff", "signal": 9})
+    );
+  }
 
   #[tokio::test]
   async fn answers_concurrent_requests_by_id() {

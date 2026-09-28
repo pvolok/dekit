@@ -94,7 +94,7 @@ impl AppEvent {
             Command::Kill {
               target: Target::glob("**"),
             },
-            Command::Quit { save: true },
+            Command::Down,
           ],
         },
       },

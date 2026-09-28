@@ -58,61 +58,62 @@ impl UnixProcess {
       })
       .collect();
 
+    let mut empty_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::sigemptyset(&mut empty_set) };
+
+    let mut master_fd = -1;
+    let pid = UnixProcessesWaiter::fork(
+      || unsafe {
+        // Some args are *mut on some BSD variants.
+        #[allow(clippy::unnecessary_mut_passed)]
+        let pid = libc::forkpty(
+          &mut master_fd,
+          null_mut(),
+          null_mut(),
+          &mut size.into(),
+        );
+
+        if pid == 0 {
+          for signo in &[
+            libc::SIGCHLD,
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGALRM,
+          ] {
+            libc::signal(*signo, libc::SIG_DFL);
+          }
+          libc::pthread_sigmask(libc::SIG_SETMASK, &empty_set, null_mut());
+
+          if let Some(cwd) = &cwd_c {
+            if libc::chdir(cwd.as_ptr()) != 0 {
+              libc::_exit(1);
+            }
+          }
+
+          for (key, value) in &env_c {
+            match value {
+              Some(v) => {
+                libc::setenv(key.as_ptr(), v.as_ptr(), 1);
+              }
+              None => {
+                libc::unsetenv(key.as_ptr());
+              }
+            }
+          }
+
+          libc::execvp(prog.as_ptr(), argv_ptrs.as_ptr());
+          libc::perror(null());
+          libc::_exit(1);
+        }
+        pid
+      },
+      on_wait_returned,
+    )?;
+
     unsafe {
-      let mut block_set: libc::sigset_t = std::mem::zeroed();
-      let mut old_set: libc::sigset_t = std::mem::zeroed();
-      libc::sigfillset(&mut block_set);
-      libc::pthread_sigmask(libc::SIG_SETMASK, &block_set, &mut old_set);
-
-      let mut empty_set: libc::sigset_t = std::mem::zeroed();
-      libc::sigemptyset(&mut empty_set);
-
-      let mut master_fd = -1;
-      // Some args are *mut on some BSD variants.
-      #[allow(clippy::unnecessary_mut_passed)]
-      let pid =
-        libc::forkpty(&mut master_fd, null_mut(), null_mut(), &mut size.into());
-      if pid < 0 {
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, null_mut());
-        return Err(std::io::Error::last_os_error());
-      }
-
-      if pid == 0 {
-        for signo in &[
-          libc::SIGCHLD,
-          libc::SIGHUP,
-          libc::SIGINT,
-          libc::SIGQUIT,
-          libc::SIGTERM,
-          libc::SIGALRM,
-        ] {
-          libc::signal(*signo, libc::SIG_DFL);
-        }
-        libc::pthread_sigmask(libc::SIG_SETMASK, &empty_set, null_mut());
-
-        if let Some(cwd) = &cwd_c {
-          if libc::chdir(cwd.as_ptr()) != 0 {
-            libc::_exit(1);
-          }
-        }
-
-        for (key, value) in &env_c {
-          match value {
-            Some(v) => {
-              libc::setenv(key.as_ptr(), v.as_ptr(), 1);
-            }
-            None => {
-              libc::unsetenv(key.as_ptr());
-            }
-          }
-        }
-
-        libc::execvp(prog.as_ptr(), argv_ptrs.as_ptr());
-        libc::perror(null());
-        libc::_exit(1);
-      }
-
-      libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, null_mut());
+      let master = OwnedFd::from_raw_fd(master_fd);
 
       let flags = libc::fcntl(master_fd, libc::F_GETFD, 0);
       if flags < 0 {
@@ -130,17 +131,129 @@ impl UnixProcess {
         return Err(std::io::Error::last_os_error());
       }
 
-      let pid = Pid::from_raw_unchecked(pid);
-      let master = OwnedFd::from_raw_fd(master_fd);
-
-      UnixProcessesWaiter::wait_for(pid, on_wait_returned);
-
       Ok(UnixProcess {
         pid,
         master: AsyncFd::new(master)?,
       })
     }
   }
+}
+
+/// Runs `argv` on a task's behalf (its ready or stop command): in the
+/// task's cwd and env, stdio on /dev/null, in a process group of its own.
+/// Only the reaper waits for it; `on_exit` gets its exit, 127 when it
+/// could not be run.
+pub fn spawn_command(
+  argv: &[String],
+  spec: &ProcessSpec,
+  on_exit: Box<dyn Fn(ExitInfo) + Send + Sync>,
+) -> std::io::Result<Pid> {
+  use std::ffi::{OsStr, OsString};
+  use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+  // Everything the child uses is made here: between fork and exec it
+  // must not allocate or take locks another thread may hold.
+  let argv = argv
+    .iter()
+    .map(|arg| CString::new(arg.as_str()))
+    .collect::<Result<Vec<_>, _>>()?;
+  let Some(prog) = argv.first() else {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      "empty command",
+    ));
+  };
+  let argv_ptrs: Vec<*const libc::c_char> = argv
+    .iter()
+    .map(|arg| arg.as_ptr())
+    .chain(std::iter::once(null()))
+    .collect();
+  let cwd = spec.cwd.as_deref().map(CString::new).transpose()?;
+  let mut env: std::collections::BTreeMap<OsString, OsString> =
+    std::env::vars_os().collect();
+  for (key, value) in &spec.env {
+    match value {
+      Some(value) => {
+        env.insert(key.into(), value.into());
+      }
+      None => {
+        env.remove(OsStr::new(key));
+      }
+    }
+  }
+  let env = env
+    .into_iter()
+    .map(|(key, value)| {
+      let mut entry = key.into_vec();
+      entry.push(b'=');
+      entry.extend_from_slice(value.as_bytes());
+      CString::new(entry)
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+  let env_ptrs: Vec<*const libc::c_char> = env
+    .iter()
+    .map(|entry| entry.as_ptr())
+    .chain(std::iter::once(null()))
+    .collect();
+  // CLOEXEC from the start: a fork on another thread must not inherit it.
+  let null_fd = unsafe {
+    libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
+  };
+  if null_fd < 0 {
+    return Err(std::io::Error::last_os_error());
+  }
+  let _null = unsafe { OwnedFd::from_raw_fd(null_fd) };
+  let mut empty_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+  unsafe { libc::sigemptyset(&mut empty_set) };
+
+  UnixProcessesWaiter::fork(
+    || unsafe {
+      let pid = libc::fork();
+      if pid == 0 {
+        for signo in [
+          libc::SIGCHLD,
+          libc::SIGHUP,
+          libc::SIGINT,
+          libc::SIGQUIT,
+          libc::SIGTERM,
+          libc::SIGALRM,
+          libc::SIGPIPE,
+        ] {
+          libc::signal(signo, libc::SIG_DFL);
+        }
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty_set, null_mut());
+        libc::setpgid(0, 0);
+        for fd in 0..3 {
+          if fd == null_fd {
+            libc::fcntl(fd, libc::F_SETFD, 0);
+          } else {
+            libc::dup2(null_fd, fd);
+          }
+        }
+        if let Some(cwd) = &cwd
+          && libc::chdir(cwd.as_ptr()) != 0
+        {
+          libc::_exit(127);
+        }
+        // What std does: execvp searches the new env's PATH.
+        #[cfg(target_vendor = "apple")]
+        {
+          *libc::_NSGetEnviron() = env_ptrs.as_ptr() as *mut *mut libc::c_char;
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+          unsafe extern "C" {
+            static mut environ: *const *const libc::c_char;
+          }
+          environ = env_ptrs.as_ptr();
+        }
+        libc::execvp(prog.as_ptr(), argv_ptrs.as_ptr());
+        libc::_exit(127);
+      }
+      pid
+    },
+    on_exit,
+  )
 }
 
 impl UnixProcess {
@@ -287,5 +400,33 @@ mod tests {
       libc::kill(-(proc.pid() as i32), libc::SIGKILL);
     }
     assert!(eof, "group SIGTERM should kill the child and EOF the pty");
+  }
+
+  #[test]
+  fn command_runs_in_the_task_context() {
+    let dir = std::env::temp_dir()
+      .join(format!("dekit_spawn_command_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker"), "").unwrap();
+    let mut spec = ProcessSpec::from_argv(Vec::new());
+    spec.cwd(dir.to_string_lossy());
+    spec.env("DEKIT_SET", "yes");
+    spec.env_remove("HOME");
+    // No reaper runs in unit tests: the test waits for its own children.
+    let status = |argv: &[&str]| {
+      let argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
+      let pid = spawn_command(&argv, &spec, Box::new(|_| {})).unwrap();
+      let mut status = 0;
+      unsafe { libc::waitpid(pid.as_raw_nonzero().get(), &mut status, 0) };
+      libc::WEXITSTATUS(status)
+    };
+    // In the task's cwd and env, leading its own process group.
+    let check = "[ -f marker ] && [ \"$DEKIT_SET\" = yes ] && \
+                 [ -z \"${HOME+set}\" ] && kill -0 -- -$$";
+    assert_eq!(status(&["sh", "-c", check]), 0);
+    // Could not be run: 127, as in a shell.
+    assert_eq!(status(&["./missing"]), 127);
+    assert_eq!(status(&["dekit-no-such-program"]), 127);
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

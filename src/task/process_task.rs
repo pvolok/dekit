@@ -1,4 +1,6 @@
-use std::future::pending;
+use std::future::{Future, pending};
+use std::pin::Pin;
+use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -7,7 +9,8 @@ use crate::kernel::kernel_message::{
   KernelCommand, SharedVt, TaskContext, TaskRegistration, TaskSelector,
 };
 use crate::kernel::task::{
-  ExitInfo, ReadyMode, RestartMode, TaskCmd, TaskDef, TaskId,
+  ExitInfo, ReadyMode, RestartMode, STOP_TIMEOUT, TaskCmd, TaskDef, TaskId,
+  TaskKind,
 };
 use crate::kernel::task_key::TaskKey;
 use crate::kernel::task_path::TaskPath;
@@ -20,6 +23,11 @@ use crate::process::process_spec::ProcessSpec;
 #[cfg(unix)]
 use crate::task::logger::LogSink;
 use crate::task::logger::{LogSpec, spawn_logger};
+#[cfg(windows)]
+use crate::task::ready::command;
+use crate::task::ready::{
+  Probe, ReadyCheck, ReadyConfig, VisibleLine, parse_http_url, wait_ready,
+};
 use crate::term::key::Key;
 use crate::term::vt::emit::{self, KeyEncodeModes};
 use crate::term::{Screen, Winsize};
@@ -92,28 +100,24 @@ signals! {
 
 #[derive(Clone, Debug)]
 pub enum StopSignal {
-  /// Graceful stop of the whole process tree. Unix: SIGTERM to the group.
-  /// Windows: Ctrl-C (TODO).
-  Shutdown,
-  /// Force-kill the whole process tree. Unix: SIGKILL to the group. Windows:
-  /// terminate (the process today; TODO: Job Object).
-  Kill,
   Signal {
     sig: Sig,
     group: bool,
   },
-  SendKeys(Vec<Key>),
-  /// Run a shell command as the stop action. Useful for tools like
-  /// `podman compose` that don't reliably respond to signals but do have
-  /// an explicit teardown command (e.g. `podman compose down`). The main
-  /// process is expected to exit on its own once the stop command
-  /// completes (e.g. `compose up` exits when containers go away).
-  Cmd(String),
+  /// Typed into the task's terminal.
+  Keys(Vec<Key>),
+  /// A program to run, for tools that stop on a command rather than a
+  /// signal (e.g. `podman compose down`). The task is expected to exit on
+  /// its own once it has run.
+  Cmd(Vec<String>),
 }
 
 impl Default for StopSignal {
   fn default() -> Self {
-    StopSignal::Shutdown
+    StopSignal::Signal {
+      sig: Sig::Term,
+      group: true,
+    }
   }
 }
 
@@ -124,10 +128,7 @@ impl StopSignal {
   fn kill_group(&self) -> bool {
     match self {
       StopSignal::Signal { group, .. } => *group,
-      StopSignal::Shutdown
-      | StopSignal::Kill
-      | StopSignal::SendKeys(_)
-      | StopSignal::Cmd(_) => true,
+      StopSignal::Keys(_) | StopSignal::Cmd(_) => true,
     }
   }
 }
@@ -135,12 +136,13 @@ impl StopSignal {
 pub struct ProcessTaskConfig {
   pub spec: ProcessSpec,
   pub label: Option<String>,
+  pub kind: TaskKind,
   pub stop: StopSignal,
+  pub stop_timeout: Duration,
   pub log: Option<LogSpec>,
   pub restart: RestartMode,
-  /// Readiness probe: the task reports ready once an output line contains
-  /// this string. Without it the task is ready as soon as it starts.
-  pub ready_log: Option<String>,
+  /// Without it the task is ready as soon as it starts.
+  pub ready: Option<ReadyConfig>,
   pub scrollback_len: usize,
   pub mouse_scroll_speed: usize,
   pub deps: Vec<TaskSelector>,
@@ -156,10 +158,12 @@ impl ProcessTaskConfig {
     Self {
       spec,
       label: None,
+      kind: TaskKind::Service,
       stop: StopSignal::default(),
+      stop_timeout: STOP_TIMEOUT,
       log: None,
       restart: RestartMode::Never,
-      ready_log: None,
+      ready: None,
       scrollback_len: 1000,
       mouse_scroll_speed: 5,
       deps: Vec::new(),
@@ -197,8 +201,31 @@ pub fn process_task_from_snapshot(
     key,
     config,
     &process.screen,
-    process.instance.clone(),
+    resumed_instance(saved, process),
   )
+}
+
+/// The saved child as its task resumes it. The kernel waits for a ready
+/// report only in a restored `Running` state; in any other it keeps what
+/// it has (a `Ready` task stays ready when the new config adds a check),
+/// so no check runs.
+#[cfg(unix)]
+pub fn resumed_instance(
+  saved: &snap::Task,
+  process: &snap::ProcessTask,
+) -> Option<snap::Instance> {
+  let mut instance = process.instance.clone()?;
+  match saved.state {
+    snap::TaskState::Running {} => (),
+    snap::TaskState::Idle {}
+    | snap::TaskState::Starting {}
+    | snap::TaskState::Ready {}
+    | snap::TaskState::Stopping {}
+    | snap::TaskState::Backoff(_)
+    | snap::TaskState::Done(_)
+    | snap::TaskState::Exited(_) => instance.ready_sent = true,
+  }
+  Some(instance)
 }
 
 pub fn process_task_config_from_snapshot(
@@ -213,15 +240,25 @@ pub fn process_task_config_from_snapshot(
     env: process.spec.env.iter().cloned().collect(),
   };
   let stop = match &process.stop {
-    snap::StopSignal::Shutdown {} => StopSignal::Shutdown,
-    snap::StopSignal::Kill {} => StopSignal::Kill,
+    snap::StopSignal::Shutdown {} => StopSignal::Signal {
+      sig: Sig::Term,
+      group: true,
+    },
+    snap::StopSignal::Kill {} => StopSignal::Signal {
+      sig: Sig::Kill,
+      group: true,
+    },
     snap::StopSignal::Signal { sig, group } => StopSignal::Signal {
       sig: Sig::from_name(sig)
         .ok_or_else(|| anyhow::anyhow!("unknown stop signal {sig}"))?,
       group: *group,
     },
-    snap::StopSignal::SendKeys { keys } => StopSignal::SendKeys(keys.clone()),
-    snap::StopSignal::Cmd { cmd } => StopSignal::Cmd(cmd.clone()),
+    snap::StopSignal::SendKeys { keys } => StopSignal::Keys(keys.clone()),
+    // An older binary's line, meant for the system shell.
+    snap::StopSignal::Cmd { cmd } => {
+      StopSignal::Cmd(crate::parse_shell::system_argv(cmd))
+    }
+    snap::StopSignal::Program { argv } => StopSignal::Cmd(argv.clone()),
   };
   let log = process.log.as_ref().map(|log| LogSpec {
     config: crate::config::task_log::TaskLogConfig {
@@ -236,13 +273,45 @@ pub fn process_task_config_from_snapshot(
     },
     name: log.name.clone(),
   });
+  let check = match (&process.ready_log, &process.ready_probe) {
+    (None, None) => None,
+    (Some(text), None) => Some(ReadyCheck::Log(text.clone())),
+    (None, Some(probe)) => Some(ReadyCheck::Probe {
+      probe: match &probe.check {
+        snap::ReadyCheck::Tcp { host, port } => Probe::Tcp {
+          host: host.clone(),
+          port: *port,
+        },
+        snap::ReadyCheck::Http { url } => {
+          Probe::Http(parse_http_url(url).map_err(anyhow::Error::msg)?)
+        }
+        snap::ReadyCheck::Cmd { argv } => Probe::Cmd { argv: argv.clone() },
+        snap::ReadyCheck::File { path } => Probe::File {
+          path: std::path::PathBuf::from(path),
+        },
+      },
+      interval: Duration::from_millis(probe.interval_ms),
+    }),
+    (Some(_), Some(_)) => anyhow::bail!("a task has two ready checks"),
+  };
   Ok(ProcessTaskConfig {
     spec,
     label: saved.label.clone(),
+    kind: if saved.job {
+      TaskKind::Job
+    } else {
+      TaskKind::Service
+    },
     stop,
+    stop_timeout: saved
+      .stop_timeout_ms
+      .map_or(STOP_TIMEOUT, Duration::from_millis),
     log,
     restart: saved.restart.into(),
-    ready_log: process.ready_log.clone(),
+    ready: check.map(|check| ReadyConfig {
+      check,
+      timeout: saved.ready_timeout_ms.map(Duration::from_millis),
+    }),
     scrollback_len: process.scrollback_len,
     mouse_scroll_speed: process.mouse_scroll_speed,
     deps,
@@ -280,11 +349,15 @@ fn registration(
   TaskRegistration::async_task(
     task_id,
     TaskDef {
-      ready: match config.ready_log {
-        Some(_) => ReadyMode::Reported,
+      kind: config.kind,
+      ready: match &config.ready {
+        Some(ready) => ReadyMode::Reported {
+          timeout: ready.timeout,
+        },
         None => ReadyMode::Immediate,
       },
       restart: config.restart,
+      stop_timeout: config.stop_timeout,
       deps: std::mem::take(&mut config.deps),
       space,
       path,
@@ -292,7 +365,7 @@ fn registration(
       vt: Some(vt),
       tags: std::mem::take(&mut config.tags),
       pinned: config.pinned,
-      ..Default::default()
+      saved_pin: false,
     },
     move |ctx, receiver| async move {
       process_main(ctx, receiver, key, task_vt, config, instance).await;
@@ -309,7 +382,9 @@ struct Instance {
   exit_info: Option<ExitInfo>,
   stdout_eof: bool,
   ready_sent: bool,
-  ready_line_buf: Vec<u8>,
+  /// A stop was sent: no ready check runs.
+  stop_sent: bool,
+  ready_line: VisibleLine,
   /// The log path is resolved per spawn (it may contain the pid).
   current_log: Option<(std::path::PathBuf, u64)>,
 }
@@ -322,6 +397,23 @@ impl Instance {
       p.on_exited();
     }
   }
+
+  /// Feeds output to the log check, if there is one and the instance is
+  /// not ready; true when this makes it ready.
+  fn log_ready(&mut self, ready: &Option<ReadyConfig>, bytes: &[u8]) -> bool {
+    if let Some(ReadyConfig {
+      check: ReadyCheck::Log(text),
+      ..
+    }) = ready
+      && !self.ready_sent
+      && self.ready_line.feed(text.as_bytes(), bytes)
+    {
+      self.ready_sent = true;
+      self.ready_line = VisibleLine::default();
+      return true;
+    }
+    false
+  }
 }
 
 fn snapshot(
@@ -331,16 +423,35 @@ fn snapshot(
   instance: &Instance,
 ) -> snap::ProcessTask {
   let stop = match &config.stop {
-    StopSignal::Shutdown => snap::StopSignal::Shutdown {},
-    StopSignal::Kill => snap::StopSignal::Kill {},
     StopSignal::Signal { sig, group } => snap::StopSignal::Signal {
       sig: sig.name().to_string(),
       group: *group,
     },
-    StopSignal::SendKeys(keys) => {
-      snap::StopSignal::SendKeys { keys: keys.clone() }
-    }
-    StopSignal::Cmd(cmd) => snap::StopSignal::Cmd { cmd: cmd.clone() },
+    StopSignal::Keys(keys) => snap::StopSignal::SendKeys { keys: keys.clone() },
+    StopSignal::Cmd(argv) => snap::StopSignal::Program { argv: argv.clone() },
+  };
+  let (ready_log, ready_probe) = match config.ready.as_ref().map(|r| &r.check) {
+    Some(ReadyCheck::Log(text)) => (Some(text.clone()), None),
+    Some(ReadyCheck::Probe { probe, interval }) => (
+      None,
+      Some(snap::ReadyProbe {
+        check: match probe {
+          Probe::Tcp { host, port } => snap::ReadyCheck::Tcp {
+            host: host.clone(),
+            port: *port,
+          },
+          Probe::Http(url) => snap::ReadyCheck::Http {
+            url: url.url.clone(),
+          },
+          Probe::Cmd { argv } => snap::ReadyCheck::Cmd { argv: argv.clone() },
+          Probe::File { path } => snap::ReadyCheck::File {
+            path: path.to_string_lossy().into_owned(),
+          },
+        },
+        interval_ms: interval.as_millis() as u64,
+      }),
+    ),
+    None => (None, None),
   };
   #[cfg(unix)]
   let instance = process.map(|p| snap::Instance {
@@ -349,7 +460,13 @@ fn snapshot(
     exit: instance.exit_info.map(Into::into),
     stdout_eof: instance.stdout_eof,
     ready_sent: instance.ready_sent,
-    ready_line: snap::to_base64(&instance.ready_line_buf),
+    // Only a polled check still waiting reads it; written only then, so
+    // an older binary can take back any other snapshot.
+    stop_sent: instance.stop_sent
+      && ready_probe.is_some()
+      && !instance.ready_sent
+      && instance.exit_info.is_none(),
+    ready_line: snap::to_base64(&instance.ready_line.saved()),
     log_path: instance
       .current_log
       .as_ref()
@@ -388,7 +505,8 @@ fn snapshot(
         .map(|p| p.to_string_lossy().into_owned()),
       truncate: log.config.mode() == crate::config::task_log::LogMode::Truncate,
     }),
-    ready_log: config.ready_log.clone(),
+    ready_log,
+    ready_probe,
     scrollback_len: config.scrollback_len,
     mouse_scroll_speed: config.mouse_scroll_speed,
     instance,
@@ -412,24 +530,48 @@ async fn process_main(
     TaskScreen::new(ctx.task_id, vt, config.mouse_scroll_speed);
   let mut screen_effects: Vec<TaskScreenEffect> = Vec::new();
 
-  let mut process: Option<NativeProcess> = None;
+  // The child must not outlive this future (it panicked, or the kernel
+  // went away): one that ignores SIGHUP survives the PTY's hangup.
+  #[cfg(unix)]
+  let kill_group = config.stop.kill_group();
+  let mut process =
+    scopeguard::guard(None, move |process: Option<NativeProcess>| {
+      #[cfg(unix)]
+      if let Some(p) = process {
+        crate::process::unix_processes_waiter::UnixProcessesWaiter::kill(
+          p.pid,
+          libc::SIGKILL,
+          kill_group,
+        );
+      }
+      #[cfg(windows)]
+      drop(process);
+    });
   let mut instance = Instance::default();
   let mut read_buf = [0u8; 8 * 1024];
   let mut key_buf: Vec<u8> = Vec::new();
   // Frozen for an upgrade: no reads until thawed.
   let mut frozen = false;
+  // The ready check that polls, while the task is starting.
+  let mut probe: Option<ProbeFuture> = None;
 
   #[cfg(unix)]
   if let Some(saved) = saved {
     match adopt_native(&saved) {
       Ok((adopted, receiver)) => {
-        process = Some(adopted);
+        *process = Some(adopted);
         instance.exits = receiver;
         instance.exit_info = saved.exit.map(Into::into);
         instance.stdout_eof = saved.stdout_eof;
         instance.ready_sent = saved.ready_sent;
-        instance.ready_line_buf =
-          snap::from_base64(&saved.ready_line).unwrap_or_default();
+        instance.stop_sent = saved.stop_sent;
+        // Checked again like new output: an older binary saved raw output
+        // it had not searched yet, since it checked only at a `\n`.
+        let line = snap::from_base64(&saved.ready_line).unwrap_or_default();
+        if instance.log_ready(&config.ready, &line) {
+          ctx.send(KernelCommand::TaskReady);
+        }
+        probe = start_probe(&config, &instance);
         if let Some(path) = saved.log_path {
           let path = std::path::PathBuf::from(path);
           let id = task_screen.add_logger(spawn_logger(LogSink {
@@ -462,6 +604,7 @@ async fn process_main(
       Cmd(Option<TaskCmd>),
       Read(std::io::Result<usize>),
       Exited(Option<ExitInfo>),
+      Ready,
     }
     let read_fut = async {
       match process.as_mut() {
@@ -477,10 +620,17 @@ async fn process_main(
         None => pending().await,
       }
     };
+    let probe_fut = async {
+      match probe.as_mut() {
+        Some(probe) => probe.await,
+        None => pending().await,
+      }
+    };
     let next = tokio::select! {
       cmd = receiver.recv() => Next::Cmd(cmd),
       n = read_fut => Next::Read(n),
       info = exit_fut => Next::Exited(info),
+      () = probe_fut => Next::Ready,
     };
 
     match next {
@@ -493,8 +643,10 @@ async fn process_main(
           {
             instance.exit_info = None;
             instance.stdout_eof = false;
-            instance.ready_line_buf.clear();
+            instance.ready_line = VisibleLine::default();
             instance.ready_sent = false;
+            instance.stop_sent = false;
+            probe = start_probe(&config, &instance);
             update_log_observer(
               &mut task_screen,
               &config.log,
@@ -502,16 +654,20 @@ async fn process_main(
               ctx.task_id,
               p.pid(),
             );
-            process = Some(p);
+            *process = Some(p);
             instance.exits = Some(receiver);
           }
         }
         TaskCmd::Stop => {
+          probe = None;
+          instance.stop_sent = true;
           if let Some(p) = process.as_mut() {
             stop_process(p, &config.stop, task_screen.vt(), &config.spec).await;
           }
         }
         TaskCmd::Kill => {
+          probe = None;
+          instance.stop_sent = true;
           if let Some(p) = process.as_mut() {
             p.kill(config.stop.kill_group()).await.log_ignore();
           }
@@ -531,10 +687,12 @@ async fn process_main(
             key,
             ProcessTaskConfig {
               spec: config.spec.clone(),
+              kind: config.kind,
               stop: config.stop.clone(),
+              stop_timeout: config.stop_timeout,
               log: None,
               restart: config.restart,
-              ready_log: config.ready_log.clone(),
+              ready: config.ready.clone(),
               scrollback_len: config.scrollback_len,
               mouse_scroll_speed: config.mouse_scroll_speed,
               deps: Vec::new(),
@@ -561,6 +719,7 @@ async fn process_main(
           }
           task_screen.flush_loggers().await;
           frozen = true;
+          probe = None;
           let saved =
             snapshot(&config, process.as_ref(), &task_screen, &instance);
           ctx.send(KernelCommand::TaskFrozen(
@@ -568,7 +727,12 @@ async fn process_main(
             snap::TaskKind::Process(saved),
           ));
         }
-        TaskCmd::Thaw => frozen = false,
+        TaskCmd::Thaw => {
+          frozen = false;
+          if process.is_some() {
+            probe = start_probe(&config, &instance);
+          }
+        }
         TaskCmd::Msg(msg) => match msg.downcast::<TaskScreenCmd>() {
           Ok(cmd) => {
             task_screen.handle_cmd(*cmd, &mut screen_effects);
@@ -585,19 +749,20 @@ async fn process_main(
       },
 
       // Each instance exits once; `None` means the reaper is gone.
-      Next::Exited(Some(info)) => instance.exited(info, process.as_mut()),
+      Next::Exited(Some(info)) => {
+        probe = None;
+        instance.exited(info, process.as_mut());
+      }
       Next::Exited(None) => instance.exits = None,
+      Next::Ready => {
+        probe = None;
+        instance.ready_sent = true;
+        ctx.send(KernelCommand::TaskReady);
+      }
       Next::Read(Ok(0)) => instance.stdout_eof = true,
       Next::Read(Ok(n)) => {
-        if let Some(pattern) = &config.ready_log
-          && !instance.ready_sent
-        {
-          instance.ready_sent = scan_ready(
-            &ctx,
-            pattern,
-            &mut instance.ready_line_buf,
-            &read_buf[..n],
-          );
+        if instance.log_ready(&config.ready, &read_buf[..n]) {
+          ctx.send(KernelCommand::TaskReady);
         }
         task_screen
           .process(&read_buf[..n], &mut screen_effects)
@@ -618,26 +783,32 @@ async fn process_main(
   }
 }
 
-/// Match completed output lines against the readiness pattern; reports
-/// `TaskReady` and returns true on the first match.
-fn scan_ready(
-  ctx: &TaskContext,
-  pattern: &str,
-  line_buf: &mut Vec<u8>,
-  bytes: &[u8],
-) -> bool {
-  for b in bytes {
-    if *b == b'\n' {
-      if String::from_utf8_lossy(line_buf).contains(pattern) {
-        ctx.send(KernelCommand::TaskReady);
-        return true;
-      }
-      line_buf.clear();
-    } else if line_buf.len() < 4096 {
-      line_buf.push(*b);
-    }
+type ProbeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// The ready check that polls, unless the instance is ready, is being
+/// stopped, or has exited.
+fn start_probe(
+  config: &ProcessTaskConfig,
+  instance: &Instance,
+) -> Option<ProbeFuture> {
+  if instance.ready_sent || instance.stop_sent || instance.exit_info.is_some() {
+    return None;
   }
-  false
+  match &config.ready {
+    Some(ReadyConfig {
+      check: ReadyCheck::Probe { probe, interval },
+      ..
+    }) => Some(Box::pin(wait_ready(
+      probe.clone(),
+      *interval,
+      config.spec.clone(),
+    ))),
+    Some(ReadyConfig {
+      check: ReadyCheck::Log(_),
+      ..
+    })
+    | None => None,
+  }
 }
 
 fn update_log_observer(
@@ -775,20 +946,16 @@ async fn stop_process(
   spec: &ProcessSpec,
 ) {
   match stop {
-    StopSignal::Shutdown => {
-      process.send_signal(libc::SIGTERM, true).log_ignore()
-    }
-    StopSignal::Kill => process.send_signal(libc::SIGKILL, true).log_ignore(),
     StopSignal::Signal { sig, group } => {
       process.send_signal(sig.to_libc(), *group).log_ignore();
     }
-    StopSignal::SendKeys(keys) => {
+    StopSignal::Keys(keys) => {
       let mut buf = Vec::new();
       for key in keys {
         send_key(process, vt, key.clone(), &mut buf).await;
       }
     }
-    StopSignal::Cmd(shell) => run_stop_cmd(spec, shell.clone()),
+    StopSignal::Cmd(argv) => run_stop_cmd(spec, argv),
   }
 }
 
@@ -800,73 +967,53 @@ async fn stop_process(
   spec: &ProcessSpec,
 ) {
   match stop {
-    // TODO: deliver Ctrl-C through the ConPTY for a graceful shutdown; for now
-    // fall back to terminating the process.
-    StopSignal::Shutdown => process.kill(true).await.log_ignore(),
-    // TODO: terminate the whole tree via a Job Object; for now terminate the
-    // process.
-    StopSignal::Kill => process.kill(true).await.log_ignore(),
     // Windows has no real signals: INT/TERM/KILL fall back to terminating the
-    // process; everything else has no equivalent and is ignored.
+    // process; everything else has no equivalent and is ignored. TODO: a
+    // Ctrl-C through the ConPTY for INT/TERM, and the whole tree via a Job
+    // Object.
     StopSignal::Signal { sig, .. } => match sig {
       Sig::Int | Sig::Term | Sig::Kill => process.kill(true).await.log_ignore(),
       _ => log::debug!("{sig:?} has no Windows equivalent; ignoring"),
     },
-    StopSignal::SendKeys(keys) => {
+    StopSignal::Keys(keys) => {
       let mut buf = Vec::new();
       for key in keys {
         send_key(process, vt, key.clone(), &mut buf).await;
       }
     }
-    StopSignal::Cmd(shell) => run_stop_cmd(spec, shell.clone()),
+    StopSignal::Cmd(argv) => run_stop_cmd(spec, argv),
   }
 }
 
-fn run_stop_cmd(spec: &ProcessSpec, shell: String) {
-  #[cfg(windows)]
-  let mut cmd = {
-    let mut c = std::process::Command::new("pwsh.exe");
-    c.arg("-Command").arg(&shell);
-    c
-  };
-  #[cfg(not(windows))]
-  let mut cmd = {
-    let mut c = std::process::Command::new("/bin/sh");
-    c.arg("-c").arg(&shell);
-    c
-  };
-  if let Some(cwd) = &spec.cwd {
-    cmd.current_dir(cwd);
-  }
-  for (k, v) in &spec.env {
-    match v {
-      Some(v) => {
-        cmd.env(k, v);
-      }
-      None => {
-        cmd.env_remove(k);
-      }
-    }
-  }
-  cmd.stdout(std::process::Stdio::null());
-  cmd.stderr(std::process::Stdio::null());
-
+fn run_stop_cmd(spec: &ProcessSpec, argv: &[String]) {
   #[cfg(unix)]
-  match cmd.spawn() {
-    Ok(child) => {
-      crate::process::unix_processes_waiter::UnixProcessesWaiter::wait_for_child(
-        child,
-        Box::new(|info| log::debug!("Stop command exited: {info}")),
-      )
+  {
+    let cmd = format!("{argv:?}");
+    let spawned = crate::process::unix_process::spawn_command(
+      argv,
+      spec,
+      Box::new(move |info| match info.code {
+        Some(127) => log::warn!(
+          "Stop command {cmd} exited with 127 (not found or not executable)"
+        ),
+        _ => log::debug!("Stop command exited: {info}"),
+      }),
+    );
+    if let Err(err) = spawned {
+      log::warn!("Stop command {argv:?} cannot run: {err}");
     }
-    Err(err) => log::warn!("Stop command failed: {err}"),
   }
   #[cfg(windows)]
-  tokio::spawn(async move {
-    if let Err(err) = tokio::process::Command::from(cmd).status().await {
-      log::warn!("Stop command failed: {err}");
-    }
-  });
+  {
+    let Some(cmd) = command(argv, spec) else {
+      return;
+    };
+    tokio::spawn(async move {
+      if let Err(err) = tokio::process::Command::from(cmd).status().await {
+        log::warn!("Stop command failed: {err}");
+      }
+    });
+  }
 }
 
 #[cfg(not(windows))]
@@ -879,7 +1026,7 @@ mod tests {
   use crate::kernel::kernel_message::{
     KernelCommand, KernelQuery, KernelQueryResponse, SpaceSelector, TaskContext,
   };
-  use crate::kernel::task::TaskId;
+  use crate::kernel::task::{TaskId, TaskState};
 
   use super::*;
 
@@ -1055,56 +1202,206 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn stop_signal_cmd_runs_shell_command() {
+  async fn stop_cmd_runs_in_the_task_dir() {
     let nanos = SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .unwrap()
       .as_nanos();
-    let mut marker = std::env::temp_dir();
-    marker.push(format!("dekit_stopcmd_{}_{}", std::process::id(), nanos));
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("dekit_stopcmd_{}_{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&dir).unwrap();
 
     let kernel = Kernel::new();
     let pc = kernel.context();
 
-    let path = TaskKey::default_space(TaskPath::new("sleeper").unwrap());
-    let spec = ProcessSpec::from_argv(vec![
-      "sh".to_string(),
-      "-c".to_string(),
-      "sleep 100".to_string(),
-    ]);
-    let (id, _) = spawn_process_task(
-      &pc,
-      Some(path),
-      ProcessTaskConfig {
-        stop: StopSignal::Cmd(format!("printf done > {}", marker.display())),
-        ..ProcessTaskConfig::new(spec)
-      },
-    );
-    pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
+    let stops = [
+      (
+        "by_cmd",
+        StopSignal::Cmd(vec!["touch".to_string(), "by_cmd".to_string()]),
+      ),
+      (
+        "by_sh",
+        StopSignal::Cmd(vec![
+          "sh".to_string(),
+          "-c".to_string(),
+          "printf done > by_sh".to_string(),
+        ]),
+      ),
+    ];
+    for (name, stop) in stops {
+      let mut spec =
+        ProcessSpec::from_argv(vec!["sleep".to_string(), "100".to_string()]);
+      spec.cwd(dir.to_string_lossy());
+      let (id, _) = spawn_process_task(
+        &pc,
+        Some(TaskKey::default_space(TaskPath::new(name).unwrap())),
+        ProcessTaskConfig {
+          stop,
+          ..ProcessTaskConfig::new(spec)
+        },
+      );
+      pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
+    }
 
     let kernel_task = tokio::spawn(kernel.run());
 
-    let id = resolve(&pc, "sleeper").await;
-    pc.send(KernelCommand::Stop(TaskSelector::Id(id), None));
+    let mut ids = Vec::new();
+    for name in ["by_cmd", "by_sh"] {
+      let id = resolve(&pc, name).await;
+      pc.send(KernelCommand::Stop(TaskSelector::Id(id), None));
+      ids.push(id);
+    }
 
     let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-      if marker.exists() {
-        break;
-      }
-      assert!(Instant::now() < deadline, "stop command never ran");
+    while !(dir.join("by_cmd").exists() && dir.join("by_sh").exists()) {
+      assert!(Instant::now() < deadline, "a stop command never ran");
       tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    pc.send(KernelCommand::Kill(TaskSelector::Id(id), None));
-    pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
+    for id in ids {
+      pc.send(KernelCommand::Kill(TaskSelector::Id(id), None));
+      pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
+    }
     pc.send(KernelCommand::Quit);
     tokio::time::timeout(Duration::from_secs(2), kernel_task)
       .await
       .expect("timed out waiting for kernel to quit")
       .unwrap();
 
-    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn snapshot_config_round_trips_ready_and_timeouts() {
+    let config = ProcessTaskConfig {
+      kind: TaskKind::Service,
+      stop_timeout: Duration::from_secs(3),
+      ready: Some(ReadyConfig {
+        check: ReadyCheck::Probe {
+          probe: Probe::Tcp {
+            host: None,
+            port: 5432,
+          },
+          interval: Duration::from_millis(250),
+        },
+        timeout: Some(Duration::from_secs(30)),
+      }),
+      ..ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".into()]))
+    };
+    let screen = TaskScreen::new(
+      TaskId(1),
+      SharedVt::new(Screen::new(DEFAULT_SIZE, 0)),
+      config.mouse_scroll_speed,
+    );
+    let process = snapshot(&config, None, &screen, &Instance::default());
+    assert_eq!(process.ready_log, None);
+    let saved = snap::Task {
+      id: 1,
+      space: String::new(),
+      path: Some("db".to_string()),
+      label: None,
+      tags: Vec::new(),
+      pinned: true,
+      deps: Vec::new(),
+      restart: snap::Restart::Never,
+      job: false,
+      ready_timeout_ms: Some(30_000),
+      stop_timeout_ms: Some(3_000),
+      state: snap::TaskState::Idle {},
+      vetoed: false,
+      killed: false,
+      start_failed: false,
+      saved_pin: false,
+      attempts: 0,
+      last_start_secs_ago: None,
+      timer_ms: None,
+      kind: snap::TaskKind::Process(process.clone()),
+    };
+    let back =
+      process_task_config_from_snapshot(&saved, &process, Vec::new()).unwrap();
+    assert_eq!(back.stop_timeout, Duration::from_secs(3));
+    let ready = back.ready.unwrap();
+    assert_eq!(ready.timeout, Some(Duration::from_secs(30)));
+    match ready.check {
+      ReadyCheck::Probe {
+        probe: Probe::Tcp { host: None, port },
+        interval,
+      } => {
+        assert_eq!(port, 5432);
+        assert_eq!(interval, Duration::from_millis(250));
+      }
+      other => panic!("{other:?}"),
+    }
+
+    // An older snapshot's `ready_log` is the log check.
+    let mut old = process.clone();
+    old.ready_probe = None;
+    old.ready_log = Some("listening".to_string());
+    let back =
+      process_task_config_from_snapshot(&saved, &old, Vec::new()).unwrap();
+    match back.ready.unwrap().check {
+      ReadyCheck::Log(text) => assert_eq!(text, "listening"),
+      other => panic!("{other:?}"),
+    }
+
+    for stop in [
+      StopSignal::Signal {
+        sig: Sig::Int,
+        group: false,
+      },
+      StopSignal::Keys(vec![Key::parse("<C-c>").unwrap()]),
+      StopSignal::Cmd(vec!["podman".to_string(), "stop".to_string()]),
+    ] {
+      let config = ProcessTaskConfig {
+        stop: stop.clone(),
+        ..ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".into()]))
+      };
+      let process = snapshot(&config, None, &screen, &Instance::default());
+      let back =
+        process_task_config_from_snapshot(&saved, &process, Vec::new())
+          .unwrap();
+      assert_eq!(format!("{:?}", back.stop), format!("{stop:?}"));
+    }
+
+    // An older binary's `cmd` line was meant for the system shell and
+    // keeps running there; its `shutdown` and `kill` are SIGTERM and
+    // SIGKILL to the group.
+    let config = ProcessTaskConfig {
+      stop: StopSignal::Cmd(vec!["podman".to_string(), "stop".to_string()]),
+      ..ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".into()]))
+    };
+    let mut old = snapshot(&config, None, &screen, &Instance::default());
+    old.stop = snap::StopSignal::Cmd {
+      cmd: "kill $(cat pid)".to_string(),
+    };
+    let back =
+      process_task_config_from_snapshot(&saved, &old, Vec::new()).unwrap();
+    match back.stop {
+      StopSignal::Cmd(argv) => {
+        assert_eq!(argv, crate::parse_shell::system_argv("kill $(cat pid)"))
+      }
+      other => panic!("{other:?}"),
+    }
+    old.stop = snap::StopSignal::Shutdown {};
+    let back =
+      process_task_config_from_snapshot(&saved, &old, Vec::new()).unwrap();
+    match back.stop {
+      StopSignal::Signal {
+        sig: Sig::Term,
+        group: true,
+      } => (),
+      other => panic!("{other:?}"),
+    }
+    old.stop = snap::StopSignal::Kill {};
+    let back =
+      process_task_config_from_snapshot(&saved, &old, Vec::new()).unwrap();
+    match back.stop {
+      StopSignal::Signal {
+        sig: Sig::Kill,
+        group: true,
+      } => (),
+      other => panic!("{other:?}"),
+    }
   }
 
   #[cfg(unix)]
@@ -1125,6 +1422,7 @@ mod tests {
       exit: None,
       stdout_eof: false,
       ready_sent: false,
+      stop_sent: false,
       ready_line: String::new(),
       log_path: None,
     });
@@ -1137,9 +1435,14 @@ mod tests {
       pinned: true,
       deps: Vec::new(),
       restart: snap::Restart::Never,
+      job: false,
+      ready_timeout_ms: None,
+      stop_timeout_ms: None,
       state: snap::TaskState::Running {},
       vetoed: false,
       killed: false,
+      start_failed: false,
+      saved_pin: false,
       attempts: 1,
       last_start_secs_ago: None,
       timer_ms: None,
@@ -1180,6 +1483,168 @@ mod tests {
       .await
       .expect("timed out waiting for kernel to quit")
       .unwrap();
+  }
+
+  async fn state_of(pc: &TaskContext, id: TaskId) -> TaskState {
+    match pc.query(KernelQuery::ListTasks(TaskSelector::Id(id))).await {
+      Ok(KernelQueryResponse::TaskList(tasks)) => tasks[0].state,
+      other => panic!("{:?}", other.is_ok()),
+    }
+  }
+
+  #[tokio::test]
+  async fn a_panicking_task_is_reported_stopped() {
+    let kernel = Kernel::new();
+    let pc = kernel.context();
+    let id = pc.alloc_id();
+    let _ack = pc.register_task(TaskRegistration::async_task(
+      id,
+      TaskDef::default(),
+      |_ctx, mut receiver| async move {
+        let _ = receiver.recv().await;
+        panic!("a bug in the task");
+      },
+    ));
+    pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
+    let kernel_task = tokio::spawn(kernel.run());
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while state_of(&pc, id).await.is_active() {
+      assert!(Instant::now() < deadline, "task stayed active");
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+      state_of(&pc, id).await,
+      TaskState::Exited(ExitInfo::error())
+    );
+    kernel_task.abort();
+  }
+
+  /// A restored task runs its ready check only in `Running`, where the
+  /// kernel waits for it; a `Ready` one stays ready without it. An older
+  /// binary's saved line is checked when the task resumes.
+  #[tokio::test]
+  async fn a_resumed_task_checks_ready_only_while_running() {
+    let screen = TaskScreen::new(
+      TaskId(1),
+      SharedVt::new(Screen::new(DEFAULT_SIZE, 0)),
+      5,
+    );
+    let listeners: Vec<std::net::TcpListener> = (0..2)
+      .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+      .collect();
+    let probe = |i: usize| ReadyCheck::Probe {
+      probe: Probe::Tcp {
+        host: Some("127.0.0.1".to_string()),
+        port: listeners[i].local_addr().unwrap().port(),
+      },
+      interval: Duration::from_millis(10),
+    };
+
+    let cases = [
+      ("was_ready", snap::TaskState::Ready {}, probe(0)),
+      ("running", snap::TaskState::Running {}, probe(1)),
+      // Old binaries ended lines only at `\n`.
+      (
+        "logged",
+        snap::TaskState::Running {},
+        ReadyCheck::Log("listening".to_string()),
+      ),
+    ];
+    let mut children = Vec::new();
+    let mut tasks = Vec::new();
+    for (i, (name, state, check)) in cases.into_iter().enumerate() {
+      let config = ProcessTaskConfig {
+        ready: Some(ReadyConfig {
+          check,
+          timeout: None,
+        }),
+        ..ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".into()]))
+      };
+      // A live child, and a pipe standing in for its PTY.
+      let child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+      let mut fds = [0; 2];
+      unsafe {
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
+      }
+      let mut process = snapshot(&config, None, &screen, &Instance::default());
+      process.instance = Some(snap::Instance {
+        pid: child.id(),
+        master_fd: fds[0],
+        exit: None,
+        stdout_eof: false,
+        ready_sent: false,
+        stop_sent: false,
+        ready_line: snap::to_base64(b"listening\r"),
+        log_path: None,
+      });
+      children.push((child, fds[1]));
+      tasks.push(snap::Task {
+        id: i + 1,
+        space: String::new(),
+        path: Some(name.to_string()),
+        label: None,
+        tags: Vec::new(),
+        pinned: true,
+        deps: Vec::new(),
+        restart: snap::Restart::Never,
+        job: false,
+        ready_timeout_ms: None,
+        stop_timeout_ms: None,
+        state,
+        vetoed: false,
+        killed: false,
+        start_failed: false,
+        saved_pin: false,
+        attempts: 1,
+        last_start_secs_ago: None,
+        timer_ms: None,
+        kind: snap::TaskKind::Process(process),
+      });
+    }
+    let mut restored = Vec::new();
+    for saved in &tasks {
+      let snap::TaskKind::Process(process) = &saved.kind else {
+        unreachable!()
+      };
+      let path = TaskPath::new(saved.path.clone().unwrap()).unwrap();
+      let registration = process_task_from_snapshot(
+        TaskId(saved.id),
+        Some(TaskKey::default_space(path)),
+        saved,
+        process,
+      )
+      .unwrap();
+      restored.push((Some(saved), registration));
+    }
+    let mut kernel = Kernel::new();
+    let pc = kernel.context();
+    kernel.restore(tasks.len() + 1, restored).unwrap();
+    let kernel_task = tokio::spawn(kernel.run());
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    for id in [TaskId(2), TaskId(3)] {
+      while state_of(&pc, id).await != TaskState::Ready {
+        assert!(Instant::now() < deadline, "task {id:?} never got ready");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+    }
+    // Many intervals, and still no check for the task that was ready.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    listeners[0].set_nonblocking(true).unwrap();
+    assert!(listeners[0].accept().is_err(), "the ready task was checked");
+    assert_eq!(state_of(&pc, TaskId(1)).await, TaskState::Ready);
+
+    kernel_task.abort();
+    for (mut child, fd) in children {
+      let _ = child.kill();
+      let _ = child.wait();
+      unsafe { libc::close(fd) };
+    }
   }
 }
 
@@ -1239,6 +1704,7 @@ fn adopt_native(
   let (exit_sender, exits) = unbounded_channel();
   crate::process::unix_processes_waiter::UnixProcessesWaiter::wait_for(
     process.pid,
+    0,
     Box::new(move |info| {
       let _ = exit_sender.send(info);
     }),

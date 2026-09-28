@@ -15,11 +15,11 @@ the same.
 
 :::commands
 - cmd: command
-  desc: "Params are a command verbatim (`{command: start, target: ...}`); result `{matched}` for task-directed verbs, `{}` otherwise."
+  desc: "Params are a command verbatim (`{command: start, target: ...}`); result `{matched}` for task-directed verbs, `add`, and `up`; `{stop_within_ms}` for `down` and `quit`; `{}` for `batch`."
 - cmd: ls
   desc: "Params `{target?}`, default `**`; result `{tasks: [task-info]}`."
 - cmd: why
-  desc: "Params `{target}` for one task; result the why object: `wanted`, `supported`, `vetoed`, `pinned`, `required_by`, `deps`, `attempts`."
+  desc: "Params `{target}` for one task; result the why object: `wanted`, `supported`, `vetoed`, `pinned`, `saved_pin` (when set), `required_by`, `deps`, `attempts`."
 - cmd: screen
   desc: "Params `{target}` for one task; result `{screen}` as ANSI text."
 - cmd: attach
@@ -43,12 +43,26 @@ a `target`, act on the matches atomically in the kernel, and reply with
 is either fully included or fully excluded. Zero matches is a normal
 reply, not an error.
 
-`add {target, label?, cmd: [..] | shell, cwd?, env?, deps?, tags?}`
-registers a process task at an exact path and starts it; `env` values of
-`null` unset a variable, each `deps` target must match at least one task
-(else `no_match`), and a taken path is `path_taken`. `quit {save?}` stops
-the runner, which first saves its tasks for its next start unless `save`
-is `false`, and `batch {commands}` runs a list in order; both reply `{}`.
+`add {target, label?, cmd: [..] | script, cwd?, env?, deps?, tags?}`
+registers a process task at an exact path and starts it. `cmd` is an argv
+run without a shell (a string is split into one as in
+|config/tasks#commands|), and an empty one is `invalid_params`; `script`
+is a `.js` or `.mjs` file to run instead (|js|). `env` values of `null`
+unset a variable, each `deps` target must match at least one task (else
+`no_match`), and a taken path is `path_taken`. The task takes the
+project's `defaults` except `autorestart`, which is `never`.
+
+`up` takes no target. It pins and starts the tasks that were started when
+the tasks were last saved (their saved pin, which it clears) and the
+tasks tagged `autostart`, with their dependencies, and replies
+`{matched}` with how many that was. It leaves running tasks and done
+jobs alone, so it is safe to repeat.
+
+`down` saves the tasks for the next `up` and stops the runner; `quit`
+stops it without saving. Both reply `{stop_within_ms}`: how long
+its stops can take at most, each task's stop timeout and kill along its
+deps, plus the save. `batch {commands}` runs a list in order and replies
+`{}`.
 
 `why`, `screen`, and `attach` need exactly one task: `no_match` when the
 target matches none, `ambiguous` when it matches several, `no_screen` when
@@ -57,10 +71,12 @@ the task has no screen.
 ## Task state
 
 `ls` task-info and `why` carry a stable state token: `idle`, `starting`,
-`running`, `ready`, `stopping`, `backoff`, `done`, or `exited`, plus
-optional `exit_code` or `signal` for `done` and `exited`. Task-info is
-`{id, path, label?, state, exit_code?, signal?}` where `path` is the
-space-qualified target of the task (`@dekit/console`).
+`running`, `ready`, `stopping`, `backoff`, `done`, or `exited`. `done`,
+`exited`, and `backoff` also carry how the last run ended: `exit_code` or
+`signal`, and `reason: "ready_timeout"` when the task was stopped for not
+being ready in time. Task-info is `{id, path, label?, state, exit_code?,
+signal?, reason?}` where `path` is the space-qualified target of the task
+(`@dekit/console`).
 
 ## Error codes
 

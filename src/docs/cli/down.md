@@ -6,8 +6,10 @@ related: [cli/up, cli/stop, cli/runner/stop, start/targets]
 ---
 
 The workday end verb. It stops every task and the project's runner, and
-saves the tasks, their screens, and which ones you had started for the
-next |cli/up|. Running it when the runner is not running does nothing.
+saves the tasks, their screens, and which ones you had started. The next
+start of the runner brings the tasks back idle with their screens, and
+|cli/up| starts the ones you had started. Running it when the runner is
+not running does nothing.
 A runner that crashed or was killed saved nothing, and one stopped with
 |cli/runner/stop| saves nothing, so its next start begins from
 `dekit.yaml`.

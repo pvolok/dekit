@@ -251,6 +251,7 @@ mod tests {
             state: "exited".to_string(),
             exit_code: Some(3),
             signal: None,
+            reason: None,
           }),
           screen: Some("build ok".to_string()),
         }),

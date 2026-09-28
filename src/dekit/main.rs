@@ -7,9 +7,13 @@ use rquickjs::CatchResultExt;
 use crate::{
   attach_client::{AttachEnd, client_main},
   command::Command,
-  config::task::{AUTOSTART_TAG, CmdConfig, is_script},
+  config::task::{CmdConfig, is_script},
   dekit::{rpc_client::rpc_request, server::run_server},
   js::js_vm::JsVm,
+  kernel::{
+    kernel::{KILL_WAIT, SAVE_TIMEOUT},
+    task::STOP_TIMEOUT,
+  },
   protocol::{
     ActResult, RpcRequest, RpcState, RpcWhy, ScreenResult, TaskListResult,
   },
@@ -23,6 +27,9 @@ use crate::{
 
 /// Render a wire state (token + optional exit detail) for humans.
 fn human_state(s: &RpcState) -> String {
+  if s.reason.as_deref() == Some("ready_timeout") {
+    return format!("{} (not ready in time)", s.state);
+  }
   match (s.exit_code, s.signal) {
     (Some(code), _) => format!("{} (code {})", s.state, code),
     (_, Some(signal)) => format!("{} (signal {})", s.state, signal),
@@ -82,6 +89,9 @@ fn print_why(result: serde_json::Value, json: bool) -> anyhow::Result<()> {
     println!("  vetoed: yes (start it to clear)");
   }
   println!("  pinned: {}", why.pinned);
+  if why.saved_pin {
+    println!("  started at the last `dekit down`; `dekit up` starts it again");
+  }
   if !why.required_by.is_empty() {
     println!("  required by: {}", why.required_by.join(", "));
   }
@@ -129,11 +139,11 @@ fn resolve_runner(matches: &clap::ArgMatches) -> anyhow::Result<RunnerSpec> {
   RunnerSpec::discover(&std::env::current_dir()?)
 }
 
-/// Stops the runner, saving its tasks for its next start when `save` is
-/// set. Returns false when it was not running.
+/// Stops the runner with `down` or `quit`. Returns false when it was not
+/// running.
 async fn shutdown_runner(
   runner: &RunnerSpec,
-  save: bool,
+  command: Command,
 ) -> anyhow::Result<bool> {
   let paths = lockfile::runner_paths(runner)?;
   match lockfile::runner_state(runner, &paths)? {
@@ -148,11 +158,15 @@ async fn shutdown_runner(
   let mut target = None;
   let mut quit_error = None;
 
-  // A graceful Quit gets 21s; then the runner is force-killed by pid
-  // and gets a few more seconds to release its lock as it dies.
-  let quit_deadline =
-    tokio::time::Instant::now() + std::time::Duration::from_secs(21);
-  let kill_deadline = quit_deadline + std::time::Duration::from_secs(5);
+  // A graceful quit gets as long as the runner says its stops can take;
+  // a runner that can't be asked gets what a runner with default
+  // settings says for one task. Then it is
+  // force-killed by pid and gets a few more seconds to release its lock
+  // as it dies.
+  let started = tokio::time::Instant::now();
+  let margin = std::time::Duration::from_secs(5);
+  let mut quit_deadline =
+    started + SAVE_TIMEOUT + STOP_TIMEOUT + KILL_WAIT + margin;
   let mut killed = None;
   loop {
     match lockfile::runner_state(runner, &paths)? {
@@ -167,10 +181,15 @@ async fn shutdown_runner(
         }
         if target.is_none() {
           target = Some(record.owner.clone());
-          quit_error = request_runner_quit(runner, save).await;
+          match request_runner_quit(runner, command.clone()).await {
+            Ok(within) => {
+              quit_deadline = tokio::time::Instant::now() + within + margin
+            }
+            Err(err) => quit_error = Some(err),
+          }
         }
         if killed.is_none() && tokio::time::Instant::now() >= quit_deadline {
-          force_kill_runner(&record.owner)?;
+          force_kill_runner(&record.owner, quit_deadline - started)?;
           killed = Some(record.owner.pid);
         }
       }
@@ -182,7 +201,7 @@ async fn shutdown_runner(
         if killed.is_none() && tokio::time::Instant::now() >= quit_deadline {
           match lockfile::runner_owner(runner) {
             Some(owner) => {
-              force_kill_runner(&owner)?;
+              force_kill_runner(&owner, quit_deadline - started)?;
               killed = Some(owner.pid);
             }
             None => anyhow::bail!(
@@ -192,7 +211,7 @@ async fn shutdown_runner(
         }
       }
     }
-    if tokio::time::Instant::now() >= kill_deadline {
+    if tokio::time::Instant::now() >= quit_deadline + margin {
       break;
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -202,9 +221,10 @@ async fn shutdown_runner(
     Some(pid) => {
       format!("killed the runner (pid {pid}), but its lock is still held")
     }
-    None => {
-      "runner did not stop within 21s and published no pid to kill".to_string()
-    }
+    None => format!(
+      "runner did not stop within {}s and published no pid to kill",
+      (quit_deadline - started).as_secs()
+    ),
   };
   match quit_error {
     Some(quit_error) => Err(quit_error.context(message)),
@@ -213,14 +233,20 @@ async fn shutdown_runner(
 }
 
 /// Force-kill a runner by verified identity and reap its task session.
-fn force_kill_runner(owner: &lockfile::OwnerInfo) -> anyhow::Result<()> {
+fn force_kill_runner(
+  owner: &lockfile::OwnerInfo,
+  waited: std::time::Duration,
+) -> anyhow::Result<()> {
   let lockfile::OwnerInfo {
     pid,
     start_time,
     sid,
   } = *owner;
   if crate::runner::kill::kill_verified(pid, start_time)? {
-    eprintln!("Runner did not stop within 21s; killed pid {pid}.");
+    eprintln!(
+      "Runner did not stop within {}s; killed pid {pid}.",
+      waited.as_secs()
+    );
     // The spawned runner owns its session and every task inherits it;
     // reap them so the kill leaves no orphans. A foreground runner
     // (sid != pid) shares the user's session, never swept.
@@ -238,19 +264,20 @@ fn force_kill_runner(owner: &lockfile::OwnerInfo) -> anyhow::Result<()> {
   Ok(())
 }
 
+/// Sends `down` or `quit`; the runner's answer is how long its stops can
+/// take.
 async fn request_runner_quit(
   runner: &RunnerSpec,
-  save: bool,
-) -> Option<anyhow::Error> {
-  match tokio::time::timeout(
+  command: Command,
+) -> anyhow::Result<std::time::Duration> {
+  let reply = tokio::time::timeout(
     std::time::Duration::from_secs(2),
-    rpc_request(runner, RpcRequest::Command(Command::Quit { save }), false),
+    rpc_request(runner, RpcRequest::Command(command), false),
   )
   .await
-  {
-    Ok(result) => result.err(),
-    Err(_) => Some(anyhow!("Quit request timed out after 2s")),
-  }
+  .map_err(|_| anyhow!("Quit request timed out after 2s"))??;
+  let reply = serde_json::from_value::<crate::protocol::QuitResult>(reply)?;
+  Ok(std::time::Duration::from_millis(reply.stop_within_ms))
 }
 
 /// The record's own JSON, minus the file-format `schema` field: the one
@@ -397,6 +424,9 @@ fn run_exit_code(state: Option<&RpcState>) -> i32 {
   let Some(state) = state else {
     return 1;
   };
+  if state.reason.is_some() {
+    return 1;
+  }
   if let Some(code) = state.exit_code {
     return code;
   }
@@ -608,7 +638,8 @@ pub fn cli() -> ClapCommand {
             .help("Fail if the runner is not running instead of starting it"),
         ),
       ClapCommand::new("up")
-        .about("Start the runner if needed and the autostart tasks"),
+        .about("Start the runner if needed and the saved and autostart tasks")
+        .arg(runner_ref_arg()),
       ClapCommand::new("down")
         .about("Stop the runner, keeping the tasks for the next up")
         .arg(runner_ref_arg()),
@@ -808,21 +839,15 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         println!("{}", crate::term::vt::emit::SGR_RESET);
       }
     }
-    Some(("up", _)) => {
-      let runner = resolve_runner(&matches)?;
-      let result = rpc_request(
-        &runner,
-        RpcRequest::Command(Command::Start {
-          target: Target::tag(AUTOSTART_TAG),
-        }),
-        true,
-      )
-      .await?;
-      print_acted(result, json, "Started", "No autostart tasks.")?;
+    Some(("up", sub_m)) => {
+      let runner = arg_runner(&matches, sub_m)?;
+      let result =
+        rpc_request(&runner, RpcRequest::Command(Command::Up), true).await?;
+      print_acted(result, json, "Started", "Nothing to start.")?;
     }
     Some(("down", sub_m)) => {
       let runner = arg_runner(&matches, sub_m)?;
-      let stopped = shutdown_runner(&runner, true).await?;
+      let stopped = shutdown_runner(&runner, Command::Down).await?;
       if json {
         println!("{}", serde_json::json!({ "stopped": stopped }));
       } else if stopped {
@@ -914,7 +939,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       }
       Some(("stop", sub_m)) => {
         let runner = arg_runner(&matches, sub_m)?;
-        let stopped = shutdown_runner(&runner, false).await?;
+        let stopped = shutdown_runner(&runner, Command::Quit).await?;
         // A save left by an earlier down would bring the tasks back.
         let mut removed_saved = false;
         if !stopped {

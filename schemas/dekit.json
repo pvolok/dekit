@@ -39,7 +39,10 @@
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/task" }
     },
-    "defaults": { "$ref": "#/$defs/taskSettings" },
+    "defaults": {
+      "$ref": "#/$defs/taskSettings",
+      "unevaluatedProperties": false
+    },
     "log": {
       "type": "object",
       "additionalProperties": false,
@@ -52,6 +55,22 @@
     "on_idle": { "type": "object" }
   },
   "$defs": {
+    "duration": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*(ms|s|m|h)$",
+      "description": "At most 24h."
+    },
+    "argv": {
+      "description": "A program and its arguments. An array is the exact argv; a string is split into words with sh quoting rules, and shell syntax in it is an error.",
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+      ]
+    },
+    "signal": {
+      "type": "string",
+      "pattern": "^SIG[A-Z0-9]+$"
+    },
     "taskSettings": {
       "type": "object",
       "properties": {
@@ -59,23 +78,8 @@
         "env": { "type": "object" },
         "add_path": { "type": "array", "items": { "type": "string" } },
         "autostart": { "type": "boolean" },
-        "autorestart": { "type": "boolean" },
-        "ready_log": { "type": "string" },
-        "stop": {
-          "oneOf": [
-            { "type": "string" },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "signal": { "type": "string" },
-                "group": { "type": "boolean" },
-                "send-keys": { "type": "array", "items": { "type": "string" } },
-                "cmd": { "type": "string" }
-              }
-            }
-          ]
-        },
+        "autorestart": { "enum": ["never", "on-failure", "always"] },
+        "stop": { "$ref": "#/$defs/stop" },
         "log": {
           "oneOf": [
             { "type": "boolean" },
@@ -97,36 +101,151 @@
         "mouse_scroll_speed": { "type": "integer", "minimum": 0 }
       }
     },
+    "stop": {
+      "description": "A signal name, or an object with at most one of signal, keys, or cmd (none: the one from defaults, else SIGTERM to the process group), plus timeout.",
+      "oneOf": [
+        { "$ref": "#/$defs/signal" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "timeout": { "$ref": "#/$defs/duration" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signal"],
+          "properties": {
+            "signal": { "$ref": "#/$defs/signal" },
+            "group": {
+              "type": "boolean",
+              "description": "false sends the signal to the main process only."
+            },
+            "timeout": { "$ref": "#/$defs/duration" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["keys"],
+          "properties": {
+            "keys": { "type": "array", "items": { "type": "string" } },
+            "timeout": { "$ref": "#/$defs/duration" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cmd"],
+          "properties": {
+            "cmd": { "$ref": "#/$defs/argv" },
+            "timeout": { "$ref": "#/$defs/duration" }
+          }
+        }
+      ]
+    },
+    "ready": {
+      "description": "Exactly one check, plus timeout (and interval for polled checks).",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["log"],
+          "properties": {
+            "log": { "type": "string", "minLength": 1 },
+            "timeout": { "$ref": "#/$defs/duration" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tcp"],
+          "properties": {
+            "tcp": {
+              "oneOf": [
+                { "type": "integer", "minimum": 1, "maximum": 65535 },
+                { "type": "string" }
+              ]
+            },
+            "interval": { "$ref": "#/$defs/duration" },
+            "timeout": { "$ref": "#/$defs/duration" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["http"],
+          "properties": {
+            "http": { "type": "string", "pattern": "^http://" },
+            "interval": { "$ref": "#/$defs/duration" },
+            "timeout": { "$ref": "#/$defs/duration" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cmd"],
+          "properties": {
+            "cmd": { "$ref": "#/$defs/argv" },
+            "interval": { "$ref": "#/$defs/duration" },
+            "timeout": { "$ref": "#/$defs/duration" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["file"],
+          "properties": {
+            "file": { "type": "string" },
+            "interval": { "$ref": "#/$defs/duration" },
+            "timeout": { "$ref": "#/$defs/duration" }
+          }
+        }
+      ]
+    },
     "task": {
+      "type": "object",
       "allOf": [
         { "$ref": "#/$defs/taskSettings" },
         {
-          "type": "object",
-          "additionalProperties": true,
           "properties": {
             "label": { "type": "string" },
-            "cmd": {
-              "oneOf": [
-                { "type": "string" },
-                { "type": "array", "items": { "type": "string" } }
-              ]
-            },
-            "shell": { "type": "string" },
+            "type": { "enum": ["service", "job"] },
+            "cmd": { "$ref": "#/$defs/argv" },
             "script": { "type": "string", "pattern": "\\.m?js$" },
             "deps": {
               "type": "array",
               "description": "Local names are rebased by fragment mounts; prefix / to address the project root.",
               "items": { "type": "string" }
             },
-            "tags": { "type": "array", "items": { "type": "string" } }
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "ready": { "$ref": "#/$defs/ready" }
           },
           "oneOf": [
             { "required": ["cmd"] },
-            { "required": ["shell"] },
             { "required": ["script"] }
           ]
+        },
+        {
+          "oneOf": [
+            {
+              "title": "service",
+              "properties": { "type": { "const": "service" } }
+            },
+            {
+              "title": "job",
+              "required": ["type"],
+              "properties": {
+                "type": { "const": "job" },
+                "autorestart": { "enum": ["never", "on-failure"] }
+              },
+              "not": { "required": ["ready"] }
+            }
+          ]
         }
-      ]
+      ],
+      "unevaluatedProperties": false
     }
   }
 }

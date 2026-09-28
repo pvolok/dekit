@@ -100,6 +100,13 @@ pub struct ActResult {
   pub matched: usize,
 }
 
+/// Result of `quit`: the runner exits within this, having stopped each
+/// task (grace, then hard kill) and saved them if asked.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct QuitResult {
+  pub stop_within_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TaskListResult {
   pub tasks: Vec<RpcTaskInfo>,
@@ -111,8 +118,10 @@ pub struct ScreenResult {
 }
 
 /// A task's lifecycle state on the wire: a stable token, plus the exit
-/// detail for `done`/`exited`. `state` is one of `idle`, `starting`,
-/// `running`, `ready`, `stopping`, `backoff`, `done`, `exited`.
+/// detail for `done`/`exited`/`backoff`. `state` is one of `idle`,
+/// `starting`, `running`, `ready`, `stopping`, `backoff`, `done`,
+/// `exited`. `reason` says why dekit ended it: `ready_timeout` (not ready
+/// in time).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RpcState {
   pub state: String,
@@ -120,6 +129,8 @@ pub struct RpcState {
   pub exit_code: Option<i32>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub signal: Option<i32>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub reason: Option<String>,
 }
 
 /// `path` is the space-qualified target of the task (`@dekit/console`),
@@ -144,6 +155,9 @@ pub struct RpcWhy {
   pub supported: bool,
   pub vetoed: bool,
   pub pinned: bool,
+  /// Started at the last `down`; `up` starts it again.
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub saved_pin: bool,
   pub required_by: Vec<String>,
   pub deps: Vec<RpcWhyDep>,
   pub attempts: u32,
@@ -180,8 +194,8 @@ mod tests {
         deps: vec![Target::glob("db")],
         tags: vec!["backend".to_string()],
       }),
-      RpcRequest::Command(Command::Quit { save: true }),
-      RpcRequest::Command(Command::Quit { save: false }),
+      RpcRequest::Command(Command::Down),
+      RpcRequest::Command(Command::Quit),
       RpcRequest::Ls { target: None },
       RpcRequest::Ls {
         target: Some(Target::glob("services/*")),
@@ -207,6 +221,7 @@ mod tests {
       RpcRequest::Upgrade {
         binary: "/opt/dekit/bin/dekit".to_string(),
       },
+      RpcRequest::Command(Command::Up),
     ]
   }
 
@@ -219,8 +234,8 @@ mod tests {
         "command",
         r#"{"cmd":["./api"],"command":"add","cwd":"/repo","deps":["db"],"tags":["backend"],"target":"api"}"#,
       ),
+      ("command", r#"{"command":"down"}"#),
       ("command", r#"{"command":"quit"}"#),
-      ("command", r#"{"command":"quit","save":false}"#),
       ("ls", r#"null"#),
       ("ls", r#"{"target":"services/*"}"#),
       ("why", r#"{"target":"web"}"#),
@@ -234,6 +249,7 @@ mod tests {
         r#"{"height":24,"target":"web/dev","until_exit":true,"width":80}"#,
       ),
       ("upgrade", r#"{"binary":"/opt/dekit/bin/dekit"}"#),
+      ("command", r#"{"command":"up"}"#),
     ];
     let samples = samples();
     assert_eq!(samples.len(), expected.len());

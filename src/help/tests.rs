@@ -437,9 +437,14 @@ fn usage_expands_from_clap() {
     MANIFEST,
   );
   let up = ir.topic("cli/up").unwrap();
-  assert_eq!(up.summary, "Start the runner if needed and the autostart tasks");
+  assert_eq!(
+    up.summary,
+    "Start the runner if needed and the saved and autostart tasks"
+  );
   match &up.blocks[1] {
-    Block::Code { text, .. } => assert_eq!(text, "dekit up [OPTIONS]"),
+    Block::Code { text, .. } => {
+      assert_eq!(text, "dekit up [OPTIONS] [runner]")
+    }
     other => panic!("expected the usage line, got {other:?}"),
   }
   let root = ir.topic("cli").unwrap();
@@ -515,12 +520,16 @@ fn config_keys_match_code_schema_and_docs() {
   use std::collections::BTreeSet;
 
   use crate::config::config::{PRESENTATION_KEYS, ROOT_KEYS};
+  use crate::config::ready::{READY_CHECKS, READY_SETTINGS};
+  use crate::config::stop_signal::STOP_KEYS;
   use crate::config::task::{TASK_KEYS, TASK_SETTING_KEYS};
 
   let docs =
     load().unwrap_or_else(|errors| panic!("{}", super::error::join(&errors)));
   let mut docs_root = BTreeSet::new();
   let mut docs_task = BTreeSet::new();
+  let mut docs_ready = BTreeSet::new();
+  let mut docs_stop = BTreeSet::new();
   for topic in &docs.topics {
     for block in &topic.blocks {
       let Block::Fields {
@@ -532,7 +541,12 @@ fn config_keys_match_code_schema_and_docs() {
       };
       for item in items {
         if let Some(key) = item.key.strip_prefix("tasks.*.") {
-          docs_task.insert(key.to_string());
+          match key.split_once('.') {
+            None => docs_task.insert(key.to_string()),
+            Some(("ready", sub)) => docs_ready.insert(sub.to_string()),
+            Some(("stop", sub)) => docs_stop.insert(sub.to_string()),
+            Some(_) => panic!("{} has no key list to check", item.key),
+          };
         } else if !item.key.contains('.') {
           docs_root.insert(item.key.clone());
         }
@@ -549,6 +563,9 @@ fn config_keys_match_code_schema_and_docs() {
     .collect();
   assert_eq!(docs_root, code_root, "project keys: docs vs code");
   assert_eq!(docs_task, set(TASK_KEYS), "task keys: docs vs code");
+  let code_ready = set(&[READY_CHECKS, READY_SETTINGS].concat());
+  assert_eq!(docs_ready, code_ready, "ready keys: docs vs code");
+  assert_eq!(docs_stop, set(STOP_KEYS), "stop keys: docs vs code");
 
   let schema: serde_json::Value =
     serde_json::from_str(include_str!("../../schemas/dekit.json")).unwrap();
@@ -569,6 +586,19 @@ fn config_keys_match_code_schema_and_docs() {
   let mut schema_task = settings;
   schema_task.extend(keys(&schema["$defs"]["task"]["allOf"][1]["properties"]));
   assert_eq!(schema_task, set(TASK_KEYS), "task keys: schema vs code");
+  let mut schema_ready = BTreeSet::new();
+  for check in schema["$defs"]["ready"]["oneOf"].as_array().unwrap() {
+    schema_ready.extend(keys(&check["properties"]));
+  }
+  assert_eq!(schema_ready, code_ready, "ready keys: schema vs code");
+  let mut schema_stop = BTreeSet::new();
+  for form in schema["$defs"]["stop"]["oneOf"].as_array().unwrap() {
+    // The signal name has no keys.
+    if form["properties"].is_object() {
+      schema_stop.extend(keys(&form["properties"]));
+    }
+  }
+  assert_eq!(schema_stop, set(STOP_KEYS), "stop keys: schema vs code");
 }
 
 const JS_MEMBERS: &str = r#"(() => {

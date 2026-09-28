@@ -36,7 +36,7 @@ impl Modal for RenameTaskModal {
     ModalResult::Keep
   }
 
-  fn size(&self) -> (u16, u16) {
+  fn size(&self, _frame: Rect) -> (u16, u16) {
     (42, 3)
   }
 

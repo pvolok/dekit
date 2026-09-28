@@ -13,12 +13,13 @@ pub enum ModalResult {
 pub trait Modal: Send {
   fn handle_key(&mut self, key: &Key) -> ModalResult;
 
-  fn size(&self) -> (u16, u16);
+  /// Width and height, given the frame the modal is centered in.
+  fn size(&self, frame: Rect) -> (u16, u16);
 
   fn render(&mut self, grid: &mut Grid, keymap: &Keymap);
 
   fn area(&self, frame: Rect) -> Rect {
-    let (w, h) = self.size();
+    let (w, h) = self.size(frame);
     let w = w.min(frame.width);
     let h = h.min(frame.height);
     Rect {

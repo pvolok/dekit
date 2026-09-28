@@ -56,6 +56,8 @@ declare const std: {
   readonly dekit: {
     /** Pin and start the matching tasks and their dependencies. */
     start(target: string): Promise<number>;
+    /** Start what `dekit down` saved as started and the autostart tasks, as `dekit up` does. */
+    up(): Promise<number>;
     /** Force-restart the matching tasks, whether or not they are wanted. */
     run(target: string): Promise<number>;
     /** Unpin and stop; a task restarts if a dependent still needs it. */

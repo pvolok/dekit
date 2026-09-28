@@ -174,12 +174,14 @@ fn parse_stop(val: &Val) -> Result<StopSignal> {
     Value::Mapping(map) => {
       if let Some(keys) = map.get("send-keys") {
         let keys: Vec<KeySpec> = serde_yaml::from_value(keys.clone())?;
-        Ok(StopSignal::SendKeys(
+        Ok(StopSignal::Keys(
           keys.into_iter().map(KeySpec::key).collect(),
         ))
       } else if let Some(cmd) = map.get("cmd") {
         match cmd {
-          Value::String(shell) => Ok(StopSignal::Cmd(shell.clone())),
+          Value::String(shell) => {
+            Ok(StopSignal::Cmd(crate::parse_shell::system_argv(shell)))
+          }
           _ => Err(val.error_at("Expected `cmd` to be a string")),
         }
       } else {

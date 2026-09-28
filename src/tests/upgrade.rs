@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use lib::protocol::{
   ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request, RpcRequest,
@@ -137,14 +137,15 @@ async fn upgrade_keeps_child_client_and_identity() {
 
 /// A restart is an upgrade into the same binary that re-reads
 /// `dekit.yaml`: a running task keeps its child and takes the new command
-/// at its next start, and a task added to the config appears.
+/// at its next start, and a task added to the config appears idle, for
+/// `up` to start.
 #[tokio::test]
 async fn restart_reloads_config() {
   let runner = TestRunner::new("rs");
   runner.yaml(
     "tasks:\n  alpha:\n    cmd: [sh, -c, 'echo pid $$; echo one; sleep 60']\n    autostart: true\n",
   );
-  runner.start_runner();
+  runner.ok(&["up"]);
   wait_until("alpha ready", || {
     task_line(&runner, "alpha").contains("ready")
   });
@@ -160,16 +161,20 @@ async fn restart_reloads_config() {
     "{out:?}"
   );
 
-  // The running child is untouched; the added task starts.
+  // The running child is untouched; the added task is idle until `up`.
   assert_eq!(pid_of(&runner, "alpha"), pid);
   let screen = runner.ok(&["screen", "alpha"]);
   assert!(
     screen.contains("one") && !screen.contains("two"),
     "{screen}"
   );
+  let beta = task_line(&runner, "beta");
+  assert!(beta.contains("idle"), "{beta}");
+  runner.ok(&["up"]);
   wait_until("beta ready", || {
     task_line(&runner, "beta").contains("ready")
   });
+  assert_eq!(pid_of(&runner, "alpha"), pid);
 
   // The new command applies at the next start.
   runner.ok(&["restart", "alpha"]);

@@ -7,7 +7,7 @@ order: 20
 
 A **target** selects tasks. `start`, `stop`, `kill`, `veto`, `restart`, and
 `rm` require one; `ls` defaults to everything. `up` and `down` take no
-target: they start and stop the whole project (|cli/up|).
+target (|cli/up|, |cli/down|).
 
 ## Forms
 

@@ -8,7 +8,7 @@ related: [start/getting-started, start/runners, start/from-mprocs]
 servers, databases and workers, in development and in production.
 
 - Define your project's tasks in a config file (|config|)
-- dekit handles dependencies, crashes and restarts (|config/tasks|)
+- dekit starts tasks in order, waits until each one is ready, and can restart the ones that crash (|config/tasks|)
 - Watch and control tasks in a terminal UI (|cli/attach|)
 - A full CLI for humans and agents (|cli|)
 - Built-in JavaScript for writing scripts (|js|)

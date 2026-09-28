@@ -1,146 +1,186 @@
-use anyhow::bail;
+use std::time::Duration;
+
+use anyhow::{Result, bail};
 
 use crate::cfg::{CfgCx, CfgNode, FromCfg};
-use crate::mprocs::yaml_val::Val;
+use crate::config::task::{NO_SHELL, argv_from_cfg, refuse_removed};
 pub use crate::task::process_task::{Sig, StopSignal};
-use crate::term::key::KeySpec;
+use crate::term::key::Key;
 
-impl StopSignal {
-  pub fn from_val(val: &Val) -> anyhow::Result<Self> {
-    match val.raw() {
-      serde_yaml::Value::String(str) => match str.as_str() {
-        "shutdown" => return Ok(StopSignal::Shutdown),
-        "kill" => return Ok(StopSignal::Kill),
-        _ => {
-          if let Some(sig) = Sig::from_name(str) {
-            return Ok(Self::Signal { sig, group: true });
-          }
-        }
-      },
-      serde_yaml::Value::Mapping(map) => {
-        if let Some(keys) = map.get("send-keys") {
-          let keys: Vec<KeySpec> = serde_yaml::from_value(keys.clone())?;
-          let keys = keys.into_iter().map(KeySpec::key).collect();
-          return Ok(Self::SendKeys(keys));
-        }
-        if let Some(cmd) = map.get("cmd") {
-          if let serde_yaml::Value::String(shell) = cmd {
-            return Ok(Self::Cmd(shell.clone()));
-          }
-          bail!("Expected 'cmd' to be a string");
-        }
-        if let Some(signal) = map.get("signal") {
-          let serde_yaml::Value::String(name) = signal else {
-            bail!("Expected 'signal' to be a string");
-          };
-          let group = match map.get("group") {
-            None => true,
-            Some(serde_yaml::Value::Bool(group)) => *group,
-            Some(_) => bail!("Expected 'group' to be a boolean"),
-          };
-          return Ok(Self::Signal {
-            sig: Sig::from_name(name)
-              .ok_or_else(|| anyhow::format_err!("Unknown signal: {name:?}"))?,
-            group,
-          });
-        }
-      }
-      _ => (),
+/// Keys of a task's `stop` object.
+pub(crate) const STOP_KEYS: &[&str] =
+  &["signal", "group", "keys", "cmd", "timeout"];
+
+/// A task's `stop`: how, and how long before the hard kill. Each part a
+/// task leaves out comes from `defaults`.
+#[derive(Clone, Debug)]
+pub struct StopConfig {
+  pub signal: Option<StopSignal>,
+  pub timeout: Option<Duration>,
+}
+
+impl StopConfig {
+  pub fn merged(self, over: StopConfig) -> StopConfig {
+    StopConfig {
+      signal: over.signal.or(self.signal),
+      timeout: over.timeout.or(self.timeout),
     }
-    bail!("Unexpected 'stop' value: {:?}.", val.raw());
   }
 }
 
-impl FromCfg for StopSignal {
-  fn from_cfg(node: &CfgNode<'_>, _cx: &CfgCx) -> anyhow::Result<Self> {
-    StopSignal::from_val(&Val::new(node.raw())?).map_err(|err| node.error(err))
+impl FromCfg for StopConfig {
+  fn from_cfg(node: &CfgNode<'_>, cx: &CfgCx) -> Result<Self> {
+    if !node.is_mapping() {
+      return Ok(StopConfig {
+        signal: Some(StopSignal::Signal {
+          sig: sig_from_cfg(node)?,
+          group: true,
+        }),
+        timeout: None,
+      });
+    }
+    let obj = node.as_obj()?;
+    refuse_removed(
+      &obj,
+      &[NO_SHELL, ("send-keys", "'send-keys' is now 'keys'")],
+    )?;
+    obj.known_keys(STOP_KEYS)?;
+    let signal = match (obj.get("signal"), obj.get("keys"), obj.get("cmd")) {
+      (None, None, None) => None,
+      (Some(signal), None, None) => Some(StopSignal::Signal {
+        sig: sig_from_cfg(&signal)?,
+        group: obj.default("group", true, cx)?,
+      }),
+      (None, Some(keys), None) => Some(StopSignal::Keys(
+        keys
+          .as_arr()?
+          .iter()
+          .map(|key| Key::parse(key.as_str()?).map_err(|err| key.error(err)))
+          .collect::<Result<_>>()?,
+      )),
+      (None, None, Some(cmd)) => Some(StopSignal::Cmd(argv_from_cfg(&cmd)?)),
+      _ => {
+        bail!(obj.error("stop takes at most one of 'signal', 'keys', or 'cmd'"))
+      }
+    };
+    if obj.get("signal").is_none()
+      && let Some(group) = obj.get("group")
+    {
+      bail!(group.error("'group' goes with 'signal'"));
+    }
+    Ok(StopConfig {
+      signal,
+      timeout: obj.optional("timeout", cx)?,
+    })
   }
+}
+
+fn sig_from_cfg(node: &CfgNode<'_>) -> Result<Sig> {
+  let name = node.as_str()?;
+  Sig::from_name(name).ok_or_else(|| {
+    node.error(format!(
+      "unknown signal '{name}'; expected a signal name such as SIGINT or SIGTERM"
+    ))
+  })
 }
 
 #[cfg(test)]
 mod tests {
+  use std::path::PathBuf;
+
   use super::*;
-  use crate::term::key::{Key, KeyCode, KeyMods};
+  use crate::cfg::CfgDoc;
+  use crate::term::key::{KeyCode, KeyMods, MediaKeyCode};
 
-  #[test]
-  fn stop_signal_send_keys_uses_key_specs() {
-    let raw: serde_yaml::Value = serde_yaml::from_str(
-      "send-keys:\n  - <C-a>\n  - <F13>\n  - <MediaPlayPause>\n",
-    )
-    .unwrap();
-    let val = Val::new(&raw).unwrap();
+  fn parse(yaml: &str) -> Result<StopConfig> {
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    let cx = CfgCx::new(PathBuf::from("."));
+    let doc = CfgDoc::from_value(value, &cx).unwrap();
+    StopConfig::from_cfg(&doc.root(), &cx)
+  }
 
-    let keys = match StopSignal::from_val(&val).unwrap() {
-      StopSignal::SendKeys(keys) => keys,
-      other => panic!("Expected SendKeys, got {other:?}"),
-    };
-
-    assert_eq!(
-      keys,
-      vec![
-        Key::new(KeyCode::Char('a'), KeyMods::CONTROL),
-        Key::new(KeyCode::F(13), KeyMods::NONE),
-        Key::new(
-          KeyCode::Media(crate::term::key::MediaKeyCode::PlayPause),
-          KeyMods::NONE,
-        ),
-      ]
-    );
+  fn stop(yaml: &str) -> StopSignal {
+    parse(yaml).unwrap().signal.unwrap()
   }
 
   #[test]
-  fn stop_signal_shutdown_and_kill_are_first_class() {
-    let raw: serde_yaml::Value = serde_yaml::from_str("shutdown").unwrap();
-    let val = Val::new(&raw).unwrap();
-    match StopSignal::from_val(&val).unwrap() {
-      StopSignal::Shutdown => {}
-      other => panic!("Expected Shutdown, got {other:?}"),
-    }
-
-    let raw: serde_yaml::Value = serde_yaml::from_str("kill").unwrap();
-    let val = Val::new(&raw).unwrap();
-    match StopSignal::from_val(&val).unwrap() {
-      StopSignal::Kill => {}
-      other => panic!("Expected Kill, got {other:?}"),
-    }
-  }
-
-  #[test]
-  fn stop_signal_bare_signal_name_targets_the_group() {
-    let raw: serde_yaml::Value = serde_yaml::from_str("SIGINT").unwrap();
-    let val = Val::new(&raw).unwrap();
-    match StopSignal::from_val(&val).unwrap() {
+  fn signal_name_targets_the_group() {
+    match stop("SIGINT") {
       StopSignal::Signal {
         sig: Sig::Int,
         group: true,
-      } => {}
-      other => panic!("Expected group SIGINT, got {other:?}"),
+      } => (),
+      other => panic!("{other:?}"),
     }
-
-    // Any standard signal is accepted, not just INT/TERM/KILL.
-    let raw: serde_yaml::Value = serde_yaml::from_str("SIGHUP").unwrap();
-    let val = Val::new(&raw).unwrap();
-    match StopSignal::from_val(&val).unwrap() {
+    // Any standard signal, not just INT/TERM/KILL.
+    match stop("SIGHUP") {
       StopSignal::Signal {
         sig: Sig::Hup,
         group: true,
-      } => {}
-      other => panic!("Expected group SIGHUP, got {other:?}"),
+      } => (),
+      other => panic!("{other:?}"),
     }
-  }
-
-  #[test]
-  fn stop_signal_object_group_overrides_default() {
-    let raw: serde_yaml::Value =
-      serde_yaml::from_str("signal: SIGKILL\ngroup: false\n").unwrap();
-    let val = Val::new(&raw).unwrap();
-    // Explicit group:false wins over the whole-group default.
-    match StopSignal::from_val(&val).unwrap() {
+    match stop("{signal: SIGKILL, group: false}") {
       StopSignal::Signal {
         sig: Sig::Kill,
         group: false,
-      } => {}
-      other => panic!("Expected leader-only SIGKILL, got {other:?}"),
+      } => (),
+      other => panic!("{other:?}"),
+    }
+    assert_eq!(parse("SIGINT").unwrap().timeout, None);
+  }
+
+  #[test]
+  fn object_forms() {
+    match stop("{keys: ['<C-a>', '<F13>', '<MediaPlayPause>']}") {
+      StopSignal::Keys(keys) => assert_eq!(
+        keys,
+        [
+          Key::new(KeyCode::Char('a'), KeyMods::CONTROL),
+          Key::new(KeyCode::F(13), KeyMods::NONE),
+          Key::new(KeyCode::Media(MediaKeyCode::PlayPause), KeyMods::NONE),
+        ]
+      ),
+      other => panic!("{other:?}"),
+    }
+    match stop("{cmd: 'docker compose stop'}") {
+      StopSignal::Cmd(argv) => assert_eq!(argv, ["docker", "compose", "stop"]),
+      other => panic!("{other:?}"),
+    }
+    match stop("{cmd: \"kill -INT '1 2'\"}") {
+      StopSignal::Cmd(argv) => assert_eq!(argv, ["kill", "-INT", "1 2"]),
+      other => panic!("{other:?}"),
+    }
+    match stop("{cmd: [kill, -INT, '1 2']}") {
+      StopSignal::Cmd(argv) => assert_eq!(argv, ["kill", "-INT", "1 2"]),
+      other => panic!("{other:?}"),
+    }
+    // Only a timeout: the signal comes from `defaults`.
+    let config = parse("{timeout: 30s}").unwrap();
+    assert!(config.signal.is_none(), "{config:?}");
+    assert_eq!(config.timeout, Some(Duration::from_secs(30)));
+  }
+
+  #[test]
+  fn bad_forms() {
+    for (yaml, expected) in [
+      ("shutdown", "unknown signal 'shutdown'"),
+      ("kill", "unknown signal 'kill'"),
+      ("{signal: TERM}", "unknown signal 'TERM'"),
+      ("{cmd: x, keys: []}", "stop takes at most one of"),
+      ("{signal: SIGINT, cmd: x}", "stop takes at most one of"),
+      ("{shell: x}", "'shell' is not supported"),
+      ("{cmd: x, group: true}", "'group' goes with 'signal'"),
+      ("{group: false}", "'group' goes with 'signal'"),
+      ("{send-keys: ['<C-c>']}", "'send-keys' is now 'keys'"),
+      ("{keys: ['.exit']}", "Expected \"<\""),
+      ("{cmd: x, timeout: 5}", "expected a duration"),
+    ] {
+      let err = match parse(yaml) {
+        Ok(config) => panic!("{yaml}: accepted {config:?}"),
+        Err(err) => err.to_string(),
+      };
+      assert!(err.contains(expected), "{yaml}: {err}");
     }
   }
 }

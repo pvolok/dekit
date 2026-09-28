@@ -2,8 +2,10 @@ use crate::config::config::Config;
 use crate::config::hook::Hook;
 use crate::config::keymap::KeymapConfig;
 use crate::config::log::LogConfig;
+use crate::config::stop_signal::StopConfig;
 use crate::config::task::{CmdConfig, TaskConfig};
 use crate::config::tui::{SidebarConfig, TipsConfig, TuiConfig};
+use crate::kernel::task::{RestartMode, TaskKind};
 
 impl From<crate::mprocs::config::Config> for Config {
   fn from(legacy: crate::mprocs::config::Config) -> Self {
@@ -31,6 +33,7 @@ impl From<crate::mprocs::config::Config> for Config {
       keymap: KeymapConfig::default(),
       on_init: legacy.on_init.map(Hook::LegacyAction),
       on_idle: legacy.on_all_finished.map(Hook::LegacyAction),
+      system_shell: true,
       warnings: Vec::new(),
     }
   }
@@ -47,10 +50,18 @@ impl From<crate::mprocs::config::ProcConfig> for TaskConfig {
       cwd: legacy.cwd,
       env: legacy.env,
       add_path: Some(legacy.add_path).filter(|p| !p.is_empty()),
+      kind: TaskKind::Service,
+      ready: None,
       autostart: Some(legacy.autostart),
-      autorestart: Some(legacy.autorestart),
-      ready_log: None,
-      stop: Some(legacy.stop),
+      autorestart: Some(if legacy.autorestart {
+        RestartMode::OnFailure
+      } else {
+        RestartMode::Never
+      }),
+      stop: Some(StopConfig {
+        signal: Some(legacy.stop),
+        timeout: None,
+      }),
       log: legacy.log,
       scrollback_len: Some(legacy.scrollback_len),
       mouse_scroll_speed: Some(legacy.mouse_scroll_speed),
@@ -62,9 +73,9 @@ impl From<crate::mprocs::config::CmdConfig> for CmdConfig {
   fn from(legacy: crate::mprocs::config::CmdConfig) -> Self {
     match legacy {
       crate::mprocs::config::CmdConfig::Cmd { cmd } => CmdConfig::Cmd { cmd },
-      crate::mprocs::config::CmdConfig::Shell { shell } => {
-        CmdConfig::Shell { shell }
-      }
+      crate::mprocs::config::CmdConfig::Shell { shell } => CmdConfig::Cmd {
+        cmd: crate::parse_shell::system_argv(&shell),
+      },
     }
   }
 }

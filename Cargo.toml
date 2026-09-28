@@ -2,7 +2,6 @@
 strip = "symbols"
 opt-level = "z"   # optimize for binary size
 lto = true        # link time optimization
-panic = "abort"
 codegen-units = 1
 
 [workspace]

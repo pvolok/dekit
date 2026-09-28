@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::Result;
 pub use flexi_logger::LoggerHandle;
@@ -127,7 +127,13 @@ impl LogWriter for LazyFileWriter {
     now: &mut DeferredNow,
     record: &Record,
   ) -> std::io::Result<()> {
-    let mut inner = self.inner.lock().unwrap();
+    // Formatted before the lock is taken: a log argument whose `Display`
+    // panics must not leave it held, since the panic hook logs too.
+    let format = *self.format.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut line = Vec::new();
+    format(&mut line, now, record)?;
+    line.push(b'\n');
+    let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
     if inner.file.is_none() {
       if inner.open_failed {
         return Ok(());
@@ -141,14 +147,12 @@ impl LogWriter for LazyFileWriter {
         }
       }
     }
-    let format = *self.format.lock().unwrap();
     let file = inner.file.as_mut().unwrap();
-    format(file, now, record)?;
-    file.write_all(b"\n")
+    file.write_all(&line)
   }
 
   fn flush(&self) -> std::io::Result<()> {
-    let mut inner = self.inner.lock().unwrap();
+    let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(file) = inner.file.as_mut() {
       file.flush()
     } else {
@@ -161,6 +165,6 @@ impl LogWriter for LazyFileWriter {
   }
 
   fn format(&mut self, format: FormatFunction) {
-    *self.format.lock().unwrap() = format;
+    *self.format.lock().unwrap_or_else(PoisonError::into_inner) = format;
   }
 }

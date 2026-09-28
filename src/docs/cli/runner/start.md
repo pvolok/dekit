@@ -6,10 +6,10 @@ related: [cli/runner, cli/runner/stop, cli/runner/status]
 ---
 
 Starts the selected runner without attaching, and prints any config
-warnings. A runner that stopped with |cli/down| comes
-back with its saved tasks, and the ones you had started run again;
-otherwise the tasks with `autostart: true` start. A runner that is already
-running is left alone.
+warnings. It starts no tasks: a runner that stopped with |cli/down| comes
+back with its saved tasks idle, with their screens, and |cli/up| starts
+the ones you had started and the tasks with `autostart: true`. A runner
+that is already running is left alone.
 
 :::usage
 

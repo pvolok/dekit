@@ -6,29 +6,34 @@ use tokio::sync::oneshot::Receiver;
 use crate::{
   config::{
     config::Config,
-    task::{CmdConfig, DYNAMIC_TAG, TaskConfig},
+    task::{AUTOSTART_TAG, CmdConfig, DYNAMIC_TAG, TaskConfig},
   },
-  kernel::kernel_message::{
-    Ack, KernelCommand, RegisterError, TaskContext, TaskSelector,
+  kernel::{
+    kernel_message::{
+      Ack, KernelCommand, RegisterError, TaskContext, TaskSelector,
+    },
+    task::RestartMode,
   },
   target::Target,
   task::config_tasks::spawn_config_task,
 };
 
 /// The serde-stable verbs shared by the CLI, RPC, config hooks, and JS.
-/// Task-directed variants carry a `Target`; `quit` addresses the runner.
+/// Task-directed variants carry a `Target`; `up`, `down`, and `quit`
+/// address the runner.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "command", rename_all = "kebab-case")]
 pub enum Command {
   Batch {
     commands: Vec<Command>,
   },
-  /// Stop the runner. It saves its tasks for its next start unless
-  /// `save` is false.
-  Quit {
-    #[serde(default = "yes", skip_serializing_if = "is_yes")]
-    save: bool,
-  },
+  /// Save the tasks for the next `up`, then stop the runner.
+  Down,
+  /// Stop the runner without saving.
+  Quit,
+  /// Start what the last `down` saved as started, and the autostart
+  /// tasks; running tasks and done jobs are left alone.
+  Up,
   Start {
     target: Target,
   },
@@ -81,18 +86,12 @@ pub enum Command {
   },
 }
 
-fn yes() -> bool {
-  true
-}
-
-fn is_yes(value: &bool) -> bool {
-  *value
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandResult {
   None,
   Matched(usize),
+  /// A quit: the runner exits within this.
+  Quitting(std::time::Duration),
 }
 
 #[derive(Debug)]
@@ -132,7 +131,9 @@ pub async fn execute(
   }
   match command {
     Command::Batch { .. } => Ok(CommandResult::None),
-    Command::Quit { .. }
+    Command::Down
+    | Command::Quit
+    | Command::Up
     | Command::Start { .. }
     | Command::Stop { .. }
     | Command::Kill { .. }
@@ -169,6 +170,7 @@ pub fn issue(pc: &TaskContext, config: &Config, command: Command) {
 enum Pending {
   Matched(Receiver<usize>),
   Registered(Receiver<Result<(), RegisterError>>),
+  Quitting(Receiver<std::time::Duration>),
 }
 
 impl Pending {
@@ -183,6 +185,10 @@ impl Pending {
         Ok(Err(err)) => Err(CommandError::Register(err)),
         Err(_) => Err(CommandError::KernelClosed),
       },
+      Pending::Quitting(rx) => rx
+        .await
+        .map(CommandResult::Quitting)
+        .map_err(|_| CommandError::KernelClosed),
     }
   }
 }
@@ -190,6 +196,18 @@ impl Pending {
 /// Every kernel message a command sends leaves here synchronously, so two
 /// commands issued in a row reach the kernel in that order. With `acks`
 /// off, only outcomes that can fail (registrations) are collected.
+fn quit(pc: &TaskContext, save: bool, pending: &mut Vec<Pending>, acks: bool) {
+  if acks {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    pc.send(KernelCommand::QuitWithin { save, reply });
+    pending.push(Pending::Quitting(rx));
+  } else if save {
+    pc.send(KernelCommand::Quit);
+  } else {
+    pc.send(KernelCommand::QuitWithoutSave);
+  }
+}
+
 fn dispatch(
   pc: &TaskContext,
   config: &Config,
@@ -203,8 +221,15 @@ fn dispatch(
         dispatch(pc, config, command, pending, acks)?;
       }
     }
-    Command::Quit { save: true } => pc.send(KernelCommand::Quit),
-    Command::Quit { save: false } => pc.send(KernelCommand::QuitWithoutSave),
+    Command::Down => quit(pc, true, pending, acks),
+    Command::Quit => quit(pc, false, pending, acks),
+    Command::Up => act(
+      pc,
+      &Target::tag(AUTOSTART_TAG),
+      KernelCommand::Up,
+      pending,
+      acks,
+    )?,
     Command::Start { target } => {
       act(pc, target, KernelCommand::Start, pending, acks)?
     }
@@ -267,9 +292,7 @@ fn dispatch(
             "script command has no runner identity".to_string(),
           ));
         }
-        CmdConfig::Cmd { .. }
-        | CmdConfig::Shell { .. }
-        | CmdConfig::Script { .. } => {}
+        CmdConfig::Cmd { .. } | CmdConfig::Script { .. } => {}
       }
       let deps = deps
         .iter()
@@ -284,6 +307,9 @@ fn dispatch(
         tags: std::iter::once(DYNAMIC_TAG.to_string())
           .chain(tags.iter().cloned())
           .collect(),
+        // Never from `defaults`: a command run once (`dekit run`) would
+        // be rerun for ever.
+        autorestart: Some(RestartMode::Never),
         ..TaskConfig::default()
       };
       let (_, ack) = spawn_config_task(config, pc, key.space, task, deps, true);
@@ -339,8 +365,8 @@ mod tests {
         Command::Add {
           target: Target::glob("web"),
           label: Some("web server".to_string()),
-          cmd: CmdConfig::Shell {
-            shell: "npm start".to_string(),
+          cmd: CmdConfig::Cmd {
+            cmd: vec!["npm".to_string(), "start".to_string()],
           },
           cwd: None,
           env: None,
@@ -361,6 +387,15 @@ mod tests {
       })
       .unwrap(),
       r#"{"command":"start","target":"+dev"}"#
+    );
+    assert_eq!(
+      serde_json::to_string(&Command::Up).unwrap(),
+      r#"{"command":"up"}"#
+    );
+    // A field a later version might add is ignored, as for other verbs.
+    assert_eq!(
+      serde_yaml::from_str::<Command>("{command: up, later: 1}").unwrap(),
+      Command::Up
     );
     assert_eq!(
       serde_json::to_string(&Command::ForceRestart {
@@ -384,6 +419,49 @@ mod tests {
       .unwrap(),
       r#"{"command":"add","target":"web","cmd":["npm","start"],"cwd":"/repo"}"#
     );
+    // A string is split into the argv when read.
+    let add: Command = serde_yaml::from_str(
+      "{command: add, target: web, cmd: \"npm run 'my script'\"}",
+    )
+    .unwrap();
+    match add {
+      Command::Add {
+        cmd: CmdConfig::Cmd { cmd },
+        ..
+      } => assert_eq!(cmd, ["npm", "run", "my script"]),
+      other => panic!("{other:?}"),
+    }
+    // null is absent, as for `script`.
+    match serde_json::from_str::<Command>(
+      r#"{"command":"add","target":"job","script":"job.js","cmd":null}"#,
+    ) {
+      Ok(Command::Add {
+        cmd: CmdConfig::Script { script },
+        ..
+      }) => assert_eq!(script, std::path::PathBuf::from("job.js")),
+      other => panic!("{other:?}"),
+    }
+    for (yaml, expected) in [
+      (
+        "{command: add, target: web, cmd: 'a && b'}",
+        "`&` needs quotes",
+      ),
+      ("{command: add, target: web}", "expected 'cmd' or 'script'"),
+      ("{command: add, target: web, cmd: []}", "cmd is empty"),
+      (
+        "{command: add, target: web, cmd: null}",
+        "expected 'cmd' or 'script'",
+      ),
+      (
+        "{command: add, target: web, cmd: x, script: x.js}",
+        "expected only one of 'cmd' or 'script'",
+      ),
+    ] {
+      let err = serde_yaml::from_str::<Command>(yaml)
+        .unwrap_err()
+        .to_string();
+      assert!(err.contains(expected), "{yaml}: {err}");
+    }
   }
 
   #[test]
@@ -448,6 +526,37 @@ mod tests {
     pc.send(KernelCommand::Remove(TaskSelector::all(), None));
     pc.send(KernelCommand::Quit);
     handle.await.unwrap();
+  }
+
+  /// `defaults.autorestart` would rerun a command run once for ever.
+  #[test]
+  fn added_task_never_takes_autorestart_from_defaults() {
+    let mut config = Config::make_default();
+    config.defaults.autorestart = Some(RestartMode::Always);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let pc = TaskContext::new(
+      std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+      crate::kernel::task::INIT_TASK_ID,
+      tx,
+    );
+    let add = Command::Add {
+      target: "build".parse().unwrap(),
+      label: None,
+      cmd: CmdConfig::Cmd {
+        cmd: vec!["make".to_string()],
+      },
+      cwd: None,
+      env: None,
+      deps: vec![],
+      tags: vec![],
+    };
+    dispatch(&pc, &config, &add, &mut Vec::new(), true).unwrap();
+    match rx.try_recv().map(|msg| msg.command) {
+      Ok(KernelCommand::RegisterTask(registration, _)) => {
+        assert_eq!(registration.def.restart, RestartMode::Never)
+      }
+      _ => panic!("expected a registration"),
+    }
   }
 
   #[tokio::test]

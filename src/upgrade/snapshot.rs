@@ -61,13 +61,25 @@ pub mod v1 {
     #[serde(default)]
     pub deps: Vec<usize>,
     pub restart: Restart,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub job: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_timeout_ms: Option<u64>,
+    /// None is the default grace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_ms: Option<u64>,
     pub state: TaskState,
     pub vetoed: bool,
     pub killed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_failed: bool,
+    /// Started at the last save, and not pinned since: `up` starts it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub saved_pin: bool,
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_start_secs_ago: Option<u64>,
-    /// Remaining stop-grace or backoff time.
+    /// Remaining stop-grace, backoff, or ready-timeout time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timer_ms: Option<u64>,
     pub kind: TaskKind,
@@ -91,7 +103,9 @@ pub mod v1 {
     Running {},
     Ready {},
     Stopping {},
-    Backoff {},
+    /// The exit it backs off from; an older runner wrote none, which
+    /// reads as an exit with no detail.
+    Backoff(ExitInfo),
     Done(ExitInfo),
     Exited(ExitInfo),
   }
@@ -103,6 +117,8 @@ pub mod v1 {
     pub code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ready_timeout: bool,
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -120,13 +136,44 @@ pub mod v1 {
     pub stop: StopSignal,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<LogSpec>,
+    /// The `log` ready check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_log: Option<String>,
+    /// Any other ready check; never together with `ready_log`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_probe: Option<ReadyProbe>,
     pub scrollback_len: usize,
     pub mouse_scroll_speed: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<Instance>,
     pub screen: Screen,
+  }
+
+  #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
+  pub struct ReadyProbe {
+    pub check: ReadyCheck,
+    pub interval_ms: u64,
+  }
+
+  #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
+  #[serde(tag = "check", rename_all = "snake_case")]
+  pub enum ReadyCheck {
+    Tcp {
+      #[serde(default, skip_serializing_if = "Option::is_none")]
+      host: Option<String>,
+      port: u16,
+    },
+    Http {
+      url: String,
+    },
+    Cmd {
+      argv: Vec<String>,
+    },
+    File {
+      path: String,
+    },
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -140,6 +187,10 @@ pub mod v1 {
     pub env: Vec<(String, Option<String>)>,
   }
 
+  /// `program` is a program run without a shell (`stop: {cmd}`). Older
+  /// binaries wrote `cmd`, a line for the system shell (`/bin/sh -c`,
+  /// PowerShell on Windows), and `shutdown` and `kill`: SIGTERM and
+  /// SIGKILL to the group.
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
   #[serde(deny_unknown_fields)]
   #[serde(tag = "stop", rename_all = "snake_case")]
@@ -149,6 +200,7 @@ pub mod v1 {
     Signal { sig: String, group: bool },
     SendKeys { keys: Vec<crate::term::key::Key> },
     Cmd { cmd: String },
+    Program { argv: Vec<String> },
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -173,6 +225,9 @@ pub mod v1 {
     pub exit: Option<ExitInfo>,
     pub stdout_eof: bool,
     pub ready_sent: bool,
+    /// A stop was sent: no ready check runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_sent: bool,
     /// Base64.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ready_line: String,
@@ -314,6 +369,7 @@ impl From<crate::kernel::task::ExitInfo> for ExitInfo {
     ExitInfo {
       code: info.code,
       signal: info.signal,
+      ready_timeout: info.ready_timeout,
     }
   }
 }
@@ -323,6 +379,7 @@ impl From<ExitInfo> for crate::kernel::task::ExitInfo {
     crate::kernel::task::ExitInfo {
       code: info.code,
       signal: info.signal,
+      ready_timeout: info.ready_timeout,
     }
   }
 }
@@ -477,22 +534,26 @@ mod tests {
   /// A newer binary's field, unknown here, is refused wherever it is.
   #[test]
   fn unknown_field_is_refused_everywhere() {
-    let fixture: serde_json::Value =
-      serde_json::from_slice(include_bytes!("fixtures/v1.json")).unwrap();
-    let mut paths = Vec::new();
-    objects(&fixture, Vec::new(), &mut paths);
-    assert!(paths.len() > 20, "{}", paths.len());
-    for path in paths {
-      let mut planted = fixture.clone();
-      at_path(&mut planted, &path)
-        .as_object_mut()
-        .unwrap()
-        .insert("from_the_future".to_string(), serde_json::json!(1));
-      let err = decode(&serde_json::to_vec(&planted).unwrap())
-        .err()
-        .unwrap_or_else(|| panic!("accepted an unknown field at {path:?}"))
-        .to_string();
-      assert!(err.contains("written by dekit 0.9.6"), "{err}");
+    for bytes in [
+      &include_bytes!("fixtures/v1.json")[..],
+      &include_bytes!("fixtures/v1-orchestration.json")[..],
+    ] {
+      let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+      let mut paths = Vec::new();
+      objects(&fixture, Vec::new(), &mut paths);
+      assert!(paths.len() > 20, "{}", paths.len());
+      for path in paths {
+        let mut planted = fixture.clone();
+        at_path(&mut planted, &path)
+          .as_object_mut()
+          .unwrap()
+          .insert("from_the_future".to_string(), serde_json::json!(1));
+        let err = decode(&serde_json::to_vec(&planted).unwrap())
+          .err()
+          .unwrap_or_else(|| panic!("accepted an unknown field at {path:?}"))
+          .to_string();
+        assert!(err.contains("written by dekit 0.9.6"), "{err}");
+      }
     }
   }
 
@@ -514,6 +575,127 @@ mod tests {
         assert!(expected.contains_key(key), "new key {key} at {path:?}");
       }
     }
+  }
+
+  /// The fields added for task orchestration (ORCHESTRATION.md
+  /// "Snapshot"), each in use, read and write back unchanged.
+  #[test]
+  fn golden_v1_orchestration_round_trips() {
+    let bytes = include_bytes!("fixtures/v1-orchestration.json");
+    let snapshot = decode(bytes).unwrap();
+    let [db, migrate, api, web, worker] = &snapshot.tasks[..] else {
+      panic!("five tasks");
+    };
+    assert!(db.start_failed);
+    assert_eq!(
+      (db.ready_timeout_ms, db.stop_timeout_ms),
+      (Some(30_000), Some(2_000))
+    );
+    assert!(migrate.job);
+    assert!(worker.saved_pin && !worker.pinned);
+    assert_eq!(
+      api.state,
+      TaskState::Backoff(ExitInfo {
+        code: Some(0),
+        signal: None,
+        ready_timeout: true,
+      })
+    );
+    assert_eq!(
+      web.state,
+      TaskState::Exited(ExitInfo {
+        code: None,
+        signal: Some(15),
+        ready_timeout: true,
+      })
+    );
+    let process = |task: &Task| match &task.kind {
+      TaskKind::Process(process) => process.clone(),
+      TaskKind::Console {} => panic!("a process"),
+    };
+    let StopSignal::Program { .. } = process(db).stop else {
+      panic!("db stops with a program");
+    };
+    assert!(process(db).instance.is_some_and(|i| i.stop_sent));
+    let checks: Vec<ReadyCheck> = [db, api, web, worker]
+      .into_iter()
+      .map(|task| process(task).ready_probe.unwrap().check)
+      .collect();
+    let [
+      ReadyCheck::Tcp { .. },
+      ReadyCheck::Http { .. },
+      ReadyCheck::Cmd { .. },
+      ReadyCheck::File { .. },
+    ] = &checks[..]
+    else {
+      panic!("one check of each kind: {checks:?}");
+    };
+    let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(serde_json::to_value(&snapshot).unwrap(), fixture);
+    // An older runner's backoff: an exit with no detail, written back as
+    // it was.
+    let older = serde_json::json!({"state": "backoff"});
+    let state: TaskState = serde_json::from_value(older.clone()).unwrap();
+    assert_eq!(state, TaskState::Backoff(ExitInfo::default()));
+    assert_eq!(serde_json::to_value(state).unwrap(), older);
+  }
+
+  #[test]
+  fn stop_forms_round_trip() {
+    assert_eq!(
+      serde_json::to_value(StopSignal::Cmd {
+        cmd: "podman compose down".to_string()
+      })
+      .unwrap(),
+      serde_json::json!({"stop": "cmd", "cmd": "podman compose down"})
+    );
+    assert_eq!(
+      serde_json::to_value(StopSignal::Program {
+        argv: vec!["podman".to_string(), "stop".to_string()]
+      })
+      .unwrap(),
+      serde_json::json!({"stop": "program", "argv": ["podman", "stop"]})
+    );
+    for stop in [
+      StopSignal::Shutdown {},
+      StopSignal::Kill {},
+      StopSignal::Signal {
+        sig: "SIGINT".to_string(),
+        group: false,
+      },
+      StopSignal::SendKeys {
+        keys: vec![crate::term::key::Key::parse("<C-c>").unwrap()],
+      },
+      StopSignal::Cmd {
+        cmd: "podman compose down".to_string(),
+      },
+      StopSignal::Program {
+        argv: vec!["podman".to_string(), "stop".to_string()],
+      },
+    ] {
+      let mut snapshot = decode(include_bytes!("fixtures/v1.json")).unwrap();
+      let TaskKind::Process(process) = &mut snapshot.tasks[1].kind else {
+        panic!("the fixture's second task is a process");
+      };
+      process.stop = stop;
+      let mut encoded = Vec::new();
+      encode(&snapshot, &mut encoded).unwrap();
+      assert_eq!(decode(&encoded).unwrap(), snapshot);
+    }
+  }
+
+  /// A snapshot from before `ready:` keeps its log check.
+  #[test]
+  fn ready_log_still_decodes() {
+    let mut fixture: serde_json::Value =
+      serde_json::from_slice(include_bytes!("fixtures/v1.json")).unwrap();
+    fixture["tasks"][1]["kind"]["ready_log"] = serde_json::json!("listening");
+    let snapshot = decode(&serde_json::to_vec(&fixture).unwrap()).unwrap();
+    let TaskKind::Process(process) = &snapshot.tasks[1].kind else {
+      panic!("the fixture's second task is a process");
+    };
+    assert_eq!(process.ready_log.as_deref(), Some("listening"));
+    assert_eq!(process.ready_probe, None);
   }
 
   #[test]

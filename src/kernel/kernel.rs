@@ -1,10 +1,12 @@
 use std::{
   collections::{HashMap, HashSet, VecDeque},
   sync::{Arc, atomic::AtomicUsize},
+  task::{Context, Poll},
   time::{Duration, Instant},
 };
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio_util::time::{DelayQueue, delay_queue};
 
 use crate::kernel::kernel_message::{KernelSnapshot, TaskContext};
 use crate::upgrade::snapshot as snap;
@@ -18,7 +20,7 @@ use super::{
   namespace::Namespace,
   sub_trie::SubMode,
   task::{
-    Effects, ExitInfo, INIT_TASK_ID, ReadyMode, RestartMode, Task, TaskCmd,
+    Effects, ExitInfo, INIT_TASK_ID, ReadyMode, STOP_TIMEOUT, Task, TaskCmd,
     TaskDef, TaskEffect, TaskHandle, TaskId, TaskKind, TaskNotification,
     TaskNotify, TaskState,
   },
@@ -26,8 +28,9 @@ use super::{
   task_path::TaskPath,
 };
 
-/// How long a stopping task may take before it is hard-killed.
-const STOP_GRACE: Duration = Duration::from_secs(10);
+/// How long a hard-killed task may take to report stopped before the
+/// kernel gives up waiting.
+pub const KILL_WAIT: Duration = Duration::from_secs(10);
 
 const BACKOFF_MIN: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -37,14 +40,6 @@ const BACKOFF_RESET: Duration = Duration::from_secs(10);
 fn backoff_delay(attempts: u32) -> Duration {
   let exp = attempts.saturating_sub(1).min(16);
   BACKOFF_MIN.saturating_mul(1 << exp).min(BACKOFF_MAX)
-}
-
-/// A timer the runtime must arm: after `delay`, deliver `StateTimeout` for
-/// `(task_id, epoch)`.
-struct TimerRequest {
-  task_id: TaskId,
-  epoch: u64,
-  delay: Duration,
 }
 
 /// Reports when the selected set goes between "some task active" and
@@ -109,8 +104,9 @@ struct Graph {
   in_queue: HashSet<TaskId>,
 
   now: Instant,
-  /// Timers armed during a `step`, taken by the runtime afterwards.
-  pending_timers: Vec<TimerRequest>,
+  /// Tasks whose `deadline` was set, cleared, or re-set at a new epoch
+  /// since the runtime last looked; it keeps one timer per task to match.
+  timer_changes: Vec<TaskId>,
   /// Effects reported by tasks during the current step; `settle` applies
   /// them one at a time, each against settled state.
   pending_effects: VecDeque<(TaskId, TaskEffect)>,
@@ -121,10 +117,10 @@ struct Graph {
   frozen: Option<Frozen>,
   /// Freezes begun so far; numbers them.
   freezes: u64,
-  /// Every state transition, for the property harness to check against
-  /// the legal state diagram.
+  /// Every state transition and whether the task's start had failed,
+  /// for the property harness to check against the legal state diagram.
   #[cfg(test)]
-  transitions: Vec<(TaskId, TaskState, TaskState)>,
+  transitions: Vec<(TaskId, TaskState, TaskState, bool)>,
   /// Every command sent to a task, for the property harness to check
   /// that commands are never silently swallowed.
   #[cfg(test)]
@@ -148,7 +144,7 @@ impl Graph {
       in_queue: HashSet::new(),
 
       now: Instant::now(),
-      pending_timers: Vec::new(),
+      timer_changes: Vec::new(),
       pending_effects: VecDeque::new(),
       active_watches: Vec::new(),
       state_changed: false,
@@ -229,9 +225,12 @@ impl Graph {
       supported: false,
       wanted_parents: 0,
       active_dependents: 0,
+      start_failed: false,
+      saved_pin: def.saved_pin,
       kind: def.kind,
       ready: def.ready,
       restart: def.restart,
+      stop_timeout: def.stop_timeout,
       space: space.clone(),
       path: path.clone(),
       label: def.label,
@@ -239,18 +238,46 @@ impl Graph {
       tags: def.tags,
     };
     if let Some(saved) = saved {
-      handle.state = match saved.state {
+      let state = match saved.state {
         snap::TaskState::Idle {} => TaskState::Idle,
         snap::TaskState::Starting {} => TaskState::Starting,
         snap::TaskState::Running {} => TaskState::Running,
         snap::TaskState::Ready {} => TaskState::Ready,
         snap::TaskState::Stopping {} => TaskState::Stopping,
-        snap::TaskState::Backoff {} => TaskState::Backoff,
+        snap::TaskState::Backoff(info) => TaskState::Backoff(info.into()),
         snap::TaskState::Done(info) => TaskState::Done(info.into()),
         snap::TaskState::Exited(info) => TaskState::Exited(info.into()),
       };
+      // The config may have changed since the save; the task comes back
+      // in a state it can be in as now configured (ORCHESTRATION.md
+      // "Restore"). A live process follows the current ready check, as
+      // after a fresh start. An end state the config would not file its
+      // exit as is dropped: the task has not ended as what it now is.
+      handle.state = match state {
+        TaskState::Running => match handle.ready {
+          ReadyMode::Immediate => TaskState::Ready,
+          ReadyMode::Reported { .. } => TaskState::Running,
+        },
+        TaskState::Backoff(info)
+        | TaskState::Done(info)
+        | TaskState::Exited(info) => {
+          let kept = handle.exit_state(info) == state
+            && (!info.ready_timeout || handle.ready.timeout().is_some());
+          if kept { state } else { TaskState::Idle }
+        }
+        TaskState::Idle
+        | TaskState::Starting
+        | TaskState::Ready
+        | TaskState::Stopping => state,
+      };
       handle.vetoed = saved.vetoed;
+      handle.saved_pin = saved.saved_pin;
       handle.killed = saved.killed;
+      // The verdict of a ready timeout the task no longer has is dropped:
+      // its stop lands in Idle.
+      handle.start_failed = saved.start_failed
+        && handle.state == TaskState::Stopping
+        && handle.ready.timeout().is_some();
       handle.attempts = saved.attempts;
       handle.last_start = saved.last_start_secs_ago.map(|secs| {
         self
@@ -259,11 +286,31 @@ impl Graph {
           .unwrap_or(self.now)
       });
     }
+    // A ready timeout counts from the start; the other timers go on with
+    // what was left of them.
+    let timer = match handle.state {
+      TaskState::Running => handle.ready.timeout().map(|timeout| {
+        let elapsed = handle
+          .last_start
+          .map_or(Duration::ZERO, |start| self.now.duration_since(start));
+        timeout.saturating_sub(elapsed)
+      }),
+      TaskState::Stopping | TaskState::Backoff(_) => {
+        Some(Duration::from_millis(
+          saved.and_then(|saved| saved.timer_ms).unwrap_or(0),
+        ))
+      }
+      TaskState::Idle
+      | TaskState::Starting
+      | TaskState::Ready
+      | TaskState::Done(_)
+      | TaskState::Exited(_) => None,
+    };
     let state = handle.state;
     self.tasks.insert(task_id, handle);
     self.state_changed = true;
-    if let Some(ms) = saved.and_then(|saved| saved.timer_ms) {
-      self.schedule_state_timeout(task_id, 0, Duration::from_millis(ms));
+    if let Some(delay) = timer {
+      self.schedule_state_timeout(task_id, delay);
     }
 
     for tag in tags {
@@ -349,14 +396,27 @@ impl Graph {
     })
   }
 
-  fn take_timers(&mut self) -> Vec<TimerRequest> {
-    std::mem::take(&mut self.pending_timers)
+  fn take_timer_changes(&mut self) -> Vec<TaskId> {
+    std::mem::take(&mut self.timer_changes)
+  }
+
+  /// The task's timer: the epoch it is set at and the time left.
+  fn timer(&self, task_id: TaskId) -> Option<(u64, Duration)> {
+    let task = self.tasks.get(&task_id)?;
+    let deadline = task.deadline?;
+    Some((task.epoch, deadline.saturating_duration_since(self.now)))
   }
 
   fn any_active(&self, selector: &TaskSelector) -> bool {
     self.matching_ids(selector).into_iter().any(|id| {
-      let state = self.tasks[&id].state;
-      state.is_active() || state == TaskState::Backoff
+      match self.tasks[&id].state {
+        TaskState::Starting
+        | TaskState::Running
+        | TaskState::Ready
+        | TaskState::Stopping
+        | TaskState::Backoff(_) => true,
+        TaskState::Idle | TaskState::Done(_) | TaskState::Exited(_) => false,
+      }
     })
   }
 
@@ -392,16 +452,36 @@ impl Graph {
 
   // ---- Intent ----
 
-  fn cmd_start(&mut self, task_id: TaskId) {
-    self.add_edge(INIT_TASK_ID, task_id);
-    self.demand(task_id);
+  /// Sets the task's pin as a verb asks. The latest wish replaces what
+  /// was saved, so it clears the saved pin (ORCHESTRATION.md "Up").
+  fn set_pin(&mut self, task_id: TaskId, pinned: bool) {
+    if let Some(task) = self.tasks.get_mut(&task_id) {
+      task.saved_pin = false;
+    }
+    if pinned {
+      self.add_edge(INIT_TASK_ID, task_id);
+    } else {
+      self.remove_edge(INIT_TASK_ID, task_id);
+    }
   }
 
-  /// An explicit start demands the whole requirement closure: vetoed
-  /// tasks are released and dead deps revived, so the pull is never blocked
-  /// by an earlier stop or crash. Done jobs stay done unless directly
-  /// targeted.
-  fn demand(&mut self, task_id: TaskId) {
+  fn cmd_start(&mut self, task_id: TaskId) {
+    self.set_pin(task_id, true);
+    self.demand(task_id, true);
+  }
+
+  /// `up` for one task of its set: pin it and demand its closure, but a
+  /// done job stays done, even this one.
+  fn cmd_up(&mut self, task_id: TaskId) {
+    self.set_pin(task_id, true);
+    self.demand(task_id, false);
+  }
+
+  /// A start demands the whole requirement closure: vetoed tasks are
+  /// released and dead deps revived, so the pull is never blocked by an
+  /// earlier stop or crash. Done jobs stay done, except `task_id` itself
+  /// when `rerun_done` (a start that targets it).
+  fn demand(&mut self, task_id: TaskId, rerun_done: bool) {
     let mut closure = vec![task_id];
     let mut seen: HashSet<TaskId> = HashSet::from([task_id]);
     let mut i = 0;
@@ -416,14 +496,17 @@ impl Graph {
       i += 1;
     }
     for id in closure {
-      let Some(task) = self.tasks.get(&id) else {
+      let Some(task) = self.tasks.get_mut(&id) else {
         continue;
       };
+      // Had the failed start's stop already landed, this demand would
+      // revive the task; so it lands in Idle instead.
+      task.start_failed = false;
       let state = task.state;
       self.set_vetoed(id, false);
       let revive = match state {
-        TaskState::Backoff | TaskState::Exited(_) => true,
-        TaskState::Done(_) => id == task_id,
+        TaskState::Backoff(_) | TaskState::Exited(_) => true,
+        TaskState::Done(_) => rerun_done && id == task_id,
         TaskState::Idle
         | TaskState::Starting
         | TaskState::Running
@@ -448,12 +531,12 @@ impl Graph {
   }
 
   fn cmd_stop(&mut self, task_id: TaskId) {
-    self.remove_edge(INIT_TASK_ID, task_id);
+    self.set_pin(task_id, false);
     self.stop_if_active(task_id);
   }
 
   fn cmd_kill(&mut self, task_id: TaskId) {
-    self.remove_edge(INIT_TASK_ID, task_id);
+    self.set_pin(task_id, false);
     let Some(task) = self.tasks.get(&task_id) else {
       return;
     };
@@ -467,14 +550,14 @@ impl Graph {
         self.hard_kill(task_id);
       }
       TaskState::Idle
-      | TaskState::Backoff
+      | TaskState::Backoff(_)
       | TaskState::Done(_)
       | TaskState::Exited(_) => (),
     }
   }
 
   fn cmd_veto(&mut self, task_id: TaskId) {
-    self.remove_edge(INIT_TASK_ID, task_id);
+    self.set_pin(task_id, false);
     self.set_vetoed(task_id, true);
   }
 
@@ -489,11 +572,11 @@ impl Graph {
     };
     match task.state {
       TaskState::Starting | TaskState::Running | TaskState::Ready => {
-        self.stop_task(task_id);
+        self.stop_task(task_id, false);
       }
       TaskState::Idle
       | TaskState::Stopping
-      | TaskState::Backoff
+      | TaskState::Backoff(_)
       | TaskState::Done(_)
       | TaskState::Exited(_) => (),
     }
@@ -602,8 +685,9 @@ impl Graph {
   /// already reported (a job's success must land in Done, not Idle).
   ///
   /// Termination relies on: drives are the only Idle -> Starting source,
-  /// and self-exits land in Backoff/Done/Exited, which only timers
-  /// (arriving as later messages) can leave. A restart mode that retries
+  /// and self-exits (and the stop of a failed start) land in
+  /// Backoff/Done/Exited, which only timers (arriving as later messages)
+  /// can leave. A restart mode that retries
   /// within the same step would loop here.
   fn settle(&mut self) {
     let budget = self.tasks.len() * 16 + 64;
@@ -693,7 +777,7 @@ impl Graph {
         | TaskState::Running
         | TaskState::Ready
         | TaskState::Stopping
-        | TaskState::Backoff
+        | TaskState::Backoff(_)
         | TaskState::Done(_)
         | TaskState::Exited(_) => (),
       }
@@ -702,10 +786,10 @@ impl Graph {
         TaskState::Starting | TaskState::Running | TaskState::Ready => {
           // Ordered shutdown: dependents go down first.
           if !self.has_active_dependent(id) {
-            self.stop_task(id);
+            self.stop_task(id, false);
           }
         }
-        TaskState::Backoff => {
+        TaskState::Backoff(_) => {
           // Cancel a pending retry.
           self.set_state(id, TaskState::Idle);
         }
@@ -885,23 +969,30 @@ impl Graph {
     self.send_cmd(task_id, TaskCmd::Start);
   }
 
-  fn stop_task(&mut self, task_id: TaskId) {
+  /// `start_failed`: the stop lands as a failed exit (see `land_stop`).
+  fn stop_task(&mut self, task_id: TaskId, start_failed: bool) {
     self.set_state(task_id, TaskState::Stopping);
-    let epoch = self.tasks.get(&task_id).expect("driven id live").epoch;
-    self.schedule_state_timeout(task_id, epoch, STOP_GRACE);
+    let task = self.tasks.get_mut(&task_id).expect("driven id live");
+    task.start_failed = start_failed;
+    let grace = task.stop_timeout;
+    self.schedule_state_timeout(task_id, grace);
     self.send_cmd(task_id, TaskCmd::Stop);
   }
 
+  /// Not ready within the ready timeout: stop it; the stop lands as a
+  /// failed exit.
+  fn fail_start(&mut self, task_id: TaskId) {
+    log::info!("Task {:?} was not ready in time; stopping it", task_id);
+    self.stop_task(task_id, true);
+  }
+
   fn hard_kill(&mut self, task_id: TaskId) {
-    let epoch = {
-      let task = self.tasks.get_mut(&task_id).expect("driven id live");
-      task.killed = true;
-      // Manual bump: invalidates the pending stop-grace timeout.
-      task.epoch += 1;
-      task.epoch
-    };
+    let task = self.tasks.get_mut(&task_id).expect("driven id live");
+    task.killed = true;
+    // Manual bump: the stop grace's timer is replaced by the kill wait's.
+    task.epoch += 1;
     self.send_cmd(task_id, TaskCmd::Kill);
-    self.schedule_state_timeout(task_id, epoch, STOP_GRACE);
+    self.schedule_state_timeout(task_id, KILL_WAIT);
   }
 
   fn send_cmd(&mut self, task_id: TaskId, cmd: TaskCmd) {
@@ -922,51 +1013,52 @@ impl Graph {
     self.queue_effects(task_id, &mut fx);
   }
 
-  fn schedule_state_timeout(
-    &mut self,
-    task_id: TaskId,
-    epoch: u64,
-    delay: Duration,
-  ) {
+  /// Sets the timer on the task's current state, at its current epoch.
+  fn schedule_state_timeout(&mut self, task_id: TaskId, delay: Duration) {
     if let Some(task) = self.tasks.get_mut(&task_id) {
       task.deadline = Some(self.now + delay);
+      self.timer_changes.push(task_id);
     }
-    self.pending_timers.push(TimerRequest {
-      task_id,
-      epoch,
-      delay,
-    });
   }
 
   fn on_state_timeout(&mut self, task_id: TaskId, epoch: u64) {
-    let Some(task) = self.tasks.get(&task_id) else {
+    let Some(task) = self.tasks.get_mut(&task_id) else {
       return;
     };
     if task.epoch != epoch {
       return;
     }
+    // This timer has run out.
+    task.deadline = None;
+    self.timer_changes.push(task_id);
+    let task = &self.tasks[&task_id];
     match task.state {
-      TaskState::Backoff => {
+      TaskState::Backoff(_) => {
         // Retry delay is over; the reconciler restarts it if still wanted.
         self.set_state(task_id, TaskState::Idle);
       }
       TaskState::Stopping => {
         if task.killed {
           // The task ignored a hard kill for a full grace period; stop
-          // waiting so the graph (and quit) can make progress. Land in
-          // Idle like any completed stop: the reconciler restarts the
-          // task if it is still wanted (a Start during the grace must
-          // not be lost). The real process may be leaked.
+          // waiting so the graph (and quit) can make progress. Land like
+          // any completed stop: the reconciler restarts the task if it is
+          // still wanted (a Start during the grace must not be lost). The
+          // real process may be leaked.
           log::warn!("Task {:?} did not stop after kill; giving up", task_id);
-          self.set_state(task_id, TaskState::Idle);
+          self.land_stop(task_id, ExitInfo::error());
         } else {
           // The stop was ignored for the whole grace period: hard-kill.
           self.hard_kill(task_id);
         }
       }
+      TaskState::Running => {
+        // Only a ready timeout is armed in Running.
+        if task.ready.timeout().is_some() {
+          self.fail_start(task_id);
+        }
+      }
       TaskState::Idle
       | TaskState::Starting
-      | TaskState::Running
       | TaskState::Ready
       | TaskState::Done(_)
       | TaskState::Exited(_) => (),
@@ -980,18 +1072,20 @@ impl Graph {
       return;
     };
     match task.state {
-      TaskState::Starting => {
-        let state = match task.ready {
-          ReadyMode::Immediate => TaskState::Ready,
-          ReadyMode::Reported => TaskState::Running,
-        };
-        self.set_state(task_id, state);
-      }
+      TaskState::Starting => match task.ready {
+        ReadyMode::Immediate => self.set_state(task_id, TaskState::Ready),
+        ReadyMode::Reported { timeout } => {
+          self.set_state(task_id, TaskState::Running);
+          if let Some(timeout) = timeout {
+            self.schedule_state_timeout(task_id, timeout);
+          }
+        }
+      },
       TaskState::Idle
       | TaskState::Running
       | TaskState::Ready
       | TaskState::Stopping
-      | TaskState::Backoff
+      | TaskState::Backoff(_)
       | TaskState::Done(_)
       | TaskState::Exited(_) => {
         log::debug!("Ignoring started report in {:?}", task.state);
@@ -1009,7 +1103,7 @@ impl Graph {
       | TaskState::Starting
       | TaskState::Ready
       | TaskState::Stopping
-      | TaskState::Backoff
+      | TaskState::Backoff(_)
       | TaskState::Done(_)
       | TaskState::Exited(_) => {
         log::debug!("Ignoring ready report in {:?}", task.state);
@@ -1023,41 +1117,68 @@ impl Graph {
       return;
     };
     match task.state {
-      TaskState::Stopping => {
-        // A commanded stop always lands in Idle; the reconciler decides what
-        // happens next from intent.
-        self.set_state(task_id, TaskState::Idle);
-      }
+      TaskState::Stopping => self.land_stop(task_id, info),
       TaskState::Starting | TaskState::Running | TaskState::Ready => {
+        // Only a start that got ready and stayed up ends the backoff; one
+        // that never got ready counts, however long it ran.
         let uptime = task.last_start.map(|t| now.duration_since(t));
-        if uptime.is_some_and(|t| t > BACKOFF_RESET) {
+        if task.state == TaskState::Ready
+          && uptime.is_some_and(|t| t > BACKOFF_RESET)
+        {
           task.attempts = 0;
         }
-        if task.kind == TaskKind::Job && info.success() {
-          self.set_state(task_id, TaskState::Done(info));
-          return;
-        }
-        let restart = match task.restart {
-          RestartMode::Never => false,
-          RestartMode::OnFailure => !info.success(),
-          RestartMode::Always => true,
-        };
-        if restart {
-          task.attempts += 1;
-          let delay = backoff_delay(task.attempts);
-          self.set_state(task_id, TaskState::Backoff);
-          let epoch = self.tasks.get(&task_id).expect("set above").epoch;
-          self.schedule_state_timeout(task_id, epoch, delay);
-        } else {
-          self.set_state(task_id, TaskState::Exited(info));
-        }
+        self.land_exit(task_id, info);
       }
       TaskState::Idle
-      | TaskState::Backoff
+      | TaskState::Backoff(_)
       | TaskState::Done(_)
       | TaskState::Exited(_) => {
         log::debug!("Ignoring stop report in {:?}", task.state);
       }
+    }
+  }
+
+  /// A commanded stop lands in Idle; the reconciler decides what happens
+  /// next from intent. The stop of a failed start lands as a failed exit.
+  fn land_stop(&mut self, task_id: TaskId, info: ExitInfo) {
+    let Some(task) = self.tasks.get(&task_id) else {
+      return;
+    };
+    if task.start_failed {
+      let info = ExitInfo {
+        ready_timeout: true,
+        ..info
+      };
+      self.land_exit(task_id, info);
+    } else {
+      self.set_state(task_id, TaskState::Idle);
+    }
+  }
+
+  /// The task ended on its own (or failed to start): a job's success is
+  /// done; else it backs off and retries if its restart mode says so, or
+  /// stays exited.
+  fn land_exit(&mut self, task_id: TaskId, info: ExitInfo) {
+    let Some(task) = self.tasks.get_mut(&task_id) else {
+      return;
+    };
+    let state = task.exit_state(info);
+    let delay = match state {
+      TaskState::Backoff(_) => {
+        task.attempts += 1;
+        Some(backoff_delay(task.attempts))
+      }
+      TaskState::Idle
+      | TaskState::Starting
+      | TaskState::Running
+      | TaskState::Ready
+      | TaskState::Stopping
+      | TaskState::Done(_)
+      | TaskState::Exited(_) => None,
+    };
+    self.set_state(task_id, state);
+    if let Some(delay) = delay {
+      self.schedule_state_timeout(task_id, delay);
     }
   }
 
@@ -1073,19 +1194,24 @@ impl Graph {
     let was_satisfied = task.is_satisfied();
     let was_active = task.state.is_active();
     #[cfg(test)]
-    let old_state = task.state;
+    let (old_state, start_failed) = (task.state, task.start_failed);
     task.state = state;
     task.epoch += 1;
     task.killed = false;
+    task.start_failed = false;
     // The epoch bump ended whatever timer was running.
-    task.deadline = None;
+    if task.deadline.take().is_some() {
+      self.timer_changes.push(task_id);
+    }
     self.state_changed = true;
     let now_satisfied = task.is_satisfied();
     let space = task.space.clone();
     let path = task.path.clone();
 
     #[cfg(test)]
-    self.transitions.push((task_id, old_state, state));
+    self
+      .transitions
+      .push((task_id, old_state, state, start_failed));
     self.enqueue(task_id);
     if was_satisfied != now_satisfied {
       // Dependents' `supported` depends on whether this task is satisfied.
@@ -1122,6 +1248,9 @@ impl Graph {
       return;
     };
     self.state_changed = true;
+    if handle.deadline.is_some() {
+      self.timer_changes.push(task_id);
+    }
     // Queued ids must be live when reconciliation drives them.
     if self.in_queue.remove(&task_id) {
       self.dirty.retain(|d| *d != task_id);
@@ -1250,6 +1379,25 @@ impl Graph {
     }
   }
 
+  /// `up`'s set: the selector's matches and every task with a saved pin,
+  /// each once, that the sender may change. The saved pins take one pass
+  /// over the tasks: `up` is a user's command, not a per-event path.
+  fn up_set(&self, sender: TaskId, selector: &TaskSelector) -> Vec<TaskId> {
+    let mut ids = self.mutable_matching_ids(sender, selector);
+    let matched: HashSet<TaskId> = ids.iter().copied().collect();
+    let mut saved: Vec<TaskId> = self
+      .tasks
+      .iter()
+      .filter(|(id, task)| {
+        task.saved_pin && !matched.contains(id) && self.can_mutate(sender, **id)
+      })
+      .map(|(id, _)| *id)
+      .collect();
+    saved.sort_unstable();
+    ids.extend(saved);
+    ids
+  }
+
   fn mutable_matching_ids(
     &self,
     sender: TaskId,
@@ -1309,6 +1457,7 @@ impl Graph {
       supported: task.supported,
       vetoed: task.vetoed,
       pinned,
+      saved_pin: task.saved_pin,
       required_by,
       deps,
       attempts: task.attempts,
@@ -1428,6 +1577,44 @@ impl Graph {
     }
   }
 
+  /// The longest the stops of a quit can take: each active task gets its
+  /// grace, then the hard kill's wait, and a task stops only after its
+  /// active dependents, so the bound is the heaviest chain of deps.
+  fn stop_within(&self) -> Duration {
+    let mut chains = HashMap::new();
+    self
+      .tasks
+      .keys()
+      .map(|&id| self.chain(id, &mut chains))
+      .max()
+      .unwrap_or_default()
+  }
+
+  /// `id`'s own stop time plus its heaviest chain of deps.
+  fn chain(
+    &self,
+    id: TaskId,
+    chains: &mut HashMap<TaskId, Duration>,
+  ) -> Duration {
+    if let Some(&chain) = chains.get(&id) {
+      return chain;
+    }
+    let own = match self.tasks.get(&id) {
+      Some(task) if task.state.is_active() => task.stop_timeout + KILL_WAIT,
+      Some(_) | None => Duration::ZERO,
+    };
+    let deps = match self.edges.get(&id) {
+      Some(deps) => deps
+        .iter()
+        .map(|&dep| self.chain(dep, chains))
+        .max()
+        .unwrap_or_default(),
+      None => Duration::ZERO,
+    };
+    chains.insert(id, own + deps);
+    own + deps
+  }
+
   /// Whether the current freeze belongs to a quit.
   fn freezing_for_quit(&self) -> bool {
     match &self.frozen {
@@ -1467,7 +1654,7 @@ impl Graph {
         TaskState::Running => snap::TaskState::Running {},
         TaskState::Ready => snap::TaskState::Ready {},
         TaskState::Stopping => snap::TaskState::Stopping {},
-        TaskState::Backoff => snap::TaskState::Backoff {},
+        TaskState::Backoff(info) => snap::TaskState::Backoff(info.into()),
         TaskState::Done(info) => snap::TaskState::Done(info.into()),
         TaskState::Exited(info) => snap::TaskState::Exited(info.into()),
       };
@@ -1489,9 +1676,18 @@ impl Graph {
           .is_some_and(|set| set.contains(&INIT_TASK_ID)),
         deps,
         restart: task.restart.into(),
+        job: match task.kind {
+          TaskKind::Service => false,
+          TaskKind::Job => true,
+        },
+        ready_timeout_ms: task.ready.timeout().map(|t| t.as_millis() as u64),
+        stop_timeout_ms: (task.stop_timeout != STOP_TIMEOUT)
+          .then_some(task.stop_timeout.as_millis() as u64),
         state,
         vetoed: task.vetoed,
         killed: task.killed,
+        start_failed: task.start_failed,
+        saved_pin: task.saved_pin,
         attempts: task.attempts,
         last_start_secs_ago: task
           .last_start
@@ -1562,7 +1758,59 @@ pub struct Kernel {
 
 /// How long a quit waits for every task to freeze before giving up on
 /// saving.
-const SAVE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SAVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One timer per task, kept matching the graph's `deadline`s; each is
+/// tagged with the epoch it was set at (ORCHESTRATION.md "State timers").
+struct StateTimers {
+  queue: DelayQueue<(TaskId, u64)>,
+  keys: HashMap<TaskId, (u64, delay_queue::Key)>,
+}
+
+impl StateTimers {
+  fn new() -> Self {
+    Self {
+      queue: DelayQueue::new(),
+      keys: HashMap::new(),
+    }
+  }
+
+  /// For each task whose timer changed: none without a deadline, else
+  /// one at the task's epoch. A timer already at that epoch is the same
+  /// one, since a deadline is set at most once per epoch.
+  fn update(&mut self, graph: &mut Graph) {
+    for task_id in graph.take_timer_changes() {
+      let timer = graph.timer(task_id);
+      if let (Some((armed, _)), Some((epoch, _))) =
+        (self.keys.get(&task_id), timer)
+        && *armed == epoch
+      {
+        continue;
+      }
+      if let Some((_, key)) = self.keys.remove(&task_id) {
+        self.queue.remove(&key);
+      }
+      if let Some((epoch, delay)) = timer {
+        let key = self.queue.insert((task_id, epoch), delay);
+        self.keys.insert(task_id, (epoch, key));
+      }
+    }
+  }
+
+  fn poll_expired(
+    &mut self,
+    cx: &mut Context<'_>,
+  ) -> Poll<Option<(TaskId, u64)>> {
+    let Poll::Ready(expired) = self.queue.poll_expired(cx) else {
+      return Poll::Pending;
+    };
+    Poll::Ready(expired.map(|expired| {
+      let (task_id, epoch) = expired.into_inner();
+      self.keys.remove(&task_id);
+      (task_id, epoch)
+    }))
+  }
+}
 
 impl Kernel {
   pub fn new() -> Self {
@@ -1690,17 +1938,29 @@ impl Kernel {
   }
 
   pub async fn run(mut self) {
-    self.after_dispatch();
+    // Made here, in the runtime whose clock it follows.
+    let mut timers = StateTimers::new();
+    self.after_dispatch(&mut timers);
     loop {
       // Deferred messages take one turn each, as if they had arrived
       // right after the thaw.
       let msg = match self.replay.pop_front() {
         Some(msg) => msg,
-        None => match self.receiver.recv().await {
-          Some(msg) => msg,
-          None => {
-            log::debug!("Kernel receiver returned None.");
-            break;
+        None => tokio::select! {
+          msg = self.receiver.recv() => match msg {
+            Some(msg) => msg,
+            None => {
+              log::debug!("Kernel receiver returned None.");
+              break;
+            }
+          },
+          Some((task_id, epoch)) =
+            std::future::poll_fn(|cx| timers.poll_expired(cx)) =>
+          {
+            KernelMessage {
+              from: INIT_TASK_ID,
+              command: KernelCommand::StateTimeout(task_id, epoch),
+            }
           }
         },
       };
@@ -1708,7 +1968,7 @@ impl Kernel {
       if self.dispatch(msg) {
         break;
       }
-      self.after_dispatch();
+      self.after_dispatch(&mut timers);
       if self.graph.quitting && self.graph.no_active_tasks() {
         break;
       }
@@ -1716,23 +1976,14 @@ impl Kernel {
     log::debug!("After kernel loop.");
   }
 
-  /// Settles and arms timers; skipped while frozen so nothing drives.
-  fn after_dispatch(&mut self) {
+  /// Settles and sets timers; skipped while frozen so nothing drives.
+  fn after_dispatch(&mut self, timers: &mut StateTimers) {
     if self.graph.frozen.is_some() {
       return;
     }
     self.graph.settle();
     self.graph.check_active_watches();
-    for req in self.graph.take_timers() {
-      let sender = self.sender.clone();
-      tokio::spawn(async move {
-        tokio::time::sleep(req.delay).await;
-        let _ = sender.send(KernelMessage {
-          from: INIT_TASK_ID,
-          command: KernelCommand::StateTimeout(req.task_id, req.epoch),
-        });
-      });
-    }
+    timers.update(&mut self.graph);
   }
 
   /// Returns true when the loop should exit at once (a second quit).
@@ -1752,13 +2003,21 @@ impl Kernel {
       | KernelCommand::FreezeTimeout(_)
       | KernelCommand::Thaw => (),
       // The quit under way covers this one; replaying it after the save
-      // would read as a second quit and skip the graceful stop.
+      // would read as a second quit and skip the graceful stop. The save
+      // ends within its timeout, and while frozen the chain only shrinks.
       KernelCommand::Quit if for_quit => return false,
+      KernelCommand::QuitWithin { save: true, reply } if for_quit => {
+        let _ = reply.send(SAVE_TIMEOUT + self.graph.stop_within());
+        return false;
+      }
       // Drops the save under way.
-      KernelCommand::QuitWithoutSave if for_quit => (),
+      KernelCommand::QuitWithoutSave
+      | KernelCommand::QuitWithin { save: false, .. }
+        if for_quit => {}
       // Intent and delivery wait for the thaw (or die with this image).
       KernelCommand::Quit
       | KernelCommand::QuitWithoutSave
+      | KernelCommand::QuitWithin { .. }
       | KernelCommand::RegisterTask(..)
       | KernelCommand::Start(..)
       | KernelCommand::Stop(..)
@@ -1766,6 +2025,7 @@ impl Kernel {
       | KernelCommand::Restart(..)
       | KernelCommand::ForceRestart(..)
       | KernelCommand::Unpin(..)
+      | KernelCommand::Up(..)
       | KernelCommand::Veto(..)
       | KernelCommand::Remove(..)
       | KernelCommand::SetLabel(..)
@@ -1782,28 +2042,62 @@ impl Kernel {
     self.dispatch_now(msg)
   }
 
+  /// Begins a quit, saving first when asked and a save is set up, and
+  /// answers `reply` with the longest the runner can take to exit, read
+  /// from the graph the quit begins on (ORCHESTRATION.md "Quit bound").
+  /// Returns true when the loop should exit at once (a second quit).
+  fn quit(
+    &mut self,
+    save: bool,
+    reply: Option<tokio::sync::oneshot::Sender<Duration>>,
+  ) -> bool {
+    if save && self.save.is_some() && !self.graph.quitting {
+      if let Some(reply) = reply {
+        let _ = reply.send(SAVE_TIMEOUT + self.graph.stop_within());
+      }
+      let number = self.graph.begin_quit_freeze();
+      let sender = self.sender.clone();
+      tokio::spawn(async move {
+        tokio::time::sleep(SAVE_TIMEOUT).await;
+        let _ = sender.send(KernelMessage {
+          from: INIT_TASK_ID,
+          command: KernelCommand::FreezeTimeout(number),
+        });
+      });
+      return false;
+    }
+    // Drops a save a quit has begun.
+    if self.graph.freezing_for_quit() {
+      self.replay.extend(self.graph.thaw());
+    }
+    let at_once = self.graph.begin_quit();
+    if let Some(reply) = reply {
+      let within = if at_once {
+        Duration::ZERO
+      } else {
+        self.graph.stop_within()
+      };
+      let _ = reply.send(within);
+    }
+    at_once
+  }
+
   fn dispatch_now(&mut self, msg: KernelMessage) -> bool {
     match msg.command {
       KernelCommand::Quit => {
-        if self.save.is_none() || self.graph.quitting {
-          return self.graph.begin_quit();
+        if self.quit(true, None) {
+          return true;
         }
-        let number = self.graph.begin_quit_freeze();
-        let sender = self.sender.clone();
-        tokio::spawn(async move {
-          tokio::time::sleep(SAVE_TIMEOUT).await;
-          let _ = sender.send(KernelMessage {
-            from: INIT_TASK_ID,
-            command: KernelCommand::FreezeTimeout(number),
-          });
-        });
       }
-
       KernelCommand::QuitWithoutSave => {
-        if self.graph.freezing_for_quit() {
-          self.replay.extend(self.graph.thaw());
+        if self.quit(false, None) {
+          return true;
         }
-        return self.graph.begin_quit();
+      }
+      KernelCommand::QuitWithin { save, reply } => {
+        if self.quit(save, Some(reply)) {
+          return true;
+        }
       }
 
       KernelCommand::RegisterTask(registration, ack) => {
@@ -1824,6 +2118,15 @@ impl Kernel {
         let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
           self.graph.cmd_start(*id);
+        }
+        if let Some(ack) = ack {
+          let _ = ack.send(ids.len());
+        }
+      }
+      KernelCommand::Up(selector, ack) => {
+        let ids = self.graph.up_set(msg.from, &selector);
+        for id in &ids {
+          self.graph.cmd_up(*id);
         }
         if let Some(ack) = ack {
           let _ = ack.send(ids.len());
@@ -1869,7 +2172,7 @@ impl Kernel {
       KernelCommand::Unpin(selector, ack) => {
         let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
-          self.graph.remove_edge(INIT_TASK_ID, *id);
+          self.graph.set_pin(*id, false);
         }
         if let Some(ack) = ack {
           let _ = ack.send(ids.len());
@@ -1946,7 +2249,11 @@ impl Kernel {
       }
       KernelCommand::FreezeTimeout(number) => {
         let timed_out = self.graph.freezing_for_quit()
-          && self.graph.frozen.as_ref().is_some_and(|f| f.number == number);
+          && self
+            .graph
+            .frozen
+            .as_ref()
+            .is_some_and(|f| f.number == number);
         if timed_out {
           log::warn!("Not saving the tasks: a task did not freeze in time");
           self.replay.extend(self.graph.thaw());

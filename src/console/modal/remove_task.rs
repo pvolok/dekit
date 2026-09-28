@@ -6,7 +6,7 @@ use crate::target::Target;
 use crate::term::{
   Grid,
   attrs::Attrs,
-  grid::BorderType,
+  grid::{BorderType, Rect},
   key::{Key, KeyCode},
 };
 
@@ -32,7 +32,7 @@ impl Modal for RemoveTaskModal {
     }
   }
 
-  fn size(&self) -> (u16, u16) {
+  fn size(&self, _frame: Rect) -> (u16, u16) {
     (36, 3)
   }
 

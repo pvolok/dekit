@@ -36,7 +36,7 @@ cargo install dekit
 tasks:
   db:
     cmd: ["postgres", "-D", ".data/db"]
-    ready_log: "ready to accept connections"
+    ready: { log: "ready to accept connections" }
   api:
     cmd: ["cargo", "run", "-p", "api"]
     deps: [db]

@@ -33,7 +33,7 @@ Describe the stack in `dekit.yaml` at the project root:
 tasks:
   db:
     cmd: ["postgres", "-D", ".data/db"]
-    ready_log: "ready to accept connections"
+    ready: {log: "ready to accept connections"}
 
   api:
     cmd: ["cargo", "run", "-p", "api"]
@@ -56,7 +56,13 @@ dekit attach    # watch live output in the TUI
 ```
 
 `db` has no `autostart`, but `api` needs it, so `up` starts it first and
-waits for its `ready_log` line.
+waits until its output says it is ready. `ready` can also wait for a port,
+a URL, a command, or a file (|config/tasks#ready|). Another `dekit up`
+starts only what is not running.
+
+On Windows, write `web`'s command as `["cmd", "/c", "npm run dev"]` for
+now: dekit does not yet start `.cmd` programs such as `npm` directly
+(|config/tasks#commands|).
 
 Close the terminal and the tasks keep running. `dekit down` stops
 everything for the day, and the next `dekit up` brings it back

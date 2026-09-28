@@ -1,8 +1,8 @@
-//! `dekit down` stops the runner, which saves its tasks and screens; the
-//! next `dekit up` brings them back idle with the current config's
-//! commands, starts the ones that were running, and starts the autostart
-//! set. A task that is not started keeps its saved screen; a start resets
-//! the screen as every start does.
+//! `dekit down` stops the runner, which saves its tasks and screens. The
+//! next runner start brings them back idle with the current config's
+//! commands and starts nothing; `dekit up` starts the ones that were
+//! started and the autostart set. A task that is not started keeps its
+//! saved screen; a start resets the screen as every start does.
 
 #![cfg(unix)]
 
@@ -25,12 +25,18 @@ fn down_then_up_restores_the_tasks() {
   let runner = TestRunner::new("dn");
   runner.yaml(
     "tasks:\n  alpha:\n    cmd: [sh, -c, 'echo before; sleep 60']\n    autostart: true\n  \
-     beta:\n    cmd: [sh, -c, 'echo beta; sleep 60']\n",
+     beta:\n    cmd: [sh, -c, 'echo beta; sleep 60']\n  \
+     gamma:\n    cmd: [sh, -c, 'echo gamma; sleep 60']\n    autostart: true\n",
   );
   runner.ok(&["up"]);
   wait_until("alpha ready", || {
     task_line(&runner, "alpha").contains("ready")
   });
+  // An autostart task stopped before the down: `up` starts it again.
+  wait_until("gamma ready", || {
+    task_line(&runner, "gamma").contains("ready")
+  });
+  runner.ok(&["stop", "gamma"]);
   wait_until("alpha output", || {
     runner.ok(&["screen", "alpha"]).contains("before")
   });
@@ -65,11 +71,32 @@ fn down_then_up_restores_the_tasks() {
     serde_json::from_str(&runner.ok(&["--json", "down"])).unwrap();
   assert_eq!(again["stopped"], false, "{again}");
 
-  // Edited while down: the new command runs.
+  // Edited while the runner was stopped: the new command runs.
   runner.yaml(
     "tasks:\n  alpha:\n    cmd: [sh, -c, 'echo after; sleep 60']\n    autostart: true\n  \
-     beta:\n    cmd: [sh, -c, 'echo beta; sleep 60']\n",
+     beta:\n    cmd: [sh, -c, 'echo beta; sleep 60']\n  \
+     gamma:\n    cmd: [sh, -c, 'echo gamma; sleep 60']\n    autostart: true\n",
   );
+  // A start by anything but `up` restores the tasks idle with their
+  // screens and starts nothing.
+  runner.start_runner();
+  std::thread::sleep(std::time::Duration::from_millis(300));
+  for task in ["alpha", "beta", "gamma", "adhoc"] {
+    let line = task_line(&runner, task);
+    assert!(line.contains("idle"), "{line}");
+  }
+  assert!(runner.ok(&["screen", "alpha"]).contains("before"));
+  assert!(runner.ok(&["why", "beta"]).contains("`dekit up` starts it"));
+  assert!(
+    !runner
+      .ok(&["why", "gamma"])
+      .contains("`dekit up` starts it")
+  );
+  assert!(runner.saved_files().is_empty());
+  // A live restart is the same session: it keeps what `up` will start.
+  let out = runner.run(&["runner", "restart"]);
+  assert!(out.status.success(), "restart: {}", stderr(&out));
+
   runner.ok(&["up"]);
   wait_until("alpha ready again", || {
     task_line(&runner, "alpha").contains("ready")
@@ -80,10 +107,21 @@ fn down_then_up_restores_the_tasks() {
   wait_until("beta ready again", || {
     task_line(&runner, "beta").contains("ready")
   });
+  wait_until("gamma ready again", || {
+    task_line(&runner, "gamma").contains("ready")
+  });
   let adhoc = task_line(&runner, "adhoc");
   assert!(adhoc.contains("idle"), "{adhoc}");
   assert!(runner.ok(&["screen", "adhoc"]).contains("adhoc"));
-  assert!(runner.saved_files().is_empty());
+  // The restore happens once: stopped now, beta stays stopped.
+  runner.ok(&["stop", "beta"]);
+  wait_until("beta stopped", || {
+    task_line(&runner, "beta").contains("idle")
+  });
+  runner.ok(&["up"]);
+  std::thread::sleep(std::time::Duration::from_millis(300));
+  let beta = task_line(&runner, "beta");
+  assert!(beta.contains("idle"), "{beta}");
 
   runner.stop();
 }

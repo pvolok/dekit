@@ -23,6 +23,9 @@ export async function main() {
 - key: std.dekit.start
   signature: "(target: string) => Promise<number>"
   desc: Pin and start the matching tasks and their dependencies.
+- key: std.dekit.up
+  signature: "() => Promise<number>"
+  desc: "Start what `dekit down` saved as started and the autostart tasks, as `dekit up` does; running tasks and done jobs are left alone."
 - key: std.dekit.run
   signature: "(target: string) => Promise<number>"
   desc: Force-restart the matching tasks, whether or not they are wanted.

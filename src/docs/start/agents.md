@@ -19,8 +19,8 @@ exports every page as data.
 
 Pass `--json` for machine-readable output.
 
-- `dekit ls --json` prints `{"tasks": [...]}`; each task has `id`, `path`, `label` (if set), `state`, and `exit_code` or `signal` once it has ended. States: idle, starting, running, ready, stopping, backoff, done, exited.
-- `dekit why <path> --json` prints the task's `path` and `state`, plus `wanted`, `supported`, `vetoed`, `pinned`, `required_by`, `attempts`, and `deps` with each dependency's state.
+- `dekit ls --json` prints `{"tasks": [...]}`; each task has `id`, `path`, `label` (if set), and `state`. States: idle, starting, running, ready, stopping, backoff, done, exited. In done, exited, and backoff, `exit_code` or `signal` tells how the last run ended, and `reason: "ready_timeout"` that it was not ready in time.
+- `dekit why <path> --json` prints the task's `path` and `state`, plus `wanted`, `supported`, `vetoed`, `pinned`, `required_by`, `attempts`, and `deps` with each dependency's state; `saved_pin: true` means `dekit up` starts it again.
 - `dekit screen <path> --json` prints `{"screen": "..."}`, the task's current terminal contents with ANSI colors.
 - `up`, `start`, `stop`, `kill`, `veto`, `restart`, and `rm` print `{"matched": n}`; zero matches is not an error.
 - `dekit down --json` prints `{"stopped": true}`, or `false` when the runner was not running.

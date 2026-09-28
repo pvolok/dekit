@@ -9,6 +9,7 @@ use crate::config::keymap::KeymapConfig;
 use crate::config::log::LogConfig;
 use crate::config::task::{TaskConfig, parse_task_settings, task_from_cfg};
 use crate::config::tui::TuiConfig;
+use crate::kernel::task::{RestartMode, TaskKind};
 use crate::kernel::task_path::TaskPath;
 use crate::runner::user_config_dir;
 
@@ -35,6 +36,9 @@ pub struct Config {
   pub keymap: KeymapConfig,
   pub on_init: Option<Hook>,
   pub on_idle: Option<Hook>,
+  /// mprocs.yaml: a line typed to add a task runs through the system shell
+  /// (`/bin/sh`, PowerShell on Windows) as mprocs ran it.
+  pub system_shell: bool,
   /// Non-fatal problems found while loading; the caller reports them.
   pub warnings: Vec<String>,
 }
@@ -50,6 +54,7 @@ impl Config {
       keymap: KeymapConfig::default(),
       on_init: None,
       on_idle: None,
+      system_shell: false,
       warnings: Vec::new(),
     }
   }
@@ -71,6 +76,17 @@ impl Config {
     let mut stack = Vec::new();
     let mut task_paths = HashSet::new();
     config.load_file(&root, &path, "", true, &mut stack, &mut task_paths)?;
+    if config.defaults.autorestart == Some(RestartMode::Always)
+      && let Some(job) = config.tasks.iter().find(|task| match task.kind {
+        TaskKind::Service => false,
+        TaskKind::Job => task.autorestart.is_none(),
+      })
+    {
+      bail!(
+        "task '{}' is a job and can't use 'autorestart: always' from defaults",
+        job.path
+      );
+    }
     Ok(config)
   }
 
@@ -537,6 +553,37 @@ mod tests {
       "{:?}",
       config.warnings
     );
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn job_refuses_autorestart_always_from_defaults() {
+    let root = temp_project("job-restart");
+    let load_err = |yaml: &str| {
+      std::fs::write(root.join("dekit.yaml"), yaml).unwrap();
+      match Config::load_dir(&root) {
+        Ok(_) => panic!("expected an error for {yaml}"),
+        Err(err) => format!("{err:#}"),
+      }
+    };
+    let err = load_err(
+      "defaults: {autorestart: always}\ntasks:\n  migrate: {cmd: ['true'], type: job}\n",
+    );
+    assert!(
+      err.contains(
+        "task 'migrate' is a job and can't use 'autorestart: always'"
+      ),
+      "{err}"
+    );
+    let err = load_err("defaults: {restart: on-failure}\n");
+    assert!(err.contains("use 'autorestart: on-failure'"), "{err}");
+    // The job's own autorestart wins over the default.
+    std::fs::write(
+      root.join("dekit.yaml"),
+      "defaults: {autorestart: always}\ntasks:\n  migrate: {cmd: ['true'], type: job, autorestart: never}\n",
+    )
+    .unwrap();
+    Config::load_dir(&root).unwrap();
     let _ = std::fs::remove_dir_all(root);
   }
 

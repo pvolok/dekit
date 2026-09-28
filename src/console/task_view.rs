@@ -25,13 +25,14 @@ impl TaskView {
 
   pub fn exit_code(&self) -> Option<i32> {
     match self.status {
-      TaskState::Done(info) | TaskState::Exited(info) => info.code,
+      TaskState::Done(info)
+      | TaskState::Exited(info)
+      | TaskState::Backoff(info) => info.code,
       TaskState::Idle
       | TaskState::Starting
       | TaskState::Running
       | TaskState::Ready
-      | TaskState::Stopping
-      | TaskState::Backoff => None,
+      | TaskState::Stopping => None,
     }
   }
 

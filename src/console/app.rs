@@ -526,7 +526,7 @@ impl App {
       }
       Action::Quit => {
         self.state.quitting = true;
-        self.issue(Command::Quit { save: true });
+        self.issue(Command::Down);
       }
       Action::Command { command } => self.issue(command),
 
@@ -597,17 +597,27 @@ impl App {
             .iter()
             .any(|t| t.path.as_ref().is_some_and(|p| p.as_str() == path))
         });
-        match path.parse::<Target>() {
-          Ok(target) => self.issue(Command::Add {
+        let argv = if self.config.system_shell {
+          Ok(crate::parse_shell::system_argv(&cmd))
+        } else {
+          crate::parse_shell::split_argv(&cmd)
+        };
+        match (path.parse::<Target>(), argv) {
+          (Ok(target), Ok(argv)) => self.issue(Command::Add {
             target,
             label: Some(label),
-            cmd: CmdConfig::Shell { shell: cmd },
+            cmd: CmdConfig::Cmd { cmd: argv },
             cwd: None,
             env: None,
             deps: Vec::new(),
             tags: Vec::new(),
           }),
-          Err(err) => log::warn!("Cannot add task '{path}': {err}"),
+          // Back to the prompt with the line, so it can be fixed.
+          (_, Err(err)) => {
+            self.modal =
+              Some(Box::new(AddTaskModal::with_error(cmd, err.to_string())))
+          }
+          (Err(err), Ok(_)) => log::warn!("Cannot add task '{path}': {err}"),
         }
       }
       Action::DuplicateTask => {

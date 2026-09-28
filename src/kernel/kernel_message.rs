@@ -35,12 +35,24 @@ impl TaskRegistration {
     Fut: std::future::Future<Output = ()> + Send + 'static,
   {
     use super::task::ChannelTask;
+    use futures::FutureExt as _;
     Self {
       task_id,
       def,
       factory: Box::new(|ctx| {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(f(ctx, rx));
+        let fut = f(ctx.clone(), rx);
+        tokio::spawn(async move {
+          // A panic ends only this task (the hook logs it); the kernel
+          // must not wait for it as if it were still active.
+          if std::panic::AssertUnwindSafe(fut)
+            .catch_unwind()
+            .await
+            .is_err()
+          {
+            ctx.send(KernelCommand::TaskStopped(ExitInfo::error()));
+          }
+        });
         Box::new(ChannelTask::new(tx))
       }),
     }
@@ -53,6 +65,12 @@ pub enum KernelCommand {
   Quit,
   /// Quits without saving, dropping a save a quit has begun.
   QuitWithoutSave,
+  /// `Quit`, or `QuitWithoutSave` when `save` is false, answering in the
+  /// dispatch that begins it the longest the runner can take to exit.
+  QuitWithin {
+    save: bool,
+    reply: tokio::sync::oneshot::Sender<std::time::Duration>,
+  },
 
   /// Registration is atomic: deps are resolved, the path claimed, and the
   /// task inserted in one dispatch, or nothing happens.
@@ -65,6 +83,10 @@ pub enum KernelCommand {
   /// same dispatch, so no other message can interleave between the two.
   /// The ack is answered in that dispatch with the matched-task count.
   Start(TaskSelector, Ack),
+  /// Pins and starts the selector's matches (the autostart set) and every
+  /// task with a saved pin, clearing the saved pins; a done job is never
+  /// run again. The ack is the size of that set.
+  Up(TaskSelector, Ack),
   Stop(TaskSelector, Ack),
   Kill(TaskSelector, Ack),
   Restart(TaskSelector, Ack),
@@ -96,8 +118,8 @@ pub enum KernelCommand {
   TaskStopped(ExitInfo),
 
   /// A time limit set on the task's current state ran out (stop grace,
-  /// backoff delay). The epoch says which state it was set for, so a
-  /// timeout from an earlier state is ignored.
+  /// kill wait, backoff delay, ready timeout). The epoch says which
+  /// state it was set for, so a timeout from an earlier state is ignored.
   StateTimeout(TaskId, u64),
 
   /// Freeze every task and answer with the graph once all have reported
@@ -249,6 +271,8 @@ pub struct TaskExplain {
   pub supported: bool,
   pub vetoed: bool,
   pub pinned: bool,
+  /// Started at the last save; `up` starts it again.
+  pub saved_pin: bool,
   pub required_by: Vec<String>,
   pub deps: Vec<DepExplain>,
   pub attempts: u32,

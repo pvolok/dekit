@@ -76,7 +76,7 @@ impl Modal for CommandsMenuModal {
     ModalResult::Keep
   }
 
-  fn size(&self) -> (u16, u16) {
+  fn size(&self, _frame: Rect) -> (u16, u16) {
     (60, 30)
   }
 

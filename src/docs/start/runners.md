@@ -17,23 +17,24 @@ A command looks upward from the current directory for `dekit.yaml`, then
 for a git repository, then for a `package.json`. A `dekit.yaml` wins even
 when another marker is closer. `-C <dir>` names the root explicitly.
 
-Commands that start tasks (`up`, `start`, `restart`, `run`, `spawn`,
-`attach`) start the runner when it is not running;
-|cli/runner/start| starts it without doing anything else.
+`up`, `start`, `restart`, `run`, `spawn`, and `attach` start the runner
+when it is not running. The runner then starts only what the command
+asks for; |cli/runner/start| starts it and nothing else.
 
 ## The host runner
 
 Tasks that are yours rather than a project's, such as a database you
-always want up, belong to the host runner. Its config is
+always want running, belong to the host runner. Its config is
 `~/.config/dekit/host/dekit.yaml`. Name it with `host::` in a target or
-`host` on `dekit down` or a `dekit runner` command. Outside a project dekit
-reports an error instead of falling back to it, so `down` cannot stop
-machine-wide tasks by accident.
+`host` on `dekit up`, `dekit down`, or a `dekit runner` command. Outside
+a project dekit reports an error instead of falling back to it, so `down`
+cannot stop machine-wide tasks by accident.
 
 ## Stopping a runner
 
 `dekit down` stops the runner and saves its tasks and screens; the next
-start brings them back. `dekit runner stop` stops it without saving, so
+start brings them back idle, and `dekit up` starts the ones you had
+started. `dekit runner stop` stops it without saving, so
 the next start begins from `dekit.yaml`.
 
 Script tasks (`script:` in `dekit.yaml`) get `DEKIT_RUNNER_ROOT` and

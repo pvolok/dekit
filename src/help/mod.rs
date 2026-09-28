@@ -7,7 +7,7 @@ mod generate;
 pub mod help;
 mod inline;
 pub mod ir;
-mod layout;
+pub(crate) mod layout;
 mod markdown;
 mod parse;
 mod patterns;

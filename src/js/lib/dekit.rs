@@ -67,6 +67,10 @@ command_fn!(veto, Veto, false);
 command_fn!(restart, Restart, true);
 command_fn!(remove, Remove, false);
 
+async fn up(ctx: Ctx<'_>) -> rquickjs::Result<usize> {
+  run(&ctx, Command::Up, true).await
+}
+
 async fn add(
   ctx: Ctx<'_>,
   path: String,
@@ -92,6 +96,7 @@ async fn add(
 pub fn init(ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> {
   let obj = Object::new(ctx)?;
   obj.def_fn_async("start", start)?;
+  obj.def_fn_async("up", up)?;
   obj.def_fn_async("run", run_fresh)?;
   obj.def_fn_async("stop", stop)?;
   obj.def_fn_async("kill", kill)?;

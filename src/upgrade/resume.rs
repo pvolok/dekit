@@ -41,7 +41,7 @@ use crate::{
     config_tasks::{
       config_task_registration, config_task_resumed, resolve_task_deps,
     },
-    process_task::process_task_from_snapshot,
+    process_task::{process_task_from_snapshot, resumed_instance},
   },
   term::Size,
   upgrade::{set_cloexec, snapshot as snap},
@@ -174,6 +174,10 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
 
   log::info!("Upgrade complete: now dekit {}", env!("CARGO_PKG_VERSION"));
   let result = serve(ctx, server_socket, kernel_handle, carried).await;
+  // As `run_server` does: `runner status` shows why it ended.
+  if let Err(err) = &result {
+    lock_guard.publish_error(err);
+  }
   drop(lock_guard);
   result
 }
@@ -316,16 +320,18 @@ fn prepare<'a>(
           deps,
           saved.pinned,
           &process.screen,
-          process.instance.clone(),
+          resumed_instance(saved, process),
         )?
       }
+      // New in the config: idle, as at a runner start; `up` starts it
+      // if it autostarts.
       None => config_task_registration(
         config,
         TaskSpaceId::default_space(),
         cfg.clone(),
         ids[i],
         deps,
-        cfg.autostart(),
+        false,
       ),
     };
     tasks.push((saved, registration));

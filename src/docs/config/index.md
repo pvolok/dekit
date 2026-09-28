@@ -16,7 +16,7 @@ Relative paths resolve from the file that declares them.
 tasks:
   db:
     cmd: ["postgres", "-D", ".data/db"]
-    ready_log: "ready to accept connections"
+    ready: {log: "ready to accept connections"}
   api:
     cmd: ["cargo", "run", "-p", "api"]
     deps: [db]
@@ -24,7 +24,7 @@ tasks:
 defaults:
   env:
     RUST_LOG: info
-on_idle: {command: quit}
+on_idle: {command: down}
 ```
 
 ## Project keys
@@ -35,7 +35,7 @@ on_idle: {command: quit}
   desc: Tasks by path (|config/tasks|). Paths may nest, as in `services/web`.
 - key: defaults
   type: object
-  desc: Task settings shared by every task, such as `cwd`, `env`, or `stop`. A task's own value wins.
+  desc: Task settings shared by every task, such as `cwd`, `env`, `autorestart`, or `stop`. A task's own value wins. Not `type` or `ready`.
 - key: load
   type: "(string | {file, at})[]"
   desc: More files with tasks, as globs (|config/load|).

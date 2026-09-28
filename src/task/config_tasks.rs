@@ -12,32 +12,45 @@ use crate::{
     kernel_message::{
       RegisterError, TaskContext, TaskRegistration, TaskSelector,
     },
-    task::{RestartMode, TaskId},
+    task::{RestartMode, STOP_TIMEOUT, TaskId},
     task_key::{TaskKey, TaskSpaceId},
     task_path::TaskPath,
   },
   task::{
     logger::LogSpec,
     process_task::{
-      ProcessTaskConfig, process_task_config_from_snapshot,
+      ProcessTaskConfig, StopSignal, process_task_config_from_snapshot,
       process_task_registration, process_task_resumed,
     },
   },
   upgrade::snapshot as snap,
 };
 
+/// The config's tasks, the autostart ones pinned so they start at once:
+/// how `dekit mprocs` starts.
 pub async fn register_config_tasks(
   config: &Config,
   pc: &TaskContext,
 ) -> anyhow::Result<()> {
-  register_config(config, pc, &HashMap::new()).await?;
+  register_config(config, pc, &HashMap::new(), true).await?;
   Ok(())
 }
 
-/// The tasks a runner saved when it quit, every one idle with a fresh
-/// id: the config tasks first, each around its saved screen and with its
-/// saved pin when the snapshot has it, then the saved tasks the config
-/// lacks. Returns what could not be restored.
+/// The config's tasks, none pinned: a dekit runner starts nothing until
+/// asked (`up` starts the autostart ones).
+pub async fn register_idle_config_tasks(
+  config: &Config,
+  pc: &TaskContext,
+) -> anyhow::Result<()> {
+  register_config(config, pc, &HashMap::new(), false).await?;
+  Ok(())
+}
+
+/// The tasks a runner saved when it quit, every one idle and unpinned with
+/// a fresh id: the config tasks first, each around its saved screen when
+/// the snapshot has it, then the saved tasks the config lacks. A task that
+/// was started when they were saved gets a saved pin, so `up` starts it
+/// again. Returns what could not be restored.
 pub async fn register_saved_tasks(
   config: &Config,
   pc: &TaskContext,
@@ -49,7 +62,7 @@ pub async fn register_saved_tasks(
     .filter(|task| task.space.is_empty())
     .filter_map(|task| Some((task.path.as_deref()?, task)))
     .collect();
-  let mut new_id = register_config(config, pc, &saved_by_path).await?;
+  let mut new_id = register_config(config, pc, &saved_by_path, false).await?;
 
   let mut warnings = Vec::new();
   let mut pending: Vec<&snap::Task> = snapshot
@@ -113,10 +126,12 @@ pub async fn register_saved_tasks(
         process_task_resumed(id, key, config, &process.screen, None)
       });
       let registered = match registration {
-        Ok(registration) => match pc.register_task(registration).await {
-          Ok(registered) => registered.map_err(|err| err.to_string()),
-          Err(_) => bail!("the kernel has stopped"),
-        },
+        Ok(registration) => {
+          match pc.register_task(with_saved_pin(registration, saved)).await {
+            Ok(registered) => registered.map_err(|err| err.to_string()),
+            Err(_) => bail!("the kernel has stopped"),
+          }
+        }
         Err(err) => Err(format!("{err:#}")),
       };
       match registered {
@@ -132,12 +147,25 @@ pub async fn register_saved_tasks(
   Ok(warnings)
 }
 
+/// A task restored at a runner start: unpinned, and with a saved pin if it
+/// was started (or still had a saved pin) when it was saved.
+fn with_saved_pin(
+  mut registration: TaskRegistration,
+  saved: &snap::Task,
+) -> TaskRegistration {
+  registration.def.pinned = false;
+  registration.def.saved_pin = saved.pinned || saved.saved_pin;
+  registration
+}
+
 /// Registers the config tasks, around their saved screens where
-/// `saved_by_path` has them. Returns the new id of every saved task used.
+/// `saved_by_path` has them. The others are pinned if they autostart and
+/// `pin_autostart`. Returns the new id of every saved task used.
 async fn register_config(
   config: &Config,
   pc: &TaskContext,
   saved_by_path: &HashMap<&str, &snap::Task>,
+  pin_autostart: bool,
 ) -> anyhow::Result<HashMap<usize, TaskId>> {
   let task_ids: Vec<TaskId> =
     config.tasks.iter().map(|_| pc.alloc_id()).collect();
@@ -159,18 +187,19 @@ async fn register_config(
           bail!("saved task {} is not a process task", cfg.path);
         };
         new_id.insert(saved.id, task_ids[i]);
-        config_task_resumed(
+        let registration = config_task_resumed(
           config,
           cfg,
           task_ids[i],
           deps,
-          saved.pinned,
+          false,
           &process.screen,
           None,
-        )?
+        )?;
+        with_saved_pin(registration, saved)
       }
       None => {
-        let pinned = cfg.autostart();
+        let pinned = pin_autostart && cfg.autostart();
         config_task_registration(
           config,
           TaskSpaceId::default_space(),
@@ -277,16 +306,21 @@ fn process_task_config(
     config,
     name: cfg.path.clone(),
   });
+  let (stop, stop_timeout) = match &cfg.stop {
+    Some(stop) => (
+      stop.signal.clone().unwrap_or_default(),
+      stop.timeout.unwrap_or(STOP_TIMEOUT),
+    ),
+    None => (StopSignal::default(), STOP_TIMEOUT),
+  };
   ProcessTaskConfig {
     spec: crate::config::task::process_spec(cfg, runner),
-    stop: cfg.stop(),
+    kind: cfg.kind,
+    stop,
+    stop_timeout,
     log,
-    restart: if cfg.autorestart() {
-      RestartMode::OnFailure
-    } else {
-      RestartMode::Never
-    },
-    ready_log: cfg.ready_log.clone(),
+    restart: cfg.autorestart.unwrap_or(RestartMode::Never),
+    ready: cfg.ready.clone(),
     scrollback_len: cfg.scrollback_len(),
     mouse_scroll_speed: cfg.mouse_scroll_speed(),
     deps,
@@ -464,8 +498,8 @@ mod tests {
   fn task_config(name: &str, deps: &[&str]) -> TaskConfig {
     TaskConfig {
       path: name.to_string(),
-      cmd: Some(CmdConfig::Shell {
-        shell: "true".to_string(),
+      cmd: Some(CmdConfig::Cmd {
+        cmd: vec!["true".to_string()],
       }),
       deps: deps.iter().map(|dep| dep.to_string()).collect(),
       ..TaskConfig::default()
@@ -542,6 +576,81 @@ mod tests {
     assert_eq!(explains.len(), 1);
     assert_eq!(explains[0].deps[0].name, "db");
 
+    pc.send(KernelCommand::Quit);
+    handle.await.unwrap();
+  }
+
+  async fn explain_all(pc: &TaskContext) -> Vec<(String, bool, bool)> {
+    let response = pc
+      .query(KernelQuery::Explain(TaskSelector::all()))
+      .await
+      .unwrap();
+    let KernelQueryResponse::Explain(explains) = response else {
+      panic!("unexpected response");
+    };
+    let mut pins: Vec<(String, bool, bool)> = explains
+      .into_iter()
+      .map(|e| (e.name, e.pinned, e.saved_pin))
+      .collect();
+    pins.sort();
+    pins
+  }
+
+  /// A dekit runner starts nothing until asked; `dekit mprocs` still
+  /// starts its autostart tasks at once.
+  #[tokio::test]
+  async fn only_mprocs_pins_autostart_tasks_at_registration() {
+    for mprocs in [false, true] {
+      let mut config = Config::make_default();
+      config.tasks = vec![TaskConfig {
+        autostart: Some(true),
+        cmd: Some(CmdConfig::Cmd {
+          cmd: vec!["sleep".to_string(), "60".to_string()],
+        }),
+        ..task_config("web", &[])
+      }];
+      let kernel = Kernel::new();
+      let pc = kernel.context();
+      let handle = tokio::spawn(kernel.run());
+      if mprocs {
+        register_config_tasks(&config, &pc).await.unwrap();
+      } else {
+        register_idle_config_tasks(&config, &pc).await.unwrap();
+      }
+      assert_eq!(explain_all(&pc).await, [("web".to_string(), mprocs, false)]);
+      // No SIGCHLD waiter in unit tests: remove the task so quit can end.
+      pc.send(KernelCommand::Remove(TaskSelector::all(), None));
+      pc.send(KernelCommand::Quit);
+      handle.await.unwrap();
+    }
+  }
+
+  /// At a runner start the saved tasks come back unpinned; the ones that
+  /// were started, or still had a saved pin, get a saved pin for `up`.
+  #[tokio::test]
+  async fn saved_tasks_come_back_unpinned_with_saved_pins() {
+    let snapshot =
+      snap::decode(include_bytes!("../upgrade/fixtures/v1-orchestration.json"))
+        .unwrap();
+    let kernel = Kernel::new();
+    let pc = kernel.context();
+    let handle = tokio::spawn(kernel.run());
+    let warnings =
+      register_saved_tasks(&Config::make_default(), &pc, &snapshot)
+        .await
+        .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let pins: Vec<(String, bool, bool)> = [
+      ("api", true),
+      ("db", true),
+      ("migrate", false),
+      ("web", true),
+      ("worker", true),
+    ]
+    .into_iter()
+    .map(|(name, saved_pin)| (name.to_string(), false, saved_pin))
+    .collect();
+    assert_eq!(explain_all(&pc).await, pins);
     pc.send(KernelCommand::Quit);
     handle.await.unwrap();
   }

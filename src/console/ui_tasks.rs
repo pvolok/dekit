@@ -4,6 +4,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::config::Config;
 use crate::console::state::{Scope, State};
+use crate::kernel::task::{ExitInfo, TaskState};
 use crate::term::{
   Color, Grid,
   attrs::Attrs,
@@ -93,6 +94,19 @@ pub fn render_tasks(
         Cow::from(" UP "),
         attrs.clone().set_bold(true).fg(Color::BRIGHT_GREEN),
       )
+    } else if let TaskState::Exited(ExitInfo {
+      ready_timeout: true,
+      ..
+    })
+    | TaskState::Backoff(ExitInfo {
+      ready_timeout: true,
+      ..
+    }) = task.status
+    {
+      (
+        Cow::from(" NOT READY "),
+        attrs.clone().fg(Color::BRIGHT_RED),
+      )
     } else {
       match task.exit_code() {
         Some(0) => {
@@ -108,7 +122,9 @@ pub fn render_tasks(
     let status_width = status_text.width() as u16;
     let r = grid.draw_text(
       Rect {
-        x: row_area.x.max(row_area.x + row_area.width - status_width),
+        x: (row_area.x + row_area.width)
+          .saturating_sub(status_width)
+          .max(row_area.x),
         width: status_width.min(row_area.width),
         ..row_area
       },

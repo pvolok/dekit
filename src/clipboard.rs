@@ -72,24 +72,29 @@ fn check_prog(cmd: &'static str, args: &[&'static str]) -> Option<Provider> {
 fn copy_impl(s: &str, provider: &Provider) -> Result<()> {
   match provider {
     Provider::Exec(prog, args) => {
+      #[cfg(unix)]
+      let mark =
+        crate::process::unix_processes_waiter::UnixProcessesWaiter::mark();
       let mut child = std::process::Command::new(prog)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-      if let Err(e) = std::io::Write::write_all(
-        &mut child.stdin.take().unwrap(),
-        s.as_bytes(),
-      ) {
+        .spawn()?;
+      if let Some(mut stdin) = child.stdin.take()
+        && let Err(e) = std::io::Write::write_all(&mut stdin, s.as_bytes())
+      {
         log::warn!("Failed to write into copy process: {:?}", e);
       }
+      // Only the reaper waits for a child.
       #[cfg(unix)]
-      crate::process::unix_processes_waiter::UnixProcessesWaiter::wait_for_child(
-        child,
-        Box::new(|_| ()),
-      );
+      if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        crate::process::unix_processes_waiter::UnixProcessesWaiter::wait_for(
+          pid,
+          mark,
+          Box::new(|_| ()),
+        );
+      }
       #[cfg(not(unix))]
       child.wait()?;
     }

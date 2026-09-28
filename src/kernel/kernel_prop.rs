@@ -1,21 +1,22 @@
 //! Property harness: drives the kernel one turn at a time over random
 //! graphs, task behaviors, and command sequences, checking invariants
 //! after every turn. Everything is synchronous and deterministic — no
-//! tokio, no time; timers are held as data and fired by the generated
-//! sequence.
+//! tokio, no time; timers are held as data, one per task as the kernel
+//! shell keeps them, and fired by the generated sequence.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
 
 use proptest::prelude::*;
 
-use super::{Graph, Kernel, SentCmd, TimerRequest};
+use super::{Graph, Kernel, SentCmd};
 use crate::kernel::kernel_message::{
   KernelCommand, KernelMessage, SpaceSelector, TaskSelector,
 };
 use crate::kernel::sub_trie::SubMode;
 use crate::kernel::task::{
-  Effects, ExitInfo, INIT_TASK_ID, ReadyMode, RestartMode, Task, TaskCmd,
-  TaskDef, TaskId, TaskKind, TaskState,
+  Effects, ExitInfo, INIT_TASK_ID, ReadyMode, RestartMode, STOP_TIMEOUT, Task,
+  TaskCmd, TaskDef, TaskId, TaskKind, TaskState,
 };
 use crate::kernel::task_key::{TaskKey, TaskSpaceId};
 use crate::kernel::task_path::TaskPath;
@@ -81,8 +82,12 @@ impl Task for ScriptedTask {
 struct TaskGen {
   job: bool,
   reported: bool,
+  /// With `reported`: a ready timeout, fired like any timer.
+  ready_timeout: bool,
   restart: RestartMode,
   pinned: bool,
+  /// Without `pinned`: registered as from a saved file.
+  saved_pin: bool,
   deps: Vec<usize>,
   script: Script,
 }
@@ -98,6 +103,7 @@ enum ReportKind {
 #[derive(Clone, Copy, Debug)]
 enum Intent {
   Start,
+  Up,
   Stop,
   Kill,
   Restart,
@@ -119,6 +125,7 @@ enum Sel {
 #[derive(Clone, Debug)]
 enum Cmd {
   Start(Sel),
+  Up(Sel),
   Stop(Sel),
   Kill(Sel),
   Restart(Sel),
@@ -172,19 +179,36 @@ fn task_gen(n: usize) -> impl Strategy<Value = TaskGen> {
   (
     any::<bool>(),
     any::<bool>(),
+    any::<bool>(),
     restart_mode(),
+    any::<bool>(),
     any::<bool>(),
     prop::collection::vec(0..n, 0..3),
     script(),
   )
-    .prop_map(|(job, reported, restart, pinned, deps, script)| TaskGen {
-      job,
-      reported,
-      restart,
-      pinned,
-      deps,
-      script,
-    })
+    .prop_map(
+      |(
+        job,
+        reported,
+        ready_timeout,
+        restart,
+        pinned,
+        saved_pin,
+        deps,
+        script,
+      )| {
+        TaskGen {
+          job,
+          reported,
+          ready_timeout,
+          restart,
+          pinned,
+          saved_pin,
+          deps,
+          script,
+        }
+      },
+    )
 }
 
 fn sel(n: usize) -> impl Strategy<Value = Sel> {
@@ -200,6 +224,7 @@ fn sel(n: usize) -> impl Strategy<Value = Sel> {
 fn cmd(n: usize) -> impl Strategy<Value = Cmd> {
   prop_oneof![
     3 => sel(n).prop_map(Cmd::Start),
+    2 => sel(n).prop_map(Cmd::Up),
     2 => sel(n).prop_map(Cmd::Stop),
     1 => sel(n).prop_map(Cmd::Kill),
     2 => sel(n).prop_map(Cmd::Restart),
@@ -241,7 +266,11 @@ fn world() -> impl Strategy<Value = World> {
 
 struct Run {
   kernel: Kernel,
-  timers: Vec<TimerRequest>,
+  /// The shell's timers: one per task, at the epoch it was set at.
+  timers: BTreeMap<TaskId, u64>,
+  /// Timers the shell dropped. They are still fired now and then (as a
+  /// timeout deferred by a freeze can arrive late); each must be ignored.
+  dropped: Vec<(TaskId, u64)>,
   /// Last seen epoch per task; cleared on removal so re-registration
   /// starts a fresh baseline.
   epochs: HashMap<TaskId, u64>,
@@ -251,7 +280,8 @@ impl Run {
   fn new() -> Self {
     Run {
       kernel: Kernel::new(),
-      timers: Vec::new(),
+      timers: BTreeMap::new(),
+      dropped: Vec::new(),
       epochs: HashMap::new(),
     }
   }
@@ -260,7 +290,7 @@ impl Run {
     &self.kernel.graph
   }
 
-  /// One turn: dispatch a single message, settle, collect armed timers.
+  /// One turn: dispatch a single message, settle, update the timers.
   /// Returns the commands the kernel sent to tasks during the turn.
   fn turn(
     &mut self,
@@ -273,9 +303,57 @@ impl Run {
 
   fn finish_turn(&mut self) -> Vec<(TaskId, SentCmd)> {
     self.kernel.graph.settle();
-    self.timers.extend(self.kernel.graph.take_timers());
+    self.update_timers();
     self.check();
     std::mem::take(&mut self.kernel.graph.sent)
+  }
+
+  /// What `StateTimers::update` does. A timer it drops must be one whose
+  /// `StateTimeout` would fail the epoch check.
+  fn update_timers(&mut self) {
+    let g = &mut self.kernel.graph;
+    for task_id in g.take_timer_changes() {
+      let timer = g.timer(task_id).map(|(epoch, _)| epoch);
+      match (self.timers.get(&task_id), timer) {
+        (Some(armed), Some(epoch)) if *armed == epoch => continue,
+        _ => (),
+      }
+      if let Some(armed) = self.timers.remove(&task_id) {
+        assert!(
+          g.tasks.get(&task_id).is_none_or(|t| t.epoch != armed),
+          "dropped the live timer {:?}@{}",
+          task_id,
+          armed
+        );
+        self.dropped.push((task_id, armed));
+      }
+      if let Some(epoch) = timer {
+        self.timers.insert(task_id, epoch);
+      }
+    }
+  }
+
+  fn fire(&mut self, task_id: TaskId, epoch: u64) {
+    self.timers.remove(&task_id);
+    self.turn(INIT_TASK_ID, KernelCommand::StateTimeout(task_id, epoch));
+  }
+
+  fn fire_dropped(&mut self, task_id: TaskId, epoch: u64) {
+    let _ = self.kernel.dispatch(KernelMessage {
+      from: INIT_TASK_ID,
+      command: KernelCommand::StateTimeout(task_id, epoch),
+    });
+    let g = &self.kernel.graph;
+    assert!(
+      g.transitions.is_empty()
+        && g.timer_changes.is_empty()
+        && g.pending_effects.is_empty()
+        && g.sent.is_empty(),
+      "the dropped timer {:?}@{} acted",
+      task_id,
+      epoch
+    );
+    self.finish_turn();
   }
 
   fn state_of(&self, t: TaskId) -> Option<TaskState> {
@@ -305,17 +383,21 @@ impl Run {
         TaskKind::Service
       },
       ready: if task.reported {
-        ReadyMode::Reported
+        ReadyMode::Reported {
+          timeout: task.ready_timeout.then_some(Duration::from_secs(30)),
+        }
       } else {
         ReadyMode::Immediate
       },
       restart: task.restart,
+      stop_timeout: STOP_TIMEOUT,
       deps: task
         .deps
         .iter()
         .map(|d| TaskSelector::Id(TaskId(d + 1)))
         .collect(),
       pinned: task.pinned,
+      saved_pin: task.saved_pin && !task.pinned,
       space: TaskSpaceId::default_space(),
       path: Some(TaskPath::new(format!("t{}", i + 1)).unwrap()),
       label: None,
@@ -340,7 +422,7 @@ impl Run {
       task_id
     );
     self.kernel.graph.settle();
-    self.timers.extend(self.kernel.graph.take_timers());
+    self.update_timers();
     self.check();
     self.kernel.graph.sent.clear();
   }
@@ -386,13 +468,49 @@ impl Run {
   /// Run an intent command and check the ack count and per-id effects
   /// against the pre-turn expectation.
   fn exec_intent(&mut self, world: &World, sel: &Sel, intent: Intent) {
-    let expected = self.expect_matched(world, sel);
+    let mut expected = self.expect_matched(world, sel);
+    match intent {
+      // `up` also takes every task with a saved pin.
+      Intent::Up => {
+        let mut saved: Vec<TaskId> = self
+          .graph()
+          .tasks
+          .iter()
+          .filter(|(id, t)| t.saved_pin && !expected.contains(id))
+          .map(|(id, _)| *id)
+          .collect();
+        saved.sort_unstable();
+        expected.extend(saved);
+      }
+      Intent::Start
+      | Intent::Stop
+      | Intent::Kill
+      | Intent::Restart
+      | Intent::Unpin
+      | Intent::Veto => (),
+    }
     let pre: Vec<(TaskId, Option<TaskState>)> =
       expected.iter().map(|t| (*t, self.state_of(*t))).collect();
+    let done_before: Vec<(TaskId, TaskState)> = self
+      .graph()
+      .tasks
+      .iter()
+      .filter_map(|(id, t)| match t.state {
+        TaskState::Done(_) => Some((*id, t.state)),
+        TaskState::Idle
+        | TaskState::Starting
+        | TaskState::Running
+        | TaskState::Ready
+        | TaskState::Stopping
+        | TaskState::Backoff(_)
+        | TaskState::Exited(_) => None,
+      })
+      .collect();
     let selector = self.to_selector(world, sel);
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     let command = match intent {
       Intent::Start => KernelCommand::Start(selector, Some(tx)),
+      Intent::Up => KernelCommand::Up(selector, Some(tx)),
       Intent::Stop => KernelCommand::Stop(selector, Some(tx)),
       Intent::Kill => KernelCommand::Kill(selector, Some(tx)),
       Intent::Restart => KernelCommand::Restart(selector, Some(tx)),
@@ -407,9 +525,35 @@ impl Run {
       sel
     );
 
+    // `up` consumes every saved pin and never runs a done job again.
+    match intent {
+      Intent::Up => {
+        for (id, task) in &self.graph().tasks {
+          assert!(!task.saved_pin, "up left the saved pin on {:?}", id);
+        }
+        for (id, state) in done_before {
+          assert_eq!(self.state_of(id), Some(state), "up revived {:?}", id);
+        }
+      }
+      Intent::Start
+      | Intent::Stop
+      | Intent::Kill
+      | Intent::Restart
+      | Intent::Unpin
+      | Intent::Veto => (),
+    }
+
     // A command on a task in a matching state is never silently
-    // swallowed; pins and vetoes follow the verb.
+    // swallowed; pins and vetoes follow the verb, and the latest wish
+    // replaces a saved pin.
     for (t, pre_state) in pre {
+      if let Some(task) = self.graph().tasks.get(&t) {
+        assert!(
+          !task.saved_pin,
+          "{:?} left the saved pin on {:?}",
+          intent, t
+        );
+      }
       let must_bounce = match pre_state {
         Some(TaskState::Starting | TaskState::Running | TaskState::Ready) => {
           true
@@ -417,7 +561,7 @@ impl Run {
         Some(
           TaskState::Idle
           | TaskState::Stopping
-          | TaskState::Backoff
+          | TaskState::Backoff(_)
           | TaskState::Done(_)
           | TaskState::Exited(_),
         )
@@ -428,6 +572,12 @@ impl Run {
           assert!(self.pinned(t), "start did not pin {:?}", t);
           if let Some(v) = self.vetoed(t) {
             assert!(!v, "start left {:?} vetoed", t);
+          }
+        }
+        Intent::Up => {
+          assert!(self.pinned(t), "up did not pin {:?}", t);
+          if let Some(v) = self.vetoed(t) {
+            assert!(!v, "up left {:?} vetoed", t);
           }
         }
         Intent::Stop => {
@@ -485,6 +635,7 @@ impl Run {
     let id = |k: usize| TaskId((k % n) + 1);
     match cmd {
       Cmd::Start(sel) => self.exec_intent(world, sel, Intent::Start),
+      Cmd::Up(sel) => self.exec_intent(world, sel, Intent::Up),
       Cmd::Stop(sel) => self.exec_intent(world, sel, Intent::Stop),
       Cmd::Kill(sel) => self.exec_intent(world, sel, Intent::Kill),
       Cmd::Restart(sel) => self.exec_intent(world, sel, Intent::Restart),
@@ -498,6 +649,9 @@ impl Run {
           INIT_TASK_ID,
           KernelCommand::Remove(TaskSelector::Id(t), None),
         );
+        // The kernel never reuses an id; this harness does on
+        // re-registration.
+        self.dropped.retain(|(task_id, _)| *task_id != t);
       }
       Cmd::Subscribe(a, b) => {
         let path = TaskPath::new(format!("t{}", (b % n) + 1)).unwrap();
@@ -523,24 +677,31 @@ impl Run {
         self.turn(id(*t), command);
       }
       Cmd::FireTimer(k) => {
-        if !self.timers.is_empty() {
-          let req = self.timers.remove(k % self.timers.len());
-          self.turn(
-            INIT_TASK_ID,
-            KernelCommand::StateTimeout(req.task_id, req.epoch),
-          );
+        let total = self.timers.len() + self.dropped.len();
+        if total == 0 {
+          return;
+        }
+        let i = k % total;
+        let live = self.timers.iter().nth(i).map(|(t, e)| (*t, *e));
+        match live {
+          Some((task_id, epoch)) => self.fire(task_id, epoch),
+          None => {
+            let (task_id, epoch) = self.dropped.remove(i - self.timers.len());
+            self.fire_dropped(task_id, epoch);
+          }
         }
       }
     }
   }
 
   fn fire_all_timers(&mut self) {
-    let due: Vec<TimerRequest> = std::mem::take(&mut self.timers);
-    for req in due {
-      self.turn(
-        INIT_TASK_ID,
-        KernelCommand::StateTimeout(req.task_id, req.epoch),
-      );
+    let due: Vec<(TaskId, u64)> =
+      self.timers.iter().map(|(t, e)| (*t, *e)).collect();
+    for (task_id, epoch) in due {
+      // An earlier firing may have replaced or dropped it.
+      if self.timers.get(&task_id) == Some(&epoch) {
+        self.fire(task_id, epoch);
+      }
     }
   }
 
@@ -548,13 +709,17 @@ impl Run {
 
   fn check(&mut self) {
     // Every transition follows the legal state diagram; in particular a
-    // commanded stop always lands in Idle, never in a dead-end state.
-    for (id, from, to) in std::mem::take(&mut self.kernel.graph.transitions) {
+    // commanded stop always lands in Idle, and only the stop of a failed
+    // start lands as a failed exit.
+    for (id, from, to, start_failed) in
+      std::mem::take(&mut self.kernel.graph.transitions)
+    {
       assert!(
-        legal_transition(from, to),
-        "illegal transition {:?} -> {:?} for {:?}",
+        legal_transition(from, to, start_failed),
+        "illegal transition {:?} -> {:?} (start failed: {}) for {:?}",
         from,
         to,
+        start_failed,
         id
       );
     }
@@ -616,6 +781,23 @@ impl Run {
           id
         );
       }
+      if task.start_failed {
+        assert_eq!(
+          task.state,
+          TaskState::Stopping,
+          "start_failed outside Stopping for {:?}",
+          id
+        );
+        assert!(task.ready.timeout().is_some(), "failed without a timeout");
+      }
+      // A saved pin is only on an unpinned task: whatever pins clears it.
+      if task.saved_pin {
+        assert!(
+          !g.edges.get(&INIT_TASK_ID).is_some_and(|s| s.contains(id)),
+          "saved pin on the pinned {:?}",
+          id
+        );
+      }
       // A settled supported task is never left sitting Idle.
       if task.supported {
         assert_ne!(
@@ -637,14 +819,66 @@ impl Run {
         }
         TaskState::Idle
         | TaskState::Stopping
-        | TaskState::Backoff
+        | TaskState::Backoff(_)
         | TaskState::Done(_)
         | TaskState::Exited(_) => (),
       }
+      // An end state is where its own exit lands as the task is
+      // configured (what a restore keeps); so only a job is ever done.
+      match task.state {
+        TaskState::Backoff(info)
+        | TaskState::Done(info)
+        | TaskState::Exited(info) => {
+          assert_eq!(
+            task.exit_state(info),
+            task.state,
+            "end state its config does not file its exit as, for {:?}",
+            id
+          );
+          assert!(
+            !info.ready_timeout || task.ready.timeout().is_some(),
+            "not ready in time without a ready timeout, for {:?}",
+            id
+          );
+        }
+        TaskState::Idle
+        | TaskState::Starting
+        | TaskState::Running
+        | TaskState::Ready
+        | TaskState::Stopping => (),
+      }
+      // A timer runs exactly in the states that have one, and the shell
+      // holds exactly it: every timer the shell keeps passes the epoch
+      // check.
+      let timed = match task.state {
+        TaskState::Stopping | TaskState::Backoff(_) => true,
+        TaskState::Running => task.ready.timeout().is_some(),
+        TaskState::Idle
+        | TaskState::Starting
+        | TaskState::Ready
+        | TaskState::Done(_)
+        | TaskState::Exited(_) => false,
+      };
+      assert_eq!(
+        task.deadline.is_some(),
+        timed,
+        "deadline in {:?} for {:?}",
+        task.state,
+        id
+      );
+      assert_eq!(
+        self.timers.get(id).copied(),
+        task.deadline.map(|_| task.epoch),
+        "shell timer disagrees with the deadline of {:?}",
+        id
+      );
       // Epochs only move forward.
       let last = self.epochs.entry(*id).or_insert(task.epoch);
       assert!(task.epoch >= *last, "epoch went backward for {:?}", id);
       *last = task.epoch;
+    }
+    for id in self.timers.keys() {
+      assert!(g.tasks.contains_key(id), "timer of a removed task {:?}", id);
     }
   }
 }
@@ -653,15 +887,30 @@ fn tag_name(i: usize) -> &'static str {
   if i % 2 == 0 { "even" } else { "odd" }
 }
 
-fn legal_transition(from: TaskState, to: TaskState) -> bool {
+fn legal_transition(
+  from: TaskState,
+  to: TaskState,
+  start_failed: bool,
+) -> bool {
   match (from, to) {
+    (TaskState::Stopping, TaskState::Idle) => !start_failed,
+    (
+      TaskState::Stopping,
+      TaskState::Backoff(info) | TaskState::Exited(info),
+    ) => start_failed && info.ready_timeout,
+    (_, TaskState::Backoff(info) | TaskState::Exited(info))
+      if info.ready_timeout =>
+    {
+      false
+    }
+    _ if start_failed => false,
     (TaskState::Idle, TaskState::Starting) => true,
     (
       TaskState::Starting,
       TaskState::Running
       | TaskState::Ready
       | TaskState::Stopping
-      | TaskState::Backoff
+      | TaskState::Backoff(_)
       | TaskState::Done(_)
       | TaskState::Exited(_),
     ) => true,
@@ -669,19 +918,18 @@ fn legal_transition(from: TaskState, to: TaskState) -> bool {
       TaskState::Running,
       TaskState::Ready
       | TaskState::Stopping
-      | TaskState::Backoff
+      | TaskState::Backoff(_)
       | TaskState::Done(_)
       | TaskState::Exited(_),
     ) => true,
     (
       TaskState::Ready,
       TaskState::Stopping
-      | TaskState::Backoff
+      | TaskState::Backoff(_)
       | TaskState::Done(_)
       | TaskState::Exited(_),
     ) => true,
-    (TaskState::Stopping, TaskState::Idle) => true,
-    (TaskState::Backoff, TaskState::Idle) => true,
+    (TaskState::Backoff(_), TaskState::Idle) => true,
     (TaskState::Done(_), TaskState::Idle) => true,
     (TaskState::Exited(_), TaskState::Idle) => true,
     _ => false,
@@ -743,7 +991,18 @@ fn run_case(world: &World) {
 
   // Quit liveness: from any reachable state, quit plus firing the armed
   // timers must reach no-active within the stop -> kill -> give-up chain.
-  run.turn(INIT_TASK_ID, KernelCommand::Quit);
+  // Its bound is read from the graph it begins on.
+  let within = run.graph().stop_within();
+  let (reply, mut rx) = tokio::sync::oneshot::channel();
+  run.turn(
+    INIT_TASK_ID,
+    KernelCommand::QuitWithin { save: true, reply },
+  );
+  assert_eq!(
+    rx.try_recv()
+      .expect("quit bound not answered in its dispatch"),
+    within
+  );
   let mut rounds = 0;
   while !run.graph().no_active_tasks() {
     assert!(
