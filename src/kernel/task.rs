@@ -224,6 +224,7 @@ pub enum TaskNotify {
   Added {
     path: Option<TaskPath>,
     label: Option<String>,
+    kind: TaskKind,
     state: TaskState,
     vt: Option<SharedVt>,
   },

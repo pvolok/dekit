@@ -32,8 +32,8 @@ use crate::{
     kernel_message::{KernelCommand, SharedVt, TaskContext, TaskRegistration},
     sub_trie::SubMode,
     task::{
-      ChannelTask, ExitInfo, TaskCmd, TaskDef, TaskId, TaskNotification,
-      TaskNotify, TaskState,
+      ChannelTask, ExitInfo, TaskCmd, TaskDef, TaskId, TaskKind,
+      TaskNotification, TaskNotify, TaskState,
     },
     task_key::TaskKey,
     task_path::{TaskPath, is_valid_component_char},
@@ -284,6 +284,7 @@ impl App {
     id: TaskId,
     label: Option<String>,
     path: Option<TaskPath>,
+    kind: TaskKind,
     status: TaskState,
     vt: Option<SharedVt>,
   ) {
@@ -294,6 +295,7 @@ impl App {
       id,
       label,
       path,
+      kind,
       status,
       vt,
       present: None,
@@ -766,9 +768,10 @@ impl App {
       TaskNotify::Added {
         path,
         label,
+        kind,
         state,
         vt,
-      } => self.add_task(id, label, path, state, vt),
+      } => self.add_task(id, label, path, kind, state, vt),
       TaskNotify::StateChanged(state) => {
         if let Some(task) = self.state.task_mut(id) {
           task.status = state;

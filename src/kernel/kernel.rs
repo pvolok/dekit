@@ -307,6 +307,7 @@ impl Graph {
       | TaskState::Exited(_) => None,
     };
     let state = handle.state;
+    let kind = handle.kind;
     self.tasks.insert(task_id, handle);
     self.state_changed = true;
     if let Some(delay) = timer {
@@ -332,6 +333,7 @@ impl Graph {
       TaskNotify::Added {
         path,
         label,
+        kind,
         state,
         vt,
       },
@@ -368,6 +370,7 @@ impl Graph {
       let notify = TaskNotify::Added {
         path: Some(path.clone()),
         label: t.label.clone(),
+        kind: t.kind,
         state: t.state,
         vt: t.vt.clone(),
       };

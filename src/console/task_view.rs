@@ -1,6 +1,6 @@
 use crate::kernel::{
   kernel_message::SharedVt,
-  task::{TaskId, TaskState},
+  task::{TaskId, TaskKind, TaskState},
   task_path::TaskPath,
 };
 
@@ -8,6 +8,7 @@ pub struct TaskView {
   pub id: TaskId,
   pub label: Option<String>,
   pub path: Option<TaskPath>,
+  pub kind: TaskKind,
   pub status: TaskState,
   pub vt: SharedVt,
   /// Copy-mode surface, shown instead of `vt` while set.

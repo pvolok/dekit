@@ -4,7 +4,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::config::Config;
 use crate::console::state::{Scope, State};
-use crate::kernel::task::{ExitInfo, TaskState};
+use crate::kernel::task::{ExitInfo, TaskKind, TaskState};
 use crate::term::{
   Color, Grid,
   attrs::Attrs,
@@ -108,15 +108,24 @@ pub fn render_tasks(
         attrs.clone().fg(Color::BRIGHT_RED),
       )
     } else {
-      match task.exit_code() {
-        Some(0) => {
+      match (task.kind, task.exit_code()) {
+        (TaskKind::Service, Some(0)) => {
           (Cow::from(" DOWN (0)"), attrs.clone().fg(Color::BRIGHT_BLUE))
         }
-        Some(exit_code) => (
+        (TaskKind::Service, Some(exit_code)) => (
           Cow::from(format!(" DOWN ({})", exit_code)),
           attrs.clone().fg(Color::BRIGHT_RED),
         ),
-        None => (Cow::from(" DOWN "), attrs.clone().fg(Color::BRIGHT_BLACK)),
+        (TaskKind::Job, Some(0)) => {
+          (Cow::from(" DONE"), attrs.clone().fg(Color::BRIGHT_BLUE))
+        }
+        (TaskKind::Job, Some(exit_code)) => (
+          Cow::from(format!(" FAILED ({})", exit_code)),
+          attrs.clone().fg(Color::BRIGHT_RED),
+        ),
+        (TaskKind::Service | TaskKind::Job, None) => {
+          (Cow::from(" DOWN "), attrs.clone().fg(Color::BRIGHT_BLACK))
+        }
       }
     };
     let status_width = status_text.width() as u16;
