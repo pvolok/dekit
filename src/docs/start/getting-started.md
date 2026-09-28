@@ -5,18 +5,10 @@ related: [start/targets, cli/up, config]
 order: 10
 ---
 
-Install with the script, from npm, or from crates.io:
+Install with the script:
 
 ```sh
 curl -fsSL https://dekit.run/install.sh | sh
-```
-
-```sh
-npm install -g dekit
-```
-
-```sh
-cargo install dekit
 ```
 
 On Windows (PowerShell):
@@ -28,8 +20,6 @@ irm https://dekit.run/install.ps1 | iex
 The scripts put `dekit` in `~/.local/bin`; `DEKIT_INSTALL_DIR` picks
 another directory. `DEKIT_VERSION` installs a given version, such as
 `1.2.3`, or `canary` for the latest build of the main branch.
-`cargo install dekit` builds from source and needs a C compiler for the
-built-in JavaScript engine.
 
 `dekit update` brings dekit and its running runners to the latest version
 (|cli/update|).

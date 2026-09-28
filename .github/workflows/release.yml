@@ -18,7 +18,6 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
-      npm_tag: ${{ steps.version.outputs.npm_tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,16 +30,13 @@ jobs:
             exit 1
           fi
           prerelease=false
-          npm_tag=latest
           case "$version" in
             *-*)
               prerelease=true
-              npm_tag=next
               ;;
           esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          echo "npm_tag=$npm_tag" >> "$GITHUB_OUTPUT"
 
       - name: Check the release notes
         run: packaging/release-notes.sh "${{ steps.version.outputs.version }}" > /dev/null
@@ -53,73 +49,8 @@ jobs:
       artifact-prefix: release
       retention-days: 7
 
-  # The checks below run before anything is published and must pass.
-  check-crate:
-    needs: meta
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: check-crate
-
-      # crates.io has no read-only call that accepts a token scoped to
-      # publishing, so only its presence can be checked.
-      - name: Check the crates.io token is set
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: test -n "$CARGO_REGISTRY_TOKEN"
-
-      - name: Package and build the crate
-        run: |
-          cp LICENSE src/LICENSE
-          cp packaging/crate/README.md src/README.md
-          cargo publish -p dekit --dry-run --locked --allow-dirty
-
-  check-npm:
-    needs: [meta, build]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20.x"
-          registry-url: "https://registry.npmjs.org"
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: dist/release
-          merge-multiple: true
-
-      - name: Check the npm token
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm whoami
-
-      - name: Pack and dry-run the npm packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          node packaging/npm/build.mjs pack \
-            --archives dist/release \
-            --out dist/npm \
-            --version "${{ needs.meta.outputs.version }}"
-          node packaging/npm/build.mjs publish \
-            --dir dist/npm \
-            --dist-tag "${{ needs.meta.outputs.npm_tag }}" \
-            --version "${{ needs.meta.outputs.version }}" \
-            --dry-run
-
   github-release:
-    needs: [meta, build, check-crate, check-npm]
+    needs: [meta, build]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -159,70 +90,3 @@ jobs:
           fi
           gh release upload "$tag" dist/release/* --clobber
           gh release edit "$tag" --draft=false
-
-  publish-crate:
-    needs: [meta, github-release]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: publish-crate
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          VERSION: ${{ needs.meta.outputs.version }}
-        run: |
-          # A re-run skips a version that is already up, as npm does below.
-          status=$(curl -sS -o /dev/null -w '%{http_code}' \
-            -A "dekit release (https://github.com/pvolok/dekit)" \
-            "https://crates.io/api/v1/crates/dekit/$VERSION")
-          case "$status" in
-            200)
-              echo "dekit $VERSION is already on crates.io"
-              exit 0
-              ;;
-            404) ;;
-            *)
-              echo "crates.io answered $status for dekit $VERSION" >&2
-              exit 1
-              ;;
-          esac
-          cp LICENSE src/LICENSE
-          cp packaging/crate/README.md src/README.md
-          cargo publish -p dekit --locked --allow-dirty
-
-  publish-npm:
-    needs: [meta, github-release]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20.x"
-          registry-url: "https://registry.npmjs.org"
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: dist/release
-          merge-multiple: true
-
-      - name: Pack and publish npm packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          node packaging/npm/build.mjs pack \
-            --archives dist/release \
-            --out dist/npm \
-            --version "${{ needs.meta.outputs.version }}"
-          node packaging/npm/build.mjs publish \
-            --dir dist/npm \
-            --dist-tag "${{ needs.meta.outputs.npm_tag }}" \
-            --version "${{ needs.meta.outputs.version }}"

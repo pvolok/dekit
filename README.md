@@ -24,8 +24,6 @@ databases and workers, in development and in production.
 ```sh
 curl -fsSL https://dekit.run/install.sh | sh     # macOS, Linux
 irm https://dekit.run/install.ps1 | iex    # Windows (PowerShell)
-npm install -g dekit
-cargo install dekit
 ```
 
 ## Quick start
