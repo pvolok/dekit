@@ -26,7 +26,9 @@ asks for; |cli/runner/start| starts it and nothing else.
 Tasks that are yours rather than a project's, such as a database you
 always want running, belong to the host runner. Its config is
 `~/.config/dekit/host/dekit.yaml`. Name it with `host::` in a target or
-`host` on `dekit up`, `dekit down`, or a `dekit runner` command. Outside
+`host` on `dekit up`, `dekit down`, or a `dekit runner` command. Inside
+`~/.config/dekit/host`, commands use the host runner without that, the
+way they use a project's runner inside the project. Anywhere else outside
 a project dekit reports an error instead of falling back to it, so `down`
 cannot stop machine-wide tasks by accident.
 
