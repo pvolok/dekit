@@ -1020,7 +1020,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         };
         let record = running_record(&runner)?;
         if Path::new(&record.binary) == binary {
-          println!(
+          eprintln!(
             "Runner already runs {}; switching live anyway.",
             binary.display()
           );
