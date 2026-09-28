@@ -1330,17 +1330,13 @@ async fn run_module_main(
     t => anyhow::bail!("Exported `main` is not a function ({}).", t.as_str()),
   };
 
-  let val = if let Some(promise) = val.clone().into_promise() {
+  if let Some(promise) = val.into_promise() {
     map_js_error(
       ctx,
       promise.into_future::<rquickjs::Value<'_>>().await,
       "Unhandled rejection in exported `main`",
-    )?
-  } else {
-    val
-  };
-
-  println!("-> {:?}", val);
+    )?;
+  }
   Ok(())
 }
 
