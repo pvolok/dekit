@@ -636,28 +636,34 @@ async fn process_main(
     match next {
       Next::Cmd(None) => break,
       Next::Cmd(Some(cmd)) => match cmd {
-        TaskCmd::Start => {
-          if process.is_none()
-            && let Some((p, receiver)) =
-              start_instance(&ctx, &config.spec, task_screen.vt())
-          {
-            instance.exit_info = None;
-            instance.stdout_eof = false;
-            instance.ready_line = VisibleLine::default();
-            instance.ready_sent = false;
-            instance.stop_sent = false;
-            probe = start_probe(&config, &instance);
-            update_log_observer(
-              &mut task_screen,
-              &config.log,
-              &mut instance.current_log,
-              ctx.task_id,
-              p.pid(),
-            );
-            *process = Some(p);
-            instance.exits = Some(receiver);
+        TaskCmd::Start if process.is_none() => {
+          match start_instance(&ctx, &config.spec, task_screen.vt()) {
+            Ok((p, receiver)) => {
+              instance.exit_info = None;
+              instance.stdout_eof = false;
+              instance.ready_line = VisibleLine::default();
+              instance.ready_sent = false;
+              instance.stop_sent = false;
+              probe = start_probe(&config, &instance);
+              update_log_observer(
+                &mut task_screen,
+                &config.log,
+                &mut instance.current_log,
+                ctx.task_id,
+                p.pid(),
+              );
+              *process = Some(p);
+              instance.exits = Some(receiver);
+            }
+            Err(message) => {
+              task_screen
+                .process(message.as_bytes(), &mut screen_effects)
+                .await;
+              screen_effects.clear();
+            }
           }
         }
+        TaskCmd::Start => {}
         TaskCmd::Stop => {
           probe = None;
           instance.stop_sent = true;
@@ -841,7 +847,7 @@ fn start_instance(
   ctx: &TaskContext,
   spec: &ProcessSpec,
   vt: &SharedVt,
-) -> Option<(NativeProcess, UnboundedReceiver<ExitInfo>)> {
+) -> Result<(NativeProcess, UnboundedReceiver<ExitInfo>), String> {
   let size = match vt.read() {
     Ok(screen) => {
       let s = screen.size();
@@ -866,14 +872,67 @@ fn start_instance(
   match spawn_native(ctx, spec, size) {
     Ok(spawned) => {
       ctx.send(KernelCommand::TaskStarted);
-      Some(spawned)
+      Ok(spawned)
     }
     Err(err) => {
-      log::warn!("Process spawn error: {}", err);
+      log::warn!("Process spawn error: {:#}", err);
       ctx.send(KernelCommand::TaskStopped(ExitInfo::error()));
-      None
+      Err(spawn_error_message(spec, &err))
     }
   }
+}
+
+/// What the task's screen shows when its program could not start.
+fn spawn_error_message(spec: &ProcessSpec, err: &anyhow::Error) -> String {
+  let mut message = format!(
+    "\x1b[31mCannot start `{}`: {}\x1b[0m\r\n",
+    spec.prog,
+    err.root_cause()
+  );
+  #[cfg(windows)]
+  let not_found = err
+    .root_cause()
+    .downcast_ref::<std::io::Error>()
+    .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound);
+  #[cfg(windows)]
+  if not_found && let Some(script) = batch_file_on_path(spec) {
+    let line = std::iter::once(&spec.prog)
+      .chain(&spec.args)
+      .map(String::as_str)
+      .collect::<Vec<_>>()
+      .join(" ");
+    message.push_str(&format!(
+      "`{}` is {}, a batch file; Windows runs those only through cmd:\r\n  cmd: [\"cmd\", \"/c\", \"{}\"]\r\n",
+      spec.prog,
+      script.display(),
+      line.replace('\\', "\\\\").replace('"', "\\\""),
+    ));
+  }
+  message
+}
+
+/// `npm` and the like are `npm.cmd` on Windows, which CreateProcess does
+/// not find or run by the bare name.
+#[cfg(windows)]
+fn batch_file_on_path(spec: &ProcessSpec) -> Option<std::path::PathBuf> {
+  let prog = std::path::Path::new(&spec.prog);
+  if prog.extension().is_some() || prog.components().count() != 1 {
+    return None;
+  }
+  let path = spec
+    .env
+    .iter()
+    .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+    .map_or_else(
+      || std::env::var_os("PATH"),
+      |(_, value)| value.as_ref().map(Into::into),
+    )?;
+  std::env::split_paths(&path).find_map(|dir| {
+    ["cmd", "bat"]
+      .iter()
+      .map(|ext| dir.join(prog).with_extension(ext))
+      .find(|file| file.is_file())
+  })
 }
 
 async fn apply_effects(
@@ -1710,4 +1769,44 @@ fn adopt_native(
     }),
   );
   Ok((process, Some(exits)))
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+mod win_tests {
+  use super::*;
+
+  #[test]
+  fn spawn_error_names_a_batch_file_and_the_cmd_to_use() {
+    let dir = std::env::temp_dir()
+      .join(format!("dekit_batch_hint_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("fake-npm.cmd"), "@echo off\r\n").unwrap();
+    let mut spec = ProcessSpec::from_argv(vec![
+      "fake-npm".into(),
+      "run".into(),
+      "a \"b\"".into(),
+    ]);
+    spec
+      .env
+      .insert("Path".into(), Some(dir.to_string_lossy().into_owned()));
+    let not_found =
+      anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound));
+
+    let message = spawn_error_message(&spec, &not_found);
+    assert!(message.contains("Cannot start `fake-npm`"), "{message}");
+    assert!(message.contains("fake-npm.cmd, a batch file"), "{message}");
+    assert!(
+      message.contains(r#"cmd: ["cmd", "/c", "fake-npm run a \"b\""]"#),
+      "{message}"
+    );
+
+    // Another failure is not about the batch file.
+    let denied = anyhow::Error::from(std::io::Error::from(
+      std::io::ErrorKind::PermissionDenied,
+    ));
+    assert!(!spawn_error_message(&spec, &denied).contains("batch file"));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
 }

@@ -215,6 +215,9 @@ fn run_installer(exe: &Path, version: &str, out: Stdio) -> anyhow::Result<()> {
     installer.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]);
     installer.arg("irm $env:DEKIT_INSTALL_URL | iex");
     installer.env("DEKIT_INSTALL_URL", &url);
+    // PowerShell 7's module path breaks Windows PowerShell's own modules
+    // (Get-FileHash, Expand-Archive); without it, powershell uses its default.
+    installer.env_remove("PSModulePath");
     installer
   };
   installer

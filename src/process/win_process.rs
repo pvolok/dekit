@@ -85,6 +85,17 @@ impl WinProcess {
         HANDLE(conpty_output.as_raw_handle()),
         0,
       )?;
+      // Until the process is running, a failure must close the pseudo
+      // console: each one left open keeps a conhost.exe alive.
+      struct CloseOnError(HPCON);
+      impl Drop for CloseOnError {
+        fn drop(&mut self) {
+          if !self.0.is_invalid() {
+            unsafe { ClosePseudoConsole(self.0) };
+          }
+        }
+      }
+      let mut conpty_guard = CloseOnError(conpty);
 
       let mut startup_info_ex: STARTUPINFOEXW = zeroed();
       startup_info_ex.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -200,7 +211,8 @@ impl WinProcess {
         PCWSTR::from_raw(cwd_ptr),
         &startup_info_ex.StartupInfo,
         &mut process_info,
-      )?;
+      )
+      .map_err(win32_error)?;
       // Keep the ConPTY-facing pipe handles alive until the client has been
       // attached. Closing them earlier can tear down conhost before it has
       // processed PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
@@ -255,6 +267,7 @@ impl WinProcess {
         host_write.into_raw_handle(),
       ));
 
+      conpty_guard.0 = HPCON::default();
       Ok(WinProcess {
         pid,
         reader,
@@ -264,6 +277,17 @@ impl WinProcess {
         wait_handle,
       })
     }
+  }
+}
+
+/// The Win32 error inside an HRESULT, so that its kind is known
+/// (`NotFound` for a missing program) and it reads as `os error 2`.
+fn win32_error(err: windows::core::Error) -> io::Error {
+  let hresult = err.code().0 as u32;
+  if hresult >> 16 == 0x8007 {
+    io::Error::from_raw_os_error((hresult & 0xffff) as i32)
+  } else {
+    err.into()
   }
 }
 
