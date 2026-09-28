@@ -1,17 +1,20 @@
 [package]
 name = "dekit"
 version = "0.9.6"
-description = "A scriptable process manager you drive from a CLI, TUI, API, or script"
+description = "Process manager for dev and prod"
+homepage = "https://dekit.run"
+documentation = "https://dekit.run/docs"
 repository = "https://github.com/pvolok/dekit"
 authors = ["Pavel Volokitin <pavelvolokitin@gmail.com>"]
 license = "MIT"
 edition = "2024"
+rust-version = "1.88"
 categories = [
   "command-line-interface",
   "command-line-utilities",
   "development-tools",
 ]
-keywords = ["cli", "terminal", "tui", "utility"]
+keywords = ["process-manager", "supervisor", "task-runner", "tui", "mprocs"]
 default-run = "dekit"
 
 include = ["*"]

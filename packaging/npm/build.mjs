@@ -111,7 +111,12 @@ function rootPackage(outDir, version) {
   writeJson(join(workDir, 'package.json'), {
     name: config.package,
     version,
-    description: 'A scriptable process manager you drive from a CLI, TUI, API, or script',
+    description: 'Process manager for dev and prod',
+    keywords: ['process-manager', 'supervisor', 'task-runner', 'tui', 'cli', 'mprocs'],
+    homepage: 'https://dekit.run',
+    bugs: {
+      url: 'https://github.com/pvolok/dekit/issues',
+    },
     repository: {
       type: 'git',
       url: 'git+https://github.com/pvolok/dekit.git',
