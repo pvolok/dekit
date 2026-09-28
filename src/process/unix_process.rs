@@ -420,9 +420,10 @@ mod tests {
       unsafe { libc::waitpid(pid.as_raw_nonzero().get(), &mut status, 0) };
       libc::WEXITSTATUS(status)
     };
-    // In the task's cwd and env, leading its own process group.
+    // In the task's cwd and env, leading its own process group. No `--`
+    // before the group: dash's kill takes it as the pid.
     let check = "[ -f marker ] && [ \"$DEKIT_SET\" = yes ] && \
-                 [ -z \"${HOME+set}\" ] && kill -0 -- -$$";
+                 [ -z \"${HOME+set}\" ] && kill -0 -$$";
     assert_eq!(status(&["sh", "-c", check]), 0);
     // Could not be run: 127, as in a shell.
     assert_eq!(status(&["./missing"]), 127);

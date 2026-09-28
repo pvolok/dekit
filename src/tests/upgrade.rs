@@ -149,6 +149,9 @@ async fn restart_reloads_config() {
   wait_until("alpha ready", || {
     task_line(&runner, "alpha").contains("ready")
   });
+  wait_until("alpha output", || {
+    runner.ok(&["screen", "alpha"]).contains("one")
+  });
   let pid = pid_of(&runner, "alpha");
 
   runner.yaml(
