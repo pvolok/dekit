@@ -6,7 +6,10 @@ use std::{
 
 use std::os::fd::{AsRawFd, RawFd};
 
-use rustix::termios::Pid;
+use rustix::{
+  fs::{Mode, OFlags},
+  termios::Pid,
+};
 use tokio::io::unix::AsyncFd;
 
 use crate::{
@@ -61,19 +64,43 @@ impl UnixProcess {
     let mut empty_set: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe { libc::sigemptyset(&mut empty_set) };
 
-    let mut master_fd = -1;
+    // Both ends are close-on-exec from the call that opens them: a task
+    // forked on another thread meanwhile must not inherit this terminal.
+    // The child gets the slave only as 0, 1 and 2. `ptsname` fills our
+    // own buffer (`ptsname_r` or an ioctl), so threads do not share it.
+    let flags = OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let master = rustix::fs::open(c"/dev/ptmx", flags, Mode::empty())?;
+    rustix::pty::grantpt(&master)?;
+    rustix::pty::unlockpt(&master)?;
+    let slave_name = rustix::pty::ptsname(&master, Vec::new())?;
+    let slave = rustix::fs::open(slave_name.as_c_str(), flags, Mode::empty())?;
+    rustix::termios::tcsetwinsize(&slave, size.into())?;
+    let master_flags = rustix::fs::fcntl_getfl(&master)?;
+    rustix::fs::fcntl_setfl(&master, master_flags | OFlags::NONBLOCK)?;
+    let slave_fd = slave.as_raw_fd();
+
     let pid = UnixProcessesWaiter::fork(
       || unsafe {
-        // Some args are *mut on some BSD variants.
-        #[allow(clippy::unnecessary_mut_passed)]
-        let pid = libc::forkpty(
-          &mut master_fd,
-          null_mut(),
-          null_mut(),
-          &mut size.into(),
-        );
+        let pid = libc::fork();
 
         if pid == 0 {
+          if libc::setsid() < 0
+            || libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0
+          {
+            libc::_exit(1);
+          }
+          for fd in 0..3 {
+            // dup2 onto the same fd would keep close-on-exec.
+            let result = if fd == slave_fd {
+              libc::fcntl(fd, libc::F_SETFD, 0)
+            } else {
+              libc::dup2(slave_fd, fd)
+            };
+            if result < 0 {
+              libc::_exit(1);
+            }
+          }
+
           for signo in &[
             libc::SIGCHLD,
             libc::SIGHUP,
@@ -111,31 +138,12 @@ impl UnixProcess {
       },
       on_wait_returned,
     )?;
+    drop(slave);
 
-    unsafe {
-      let master = OwnedFd::from_raw_fd(master_fd);
-
-      let flags = libc::fcntl(master_fd, libc::F_GETFD, 0);
-      if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-      }
-      if libc::fcntl(master_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
-        return Err(std::io::Error::last_os_error());
-      }
-
-      let flags = libc::fcntl(master_fd, libc::F_GETFL, 0);
-      if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-      }
-      if libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-        return Err(std::io::Error::last_os_error());
-      }
-
-      Ok(UnixProcess {
-        pid,
-        master: AsyncFd::new(master)?,
-      })
-    }
+    Ok(UnixProcess {
+      pid,
+      master: AsyncFd::new(master)?,
+    })
   }
 }
 
@@ -321,7 +329,7 @@ impl Process for UnixProcess {
   }
 
   fn send_signal(&mut self, sig: i32, group: bool) -> std::io::Result<()> {
-    // forkpty puts the child in its own session/process group (pgid == pid).
+    // `spawn` puts the child in its own session/process group (pgid == pid).
     // Signaling the whole group reaches children that outlive the shell — e.g.
     // `sh -c "...; tail -f /dev/null"`, which would otherwise keep the pty slave
     // open so the master never EOFs and the task never reports as stopped.
@@ -400,6 +408,89 @@ mod tests {
       libc::kill(-(proc.pid() as i32), libc::SIGKILL);
     }
     assert!(eof, "group SIGTERM should kill the child and EOF the pty");
+  }
+
+  // Tasks spawned at the same moment on several threads, as `dekit up`
+  // starts them. A pty leaked from another task shows up as a terminal
+  // past fd 2. Only terminals are looked for: tests running alongside may
+  // hold other fds open that any child inherits.
+  #[test]
+  fn tasks_started_together_see_only_their_own_terminal() {
+    const TASKS: usize = 8;
+    const ROUNDS: usize = 5;
+    // `read` keeps each task's terminal open until every task has looked.
+    let spec = ProcessSpec::from_argv(vec![
+      "sh".into(),
+      "-c".into(),
+      "for fd in $(ls /dev/fd); do \
+         [ \"$fd\" -gt 2 ] && [ -t \"$fd\" ] && echo \"terminal at $fd\"; \
+       done; echo checked; read line"
+        .into(),
+    ]);
+    let size = Winsize {
+      x: 80,
+      y: 24,
+      x_px: 0,
+      y_px: 0,
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for _ in 0..ROUNDS {
+      let barrier = std::sync::Barrier::new(TASKS);
+      let mut procs: Vec<UnixProcess> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..TASKS)
+          .map(|_| {
+            scope.spawn(|| {
+              let _runtime = runtime.enter();
+              barrier.wait();
+              UnixProcess::spawn(TaskId(0), &spec, size, Box::new(|_| {}))
+                .unwrap()
+            })
+          })
+          .collect();
+        threads
+          .into_iter()
+          .map(|thread| thread.join().unwrap())
+          .collect()
+      });
+
+      let outputs: Vec<String> = runtime.block_on(async {
+        let mut outputs = Vec::new();
+        for proc in &mut procs {
+          let mut output = Vec::new();
+          let mut buf = [0u8; 1024];
+          let read = tokio::time::timeout(Duration::from_secs(10), async {
+            while !String::from_utf8_lossy(&output).contains("checked") {
+              match proc.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+              }
+            }
+          })
+          .await;
+          let mut output = String::from_utf8_lossy(&output).into_owned();
+          if read.is_err() {
+            output.push_str("(timed out)");
+          }
+          outputs.push(output);
+        }
+        outputs
+      });
+
+      for proc in &procs {
+        let pid = proc.pid() as i32;
+        let mut status = 0;
+        unsafe {
+          libc::kill(-pid, libc::SIGKILL);
+          libc::waitpid(pid, &mut status, 0);
+        }
+      }
+      for output in &outputs {
+        assert!(
+          output.contains("checked") && !output.contains("terminal at"),
+          "a task saw another terminal: {outputs:?}"
+        );
+      }
+    }
   }
 
   #[test]
