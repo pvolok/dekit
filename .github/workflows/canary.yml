@@ -45,3 +45,51 @@ jobs:
             --notes "Rolling build of the latest master commit (${GITHUB_SHA}). Updated on every push to master. Prerelease; not a stable release." \
             --prerelease \
             --target "${GITHUB_SHA}"
+
+  # An installed dekit must always be able to update to what master holds.
+  # `from` lists the release tags to update from: add the first release
+  # (and keep it) once it exists.
+  update-test:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+        from: [canary]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update with a runner running
+        if: runner.os != 'Windows'
+        run: packaging/update-test.sh "${{ matrix.from }}" canary
+
+      # Windows has no live upgrade: the binary is replaced under the
+      # running runner, which keeps its version until it restarts.
+      - name: Update with a runner running (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Releases = "https://github.com/pvolok/dekit/releases/download"
+          $Dir = Join-Path $env:RUNNER_TEMP "dk"
+          $env:DEKIT_INSTALL_DIR = Join-Path $Dir "bin"
+          New-Item -ItemType Directory (Join-Path $Dir "project") | Out-Null
+          Set-Location (Join-Path $Dir "project")
+
+          $env:DEKIT_VERSION = "${{ matrix.from }}"
+          irm "$Releases/${{ matrix.from }}/install.ps1" | iex
+          Remove-Item Env:DEKIT_VERSION
+
+          Set-Content dekit.yaml 'tasks: {pinger: {cmd: ["ping", "-t", "localhost"], autostart: true}}'
+          dekit up
+          if ($LASTEXITCODE -ne 0) { throw "up failed" }
+
+          $env:DEKIT_INSTALL_URL = "$Releases/canary/install.ps1"
+          dekit update canary
+          if ($LASTEXITCODE -ne 0) { throw "update failed" }
+          dekit --version
+          if ($LASTEXITCODE -ne 0) { throw "the new binary does not run" }
+          dekit ls
+          if ($LASTEXITCODE -ne 0) { throw "the runner is gone" }
+          dekit down

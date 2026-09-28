@@ -1,112 +1,109 @@
-$ErrorActionPreference = "Stop"
+# Installs dekit. `dekit update` runs this same script.
+#
+#   DEKIT_VERSION       latest (default), canary, or a version like 1.2.3
+#   DEKIT_INSTALL_DIR   where dekit.exe goes (default: ~\.local\bin)
+#   DEKIT_RELEASES_URL  a mirror of https://github.com/pvolok/dekit/releases
 
-$Repo = if ($env:DEKIT_REPO) { $env:DEKIT_REPO } else { "pvolok/dekit" }
-$Version = if ($env:DEKIT_VERSION) { $env:DEKIT_VERSION } else { "latest" }
-$InstallDir = if ($env:DEKIT_INSTALL_DIR) { $env:DEKIT_INSTALL_DIR } else { Join-Path $HOME ".local\bin" }
+# The block keeps these settings out of the session that ran `irm | iex`.
+& {
+    $ErrorActionPreference = "Stop"
+    $ProgressPreference = "SilentlyContinue"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-function Fail($Message) {
-    Write-Error "dekit: $Message"
-    exit 1
-}
+    $Releases = if ($env:DEKIT_RELEASES_URL) { $env:DEKIT_RELEASES_URL } else { "https://github.com/pvolok/dekit/releases" }
+    $Version = if ($env:DEKIT_VERSION) { $env:DEKIT_VERSION } else { "latest" }
+    $InstallDir = if ($env:DEKIT_INSTALL_DIR) { $env:DEKIT_INSTALL_DIR } else { Join-Path $HOME ".local\bin" }
 
-$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-switch ($Architecture) {
-    "x64" { $Target = "x86_64-pc-windows-msvc" }
-    "arm64" {
-        # No native arm64 build; the x64 binary runs under Windows' built-in emulation.
-        Write-Warning "No native arm64 build; installing the x64 binary (runs under emulation)."
-        $Target = "x86_64-pc-windows-msvc"
+    $Cpu = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    if ($Cpu -ne "X64" -and $Cpu -ne "Arm64") {
+        throw "dekit: unsupported CPU: $Cpu"
     }
-    default { Fail "unsupported CPU: $Architecture" }
-}
+    # Arm64 runs the x64 build under Windows' emulation.
+    $Asset = "dekit-x86_64-pc-windows-msvc.zip"
 
-$Asset = "dekit-$Target.zip"
-$ReleaseVersion = if ($Version -eq "latest" -or $Version -eq "canary" -or $Version.StartsWith("v")) {
-    $Version
-} else {
-    "v$Version"
-}
+    $Url = if ($Version -eq "latest") {
+        "$Releases/latest/download"
+    } elseif ($Version -eq "canary" -or $Version.StartsWith("v")) {
+        "$Releases/download/$Version"
+    } else {
+        "$Releases/download/v$Version"
+    }
 
-$BaseUrl = if ($ReleaseVersion -eq "latest") {
-    "https://github.com/$Repo/releases/latest/download"
-} else {
-    "https://github.com/$Repo/releases/download/$ReleaseVersion"
-}
+    $Temp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
+    New-Item -ItemType Directory -Path $Temp | Out-Null
 
-$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
-New-Item -ItemType Directory -Path $TempDir | Out-Null
-
-try {
-    $ArchivePath = Join-Path $TempDir $Asset
-    Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/$Asset" -OutFile $ArchivePath
-
-    $SumsPath = Join-Path $TempDir "SHA256SUMS"
     try {
-        Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/SHA256SUMS" -OutFile $SumsPath
+        $Archive = Join-Path $Temp $Asset
+        $Sums = Join-Path $Temp "SHA256SUMS"
+        Invoke-WebRequest -UseBasicParsing -Uri "$Url/$Asset" -OutFile $Archive
+        Invoke-WebRequest -UseBasicParsing -Uri "$Url/SHA256SUMS" -OutFile $Sums
+
         $Expected = $null
-        foreach ($Line in Get-Content $SumsPath) {
+        foreach ($Line in Get-Content $Sums) {
             $Parts = $Line -split "\s+"
-            if ($Parts.Length -ge 2 -and ($Parts[-1] -eq $Asset -or $Parts[-1] -eq "*$Asset")) {
-                $Expected = $Parts[0].ToLowerInvariant()
+            if ($Parts[-1].TrimStart("*") -eq $Asset) {
+                $Expected = $Parts[0]
                 break
             }
         }
-        if ($Expected) {
-            $Actual = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
-            if ($Actual -ne $Expected) {
-                Fail "checksum mismatch for $Asset"
+        if (-not $Expected) {
+            throw "dekit: SHA256SUMS has no checksum for $Asset"
+        }
+        if ((Get-FileHash -Algorithm SHA256 $Archive).Hash -ne $Expected) {
+            throw "dekit: checksum mismatch for $Asset"
+        }
+
+        Expand-Archive -Path $Archive -DestinationPath $Temp -Force
+        $New = Join-Path $Temp "dekit.exe"
+        $Installed = & $New --version
+        if ($LASTEXITCODE -ne 0) {
+            throw "dekit: the downloaded binary does not run on this machine"
+        }
+
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+        $Target = Join-Path $InstallDir "dekit.exe"
+        $Fresh = -not (Test-Path $Target)
+
+        # A running dekit.exe cannot be overwritten or deleted, but it can be
+        # renamed. What is left of it goes away on a later install, once
+        # nothing runs it.
+        foreach ($File in Get-ChildItem $InstallDir -Filter "dekit.exe.old-*") {
+            try { Remove-Item $File.FullName -Force } catch {}
+        }
+        $Old = "$Target.old-$([System.Guid]::NewGuid().ToString('N'))"
+        if (-not $Fresh) {
+            Move-Item $Target $Old
+        }
+        try {
+            Move-Item $New $Target
+        } catch {
+            if (-not $Fresh) {
+                Move-Item $Old $Target
             }
-        } else {
-            Write-Warning "No checksum found for $Asset; skipping checksum verification"
+            throw
         }
-    } catch {
-        Write-Warning "Could not verify checksum: $($_.Exception.Message)"
-    }
-
-    Expand-Archive -Path $ArchivePath -DestinationPath $TempDir -Force
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    Copy-Item -Path (Join-Path $TempDir "dekit.exe") -Destination (Join-Path $InstallDir "dekit.exe") -Force
-
-    $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $PathEntries = @()
-    if ($UserPath) {
-        $PathEntries = $UserPath -split ";" | Where-Object { $_ }
-    }
-    $TrimChars = [char[]]"\/"
-    $NormalizedInstallDir = $InstallDir.TrimEnd($TrimChars)
-    $HasInstallDir = $false
-    foreach ($Entry in $PathEntries) {
-        if ([string]::Equals($Entry.TrimEnd($TrimChars), $NormalizedInstallDir, [StringComparison]::OrdinalIgnoreCase)) {
-            $HasInstallDir = $true
-            break
+        if (-not $Fresh) {
+            try { Remove-Item $Old -Force } catch {}
         }
-    }
 
-    if (-not $HasInstallDir) {
-        $NewUserPath = if ($UserPath) { "$UserPath;$InstallDir" } else { $InstallDir }
-        [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
-    }
+        Write-Host "$Installed installed to $Target"
 
-    if (($env:Path -split ";") -notcontains $InstallDir) {
-        $env:Path = "$InstallDir;$env:Path"
+        # Only a first install touches PATH.
+        if ($Fresh) {
+            $Slashes = [char[]]"\/"
+            $Dir = $InstallDir.TrimEnd($Slashes)
+            $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            $Entries = @($UserPath -split ";" | ForEach-Object { $_.TrimEnd($Slashes) })
+            if ($Entries -notcontains $Dir) {
+                $NewPath = if ($UserPath) { "$UserPath;$InstallDir" } else { $InstallDir }
+                # This also tells running programs that the environment changed.
+                [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
+            }
+            if (($env:Path -split ";") -notcontains $InstallDir) {
+                $env:Path = "$InstallDir;$env:Path"
+            }
+        }
+    } finally {
+        Remove-Item -Recurse -Force $Temp -ErrorAction SilentlyContinue
     }
-
-    try {
-        Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class DekitEnvironmentBroadcast {
-    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
-}
-"@
-        $Result = [UIntPtr]::Zero
-        [void][DekitEnvironmentBroadcast]::SendMessageTimeout([IntPtr]0xffff, 0x1a, [UIntPtr]::Zero, "Environment", 0x2, 5000, [ref]$Result)
-    } catch {
-        Write-Warning "Could not broadcast PATH update: $($_.Exception.Message)"
-    }
-
-    Write-Host "dekit installed to $(Join-Path $InstallDir 'dekit.exe')"
-} finally {
-    Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
 }

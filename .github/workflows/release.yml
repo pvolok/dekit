@@ -61,8 +61,9 @@ jobs:
       - name: Add installers and checksums
         run: packaging/bundle.sh dist/release
 
-      # Idempotent so a re-run after a partial failure is clean: create the
-      # release if it is missing, then (re)upload assets with --clobber.
+      # The release is a draft until every asset is up: installers and
+      # `dekit update` download from `latest`, which must never name a
+      # release without its assets. Safe to re-run after a partial failure.
       - name: Create GitHub release
         shell: bash
         run: |
@@ -71,8 +72,10 @@ jobs:
           if [ "${{ needs.meta.outputs.prerelease }}" = "true" ]; then
             flags+=(--prerelease)
           fi
-          gh release create "${GITHUB_REF_NAME}" "${flags[@]}" || true
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 ||
+            gh release create "${GITHUB_REF_NAME}" --draft "${flags[@]}"
           gh release upload "${GITHUB_REF_NAME}" dist/release/* --clobber
+          gh release edit "${GITHUB_REF_NAME}" --draft=false
 
   publish-crate:
     needs: [meta, github-release]

@@ -22,8 +22,11 @@ cargo install dekit
 On Windows (PowerShell):
 
 ```powershell
-iwr -useb https://dekit.run/install.ps1 | iex
+irm https://dekit.run/install.ps1 | iex
 ```
+
+`dekit update` brings dekit and its running runners to the latest version
+(|cli/update|).
 
 ## A first project
 

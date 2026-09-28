@@ -341,6 +341,100 @@ fn result_version(result: &serde_json::Value) -> &str {
     .unwrap_or("?")
 }
 
+/// Switches every running runner that runs an older version of this
+/// binary, which is what an update leaves behind. Runners on another
+/// binary follow their own kernel.
+async fn upgrade_all(json: bool) -> anyhow::Result<()> {
+  let exe = dunce::canonicalize(std::env::current_exe()?)?;
+  let version = env!("CARGO_PKG_VERSION");
+  let mut results = Vec::new();
+  let mut failed = false;
+  for info in lockfile::list_runners()? {
+    if !info.is_running {
+      continue;
+    }
+    let record = info.contents;
+    let root = &record.root;
+    let was = &record.version;
+    let mut error = None;
+    let (result, note) = if Path::new(&record.binary) != exe {
+      (
+        "kept",
+        format!("Kept {root} on dekit {was} ({}).", record.binary),
+      )
+    } else if was == version {
+      ("current", format!("{root} already runs dekit {version}."))
+    } else if cfg!(windows) {
+      (
+        "restart_needed",
+        format!(
+          "{root} runs dekit {was} until its runner restarts (`dekit down`, then `dekit up`)."
+        ),
+      )
+    } else {
+      let switched =
+        match RunnerSpec::exact(record.kind.clone(), Path::new(root)) {
+          Ok(runner) => switch_runner(&runner, &exe).await,
+          Err(err) => Err(err),
+        };
+      match switched {
+        Ok(_) => (
+          "upgraded",
+          format!("Upgraded {root} from dekit {was} to {version}."),
+        ),
+        Err(err) => {
+          error = Some(format!("{err:#}"));
+          ("failed", format!("Could not upgrade {root}: {err:#}"))
+        }
+      }
+    };
+    if error.is_some() {
+      failed = true;
+      eprintln!("{note}");
+    } else if !json {
+      println!("{note}");
+    }
+    results.push(serde_json::json!({
+      "kind": record.kind,
+      "root": root,
+      "result": result,
+      "version": if result == "upgraded" { version } else { was },
+      "error": error,
+    }));
+  }
+  if json {
+    println!("{}", serde_json::to_string(&results)?);
+  } else if results.is_empty() {
+    println!("No runners are running.");
+  }
+  if failed {
+    anyhow::bail!("could not upgrade every runner");
+  }
+  Ok(())
+}
+
+/// What to say when a runner is behind its selected kernel: another
+/// binary is selected, or an update replaced this one under the runner.
+fn upgrade_hint(
+  record: &lockfile::RunnerRecord,
+  selected: &Path,
+) -> Option<String> {
+  if Path::new(&record.binary) != selected {
+    return Some(format!(
+      "Selected kernel is {}; run `dekit runner upgrade` to switch live.",
+      selected.display()
+    ));
+  }
+  let version = env!("CARGO_PKG_VERSION");
+  let this = std::env::current_exe().and_then(dunce::canonicalize);
+  if record.version != version && this.is_ok_and(|exe| exe == selected) {
+    return Some(format!(
+      "The kernel is now dekit {version}; run `dekit runner upgrade` to switch live."
+    ));
+  }
+  None
+}
+
 async fn start_runner(runner: &RunnerSpec) -> anyhow::Result<()> {
   match lockfile::get_runner_state(runner)? {
     lockfile::RunnerState::Ready(record) => {
@@ -615,6 +709,15 @@ pub fn cli() -> ClapCommand {
           Arg::new("binary")
             .long("binary")
             .help("Binary to switch to (default: the selected kernel)"),
+        )
+        .arg(
+          Arg::new("all")
+            .long("all")
+            .action(clap::ArgAction::SetTrue)
+            .conflicts_with_all(["runner", "binary"])
+            .help(
+              "Upgrade every runner that runs an older version of this binary",
+            ),
         ),
       ClapCommand::new("restart")
         .about("Restart the runner live, reloading dekit.yaml")
@@ -688,6 +791,12 @@ pub fn cli() -> ClapCommand {
           ClapCommand::new("clear-default")
             .about("Clear the registered default binary"),
         ]),
+      ClapCommand::new("update")
+        .about("Update dekit and the runners that run it")
+        // Not "version": that id is clap's own --version flag.
+        .arg(Arg::new("release").value_name("version").help(
+          "Version to install: latest (default), canary, or one like 1.2.3",
+        )),
       ClapCommand::new("mprocs")
         .about("Run the legacy mprocs CLI (mprocs.yaml, --ctl, etc.)")
         .disable_help_flag(true)
@@ -899,6 +1008,9 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         let runner = arg_runner(&matches, sub_m)?;
         start_runner(&runner).await?;
       }
+      Some(("upgrade", sub_m)) if sub_m.get_flag("all") => {
+        upgrade_all(json).await?;
+      }
       Some(("upgrade", sub_m)) => {
         let runner = arg_runner(&matches, sub_m)?;
         let binary = match sub_m.get_one::<String>("binary") {
@@ -981,7 +1093,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
                               running: bool| {
             let restart_required = running
               && selected_path
-                .is_some_and(|path| path != Path::new(&record.binary));
+                .is_some_and(|path| upgrade_hint(record, path).is_some());
             let mut map = record_json(record);
             map.insert(
               "status".to_string(),
@@ -1023,14 +1135,12 @@ pub async fn dekit_main() -> anyhow::Result<()> {
                 record.owner.pid, record.socket, record.version, record.binary,
               );
               match &selected {
-                Ok(selected) if Path::new(&record.binary) != selected => {
-                  println!(
-                    "Selected kernel is {}; run `dekit runner upgrade` to switch live.",
-                    selected.display()
-                  );
+                Ok(selected) => {
+                  if let Some(hint) = upgrade_hint(&record, selected) {
+                    println!("{hint}");
+                  }
                 }
                 Err(error) => println!("Kernel selection error: {error:#}"),
-                _ => {}
               }
               print_warnings(&record.warnings);
             }
@@ -1083,15 +1193,16 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         let runner = resolve_runner(&matches)?;
         let selected = resolve_kernel_binary(&runner);
         let default = read_default_binary()?;
-        let active = match lockfile::get_runner_state(&runner)? {
-          lockfile::RunnerState::Ready(record) => {
-            Some(PathBuf::from(record.binary))
-          }
+        let record = match lockfile::get_runner_state(&runner)? {
+          lockfile::RunnerState::Ready(record) => Some(record),
           _ => None,
         };
-        let restart_required = selected.as_ref().ok().is_some_and(|selected| {
-          active.as_deref().is_some_and(|path| path != selected)
-        });
+        let hint = match (&record, &selected) {
+          (Some(record), Ok(selected)) => upgrade_hint(record, selected),
+          _ => None,
+        };
+        let restart_required = hint.is_some();
+        let active = record.map(|record| PathBuf::from(record.binary));
         if json {
           println!(
             "{}",
@@ -1116,8 +1227,8 @@ pub async fn dekit_main() -> anyhow::Result<()> {
             Some(path) => println!("Default:  {}", path.display()),
             None => println!("Default:  not registered"),
           }
-          if restart_required {
-            println!("Restart required to use the selected kernel.");
+          if let Some(hint) = hint {
+            println!("{hint}");
           }
         }
       }
@@ -1137,6 +1248,10 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         "expected `status`, `set-default`, or `clear-default` after `dekit kernel`"
       ),
     },
+    Some(("update", sub_m)) => {
+      let version = sub_m.get_one::<String>("release").map(String::as_str);
+      crate::dekit::update::update(version, json)?;
+    }
     Some((arg, _sub_m)) => {
       anyhow::bail!("unknown command: {}", arg);
     }
