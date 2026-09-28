@@ -1,9 +1,9 @@
 declare const std: {
-  /** Log a message to stderr at info level. */
+  /** Print values to stderr, separated by spaces. */
   log(...args: unknown[]): void;
-  /** Log a message to stderr at warn level. */
+  /** Print to stderr, like `log`. */
   warn(...args: unknown[]): void;
-  /** Log a message to stderr at error level. */
+  /** Print to stderr, like `log`. */
   error(...args: unknown[]): void;
 
   /** File system operations (async). */
@@ -12,7 +12,7 @@ declare const std: {
     read(path: string): Promise<string>;
     /** Write a string to a file, creating or overwriting it. */
     write(path: string, content: string): Promise<void>;
-    /** Check whether a path exists. */
+    /** Check whether a path exists, following symlinks. False for a missing path or a path under a file; throws on other errors. */
     exists(path: string): Promise<boolean>;
     /** Create a directory. Pass `{recursive: true}` to create parent dirs. */
     mkdir(path: string, opts?: { recursive?: boolean }): Promise<void>;
@@ -20,7 +20,7 @@ declare const std: {
     rm(path: string, opts?: { recursive?: boolean }): Promise<void>;
     /** List entries in a directory, returns filenames. */
     readDir(path: string): Promise<string[]>;
-    /** Get file/directory metadata. */
+    /** Get file/directory metadata, following symlinks. `isSymlink` is about the path itself. */
     stat(path: string): Promise<{
       size: number;
       mtime: number;

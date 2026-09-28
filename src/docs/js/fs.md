@@ -9,11 +9,9 @@ Every function returns a promise. Relative paths start from the script's
 working directory; |js/path| builds them.
 
 ```js
-export async function main() {
-  await std.fs.mkdir("out", { recursive: true });
-  await std.fs.write("out/hello.txt", "hello\n");
-  std.log(await std.fs.read("out/hello.txt"));
-}
+await std.fs.mkdir("out", { recursive: true });
+await std.fs.write("out/hello.txt", "hello\n");
+std.log(await std.fs.read("out/hello.txt"));
 ```
 
 :::fields kind=js
@@ -25,7 +23,7 @@ export async function main() {
   desc: Write a string to a file, creating or replacing it.
 - key: std.fs.exists
   signature: "(path: string) => Promise<boolean>"
-  desc: Whether a path exists.
+  desc: Whether a path exists, following symlinks. It is false for a missing path or a path under a file; any other error, such as permission denied, is thrown.
 - key: std.fs.mkdir
   signature: "(path: string, opts?: {recursive?: boolean}) => Promise<void>"
   desc: Create a directory; `recursive` creates missing parents too.
@@ -37,7 +35,7 @@ export async function main() {
   desc: The names of the entries in a directory.
 - key: std.fs.stat
   signature: "(path: string) => Promise<{size, mtime, isDir, isFile, isSymlink}>"
-  desc: Facts about a path, following symlinks; `mtime` is in milliseconds since the Unix epoch.
+  desc: Facts about a path, following symlinks; `isSymlink` tells whether the path itself is a symlink, and `mtime` is in milliseconds since the Unix epoch.
 - key: std.fs.rename
   signature: "(from: string, to: string) => Promise<void>"
   desc: Rename or move a file or directory.

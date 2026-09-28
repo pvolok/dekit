@@ -12,11 +12,9 @@ project runner for a `script:` task, or the nearest project for
 the number of tasks it acted on.
 
 ```js
-export async function main() {
-  await std.dekit.add("tmp/build", ["npm", "run", "build"]);
-  const started = await std.dekit.start("+workers");
-  std.log(`started ${started} workers`);
-}
+await std.dekit.add("tmp/build", ["npm", "run", "build"]);
+const started = await std.dekit.start("+workers");
+std.log(`started ${started} workers`);
 ```
 
 :::fields kind=js

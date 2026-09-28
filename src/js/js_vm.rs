@@ -40,6 +40,7 @@ impl JsVm {
     let path = path.to_path_buf();
     let module = AsyncContext::async_with(&self.context, async |ctx| {
       eval_module(&ctx, &path, src)
+        .await
         .catch(&ctx)
         .map_err(|err| anyhow!("JavaScript module evaluation failed:\n{err}"))
     })
@@ -48,7 +49,7 @@ impl JsVm {
   }
 }
 
-fn eval_module(
+async fn eval_module(
   ctx: &Ctx<'_>,
   path: &Path,
   src: Vec<u8>,
@@ -59,6 +60,8 @@ fn eval_module(
     path.to_string_lossy()
   };
   let module = Module::declare(ctx.clone(), name.as_bytes(), src)?;
-  let (module, _promise) = module.eval()?;
+  // Settles after top-level `await`s; a throw at the top level rejects it.
+  let (module, promise) = module.eval()?;
+  promise.into_future::<()>().await?;
   Ok(Persistent::save(ctx, module.namespace()?))
 }

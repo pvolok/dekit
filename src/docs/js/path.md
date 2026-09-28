@@ -8,10 +8,8 @@ order: 30
 All functions are synchronous and never read the disk.
 
 ```js
-export function main() {
-  const file = std.path.join("src", "main.ts");
-  std.log(std.path.dirname(file), std.path.extname(file));
-}
+const file = std.path.join("src", "main.ts");
+std.log(std.path.dirname(file), std.path.extname(file));
 ```
 
 :::fields kind=js

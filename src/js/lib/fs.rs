@@ -6,11 +6,15 @@ async fn stat_fn(ctx: Ctx<'_>, path: String) -> rquickjs::Result<Object<'_>> {
   let meta = tokio::fs::metadata(&path)
     .await
     .map_err(|e| Exception::throw_message(&ctx, &format!("fs.stat: {e}")))?;
+  // `metadata` follows links; `isSymlink` is about the path itself.
+  let link_meta = tokio::fs::symlink_metadata(&path)
+    .await
+    .map_err(|e| Exception::throw_message(&ctx, &format!("fs.stat: {e}")))?;
   let obj = Object::new(ctx.clone())?;
   obj.set("size", meta.len() as f64)?;
   obj.set("isDir", meta.is_dir())?;
   obj.set("isFile", meta.is_file())?;
-  obj.set("isSymlink", meta.file_type().is_symlink())?;
+  obj.set("isSymlink", link_meta.file_type().is_symlink())?;
   let mtime = meta
     .modified()
     .ok()
@@ -39,8 +43,13 @@ pub fn init(ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> {
     },
   )?;
 
-  obj.def_fn_async("exists", async |path: String| {
-    tokio::fs::metadata(&path).await.is_ok()
+  obj.def_fn_async("exists", async |ctx: Ctx<'_>, path: String| {
+    match tokio::fs::try_exists(&path).await {
+      Ok(exists) => Ok(exists),
+      // A path under a regular file cannot exist.
+      Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+      Err(e) => Err(Exception::throw_message(&ctx, &format!("fs.exists: {e}"))),
+    }
   })?;
 
   obj.def_fn_async(

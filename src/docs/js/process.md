@@ -10,11 +10,9 @@ finish. The program is not a task; for long-running work, add a task with
 |js/dekit| instead.
 
 ```js
-export async function main() {
-  const { stdout, code } = await std.process.exec("git", ["rev-parse", "HEAD"]);
-  if (code !== 0) std.process.exit(1);
-  std.log(stdout.trim());
-}
+const { stdout, code } = await std.process.exec("git", ["rev-parse", "HEAD"]);
+if (code !== 0) std.process.exit(1);
+std.log(stdout.trim());
 ```
 
 :::fields kind=js

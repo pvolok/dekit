@@ -1304,6 +1304,14 @@ async fn run_module_main(
     root.clone().restore(ctx),
     "Failed to restore module namespace",
   )?;
+  // `main` is optional: the module has already run to the end.
+  if !map_js_error(
+    ctx,
+    m.contains_key("main"),
+    "Failed to read exported `main`",
+  )? {
+    return Ok(());
+  }
   let main = map_js_error(
     ctx,
     m.get::<_, rquickjs::Value>("main"),
