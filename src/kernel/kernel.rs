@@ -1416,39 +1416,43 @@ impl Graph {
       Some(t) => task_name(id, &t.space, t.path.as_ref()),
       None => task_name(id, &TaskSpaceId::default_space(), None),
     };
+    // The order `list_tasks` uses.
+    let ls_order =
+      |id: &TaskId| (self.tasks.get(id).map(|t| (&t.space, &t.path)), *id);
     let pinned = self
       .redges
       .get(&task_id)
       .is_some_and(|s| s.contains(&INIT_TASK_ID));
-    let required_by = self
+    let mut required_by: Vec<TaskId> = self
       .redges
       .get(&task_id)
-      .map(|set| {
-        set
-          .iter()
-          .filter(|from| **from != INIT_TASK_ID)
-          .map(|from| name(*from))
-          .collect()
-      })
-      .unwrap_or_default();
-    let deps = self
+      .into_iter()
+      .flatten()
+      .copied()
+      .filter(|from| *from != INIT_TASK_ID)
+      .collect();
+    required_by.sort_by_key(ls_order);
+    let mut deps: Vec<TaskId> = self
       .edges
       .get(&task_id)
-      .map(|set| {
-        set
-          .iter()
-          .map(|dep| {
-            let task = self.tasks.get(dep);
-            DepExplain {
-              name: name(*dep),
-              state: task.map_or(TaskState::Idle, |t| t.state),
-              wanted: task.is_some_and(|t| t.wanted),
-              satisfied: task.is_some_and(|t| t.is_satisfied()),
-            }
-          })
-          .collect()
+      .into_iter()
+      .flatten()
+      .copied()
+      .collect();
+    deps.sort_by_key(ls_order);
+    let required_by = required_by.into_iter().map(name).collect();
+    let deps = deps
+      .into_iter()
+      .map(|dep| {
+        let task = self.tasks.get(&dep);
+        DepExplain {
+          name: name(dep),
+          state: task.map_or(TaskState::Idle, |t| t.state),
+          wanted: task.is_some_and(|t| t.wanted),
+          satisfied: task.is_some_and(|t| t.is_satisfied()),
+        }
       })
-      .unwrap_or_default();
+      .collect();
     Some(TaskExplain {
       id: task_id,
       name: name(task_id),

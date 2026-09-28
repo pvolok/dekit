@@ -1543,18 +1543,33 @@ async fn explain_reports_block_reason() {
       ..path_def("dep")
     },
   );
+  let base = fx.add("base", path_def("base"));
   let app = fx.add(
     "app",
     TaskDef {
-      deps: vec![TaskSelector::Id(dep)],
+      deps: vec![TaskSelector::Id(dep), TaskSelector::Id(base)],
       ..path_def("app")
     },
   );
+  for user in ["c-user", "a-user", "b-user"] {
+    fx.add(
+      user,
+      TaskDef {
+        deps: vec![TaskSelector::Id(app)],
+        ..path_def(user)
+      },
+    );
+  }
   let handle = fx.run();
 
   fx.pc
     .send(KernelCommand::Start(TaskSelector::Id(app), None));
-  assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
+  let mut started = vec![fx.recv().await, fx.recv().await];
+  started.sort();
+  assert_eq!(
+    started,
+    [("base", RecordedCmd::Start), ("dep", RecordedCmd::Start)]
+  );
 
   let rx = fx.pc.query(KernelQuery::Explain(TaskSelector::Id(app)));
   let resp = tokio::time::timeout(Duration::from_secs(1), rx)
@@ -1574,11 +1589,14 @@ async fn explain_reports_block_reason() {
   assert!(!explain.supported);
   assert!(explain.pinned);
   assert!(!explain.vetoed);
-  assert_eq!(explain.deps.len(), 1);
-  assert_eq!(explain.deps[0].name, "dep");
-  assert_eq!(explain.deps[0].state, TaskState::Running);
-  assert!(explain.deps[0].wanted);
-  assert!(!explain.deps[0].satisfied);
+  assert_eq!(explain.required_by, ["a-user", "b-user", "c-user"]);
+  assert_eq!(explain.deps.len(), 2);
+  assert_eq!(explain.deps[0].name, "base");
+  assert!(explain.deps[0].satisfied);
+  assert_eq!(explain.deps[1].name, "dep");
+  assert_eq!(explain.deps[1].state, TaskState::Running);
+  assert!(explain.deps[1].wanted);
+  assert!(!explain.deps[1].satisfied);
 
   fx.quit(handle).await;
 }
