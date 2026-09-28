@@ -302,7 +302,31 @@ mod unix {
     let mut ptrs: Vec<*const libc::c_char> =
       argv.iter().map(|arg| arg.as_ptr()).collect();
     ptrs.push(std::ptr::null());
+    // The exec resets handlers anyway, but on macOS a handled signal that
+    // arrives during the exec (the check child's late SIGCHLD) kills the
+    // new image with SIGILL before it runs. 64 is Linux's last signal;
+    // numbers past the platform's last one are refused.
+    let mut saved = Vec::new();
+    for sig in 1..=64 {
+      let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+      if unsafe { libc::sigaction(sig, std::ptr::null(), &mut action) } != 0 {
+        continue;
+      }
+      if action.sa_sigaction == libc::SIG_DFL
+        || action.sa_sigaction == libc::SIG_IGN
+      {
+        continue;
+      }
+      let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
+      default.sa_sigaction = libc::SIG_DFL;
+      unsafe { libc::sigaction(sig, &default, std::ptr::null_mut()) };
+      saved.push((sig, action));
+    }
     unsafe { libc::execv(argv[0].as_ptr(), ptrs.as_ptr()) };
-    std::io::Error::last_os_error()
+    let err = std::io::Error::last_os_error();
+    for (sig, action) in &saved {
+      unsafe { libc::sigaction(*sig, action, std::ptr::null_mut()) };
+    }
+    err
   }
 }
