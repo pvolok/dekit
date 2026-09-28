@@ -1,5 +1,11 @@
 ## Unreleased
 
+First release of dekit, the next version of mprocs under a new name. It
+keeps the mprocs terminal UI and adds a runner that keeps tasks running
+after you close the terminal, a CLI to control them, dependencies and
+ready checks in `dekit.yaml`, and built-in JavaScript. Existing
+`mprocs.yaml` files still run with `dekit mprocs`.
+
 ## 0.9.6 - 2026-06-06
 
 - Fix TUI freeze for unserializable keys (#226)
