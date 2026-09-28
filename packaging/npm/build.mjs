@@ -10,7 +10,7 @@ const config = JSON.parse(readFileSync(join(root, 'packaging/platforms.json'), '
 function usage() {
   console.error(`usage:
   node packaging/npm/build.mjs pack --archives <dir> --out <dir> --version <version>
-  node packaging/npm/build.mjs publish --dir <dir> --dist-tag <tag> --version <version>`);
+  node packaging/npm/build.mjs publish --dir <dir> --dist-tag <tag> --version <version> [--dry-run]`);
   process.exit(1);
 }
 
@@ -149,7 +149,7 @@ function isPublished(name, version) {
 
 // Platform packages must land before the root package, whose optionalDependencies
 // pin their exact versions. Re-running after a partial failure skips what is already up.
-function publishAll(dir, distTag, version) {
+function publishAll(dir, distTag, version, dryRun) {
   const packages = [
     ...config.platforms.map((platform) => ({
       name: platform.npmPackage,
@@ -163,7 +163,8 @@ function publishAll(dir, distTag, version) {
       console.log(`skip ${name}@${version} (already published)`);
       continue;
     }
-    run('npm', ['publish', '--provenance', '--access', 'public', '--tag', distTag, join(dir, file)]);
+    const args = ['publish', '--provenance', '--access', 'public', '--tag', distTag, join(dir, file)];
+    run('npm', dryRun ? [...args, '--dry-run'] : args);
   }
 }
 
@@ -181,6 +182,7 @@ try {
       resolve(requiredOption('--dir')),
       requiredOption('--dist-tag'),
       requiredOption('--version'),
+      process.argv.includes('--dry-run'),
     );
   } else {
     usage();

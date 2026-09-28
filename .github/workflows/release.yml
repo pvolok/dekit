@@ -18,6 +18,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
+      npm_tag: ${{ steps.version.outputs.npm_tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,11 +31,19 @@ jobs:
             exit 1
           fi
           prerelease=false
+          npm_tag=latest
           case "$version" in
-            *-*) prerelease=true ;;
+            *-*)
+              prerelease=true
+              npm_tag=next
+              ;;
           esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "npm_tag=$npm_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check the release notes
+        run: packaging/release-notes.sh "${{ steps.version.outputs.version }}" > /dev/null
 
   build:
     needs: meta
@@ -44,8 +53,73 @@ jobs:
       artifact-prefix: release
       retention-days: 7
 
-  github-release:
+  # The checks below run before anything is published and must pass.
+  check-crate:
+    needs: meta
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-crate
+
+      # crates.io has no read-only call that accepts a token scoped to
+      # publishing, so only its presence can be checked.
+      - name: Check the crates.io token is set
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: test -n "$CARGO_REGISTRY_TOKEN"
+
+      - name: Package and build the crate
+        run: |
+          cp LICENSE src/LICENSE
+          cp packaging/crate/README.md src/README.md
+          cargo publish -p dekit --dry-run --locked --allow-dirty
+
+  check-npm:
     needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist/release
+          merge-multiple: true
+
+      - name: Check the npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
+
+      - name: Pack and dry-run the npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          node packaging/npm/build.mjs pack \
+            --archives dist/release \
+            --out dist/npm \
+            --version "${{ needs.meta.outputs.version }}"
+          node packaging/npm/build.mjs publish \
+            --dir dist/npm \
+            --dist-tag "${{ needs.meta.outputs.npm_tag }}" \
+            --version "${{ needs.meta.outputs.version }}" \
+            --dry-run
+
+  github-release:
+    needs: [meta, build, check-crate, check-npm]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -63,19 +137,28 @@ jobs:
 
       # The release is a draft until every asset is up: installers and
       # `dekit update` download from `latest`, which must never name a
-      # release without its assets. Safe to re-run after a partial failure.
+      # release without its assets. A re-run finishes a draft and leaves a
+      # published release as it is.
       - name: Create GitHub release
         shell: bash
         run: |
           set -euo pipefail
-          flags=(--generate-notes --title "dekit ${GITHUB_REF_NAME}")
-          if [ "${{ needs.meta.outputs.prerelease }}" = "true" ]; then
-            flags+=(--prerelease)
+          tag="${GITHUB_REF_NAME}"
+          draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
+          if [ "$draft" = "false" ]; then
+            echo "$tag is already published; not touching it"
+            exit 0
           fi
-          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 ||
-            gh release create "${GITHUB_REF_NAME}" --draft "${flags[@]}"
-          gh release upload "${GITHUB_REF_NAME}" dist/release/* --clobber
-          gh release edit "${GITHUB_REF_NAME}" --draft=false
+          if [ "$draft" = "missing" ]; then
+            packaging/release-notes.sh "${{ needs.meta.outputs.version }}" > "$RUNNER_TEMP/notes.md"
+            flags=(--draft --title "dekit $tag" --notes-file "$RUNNER_TEMP/notes.md")
+            if [ "${{ needs.meta.outputs.prerelease }}" = "true" ]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$tag" "${flags[@]}"
+          fi
+          gh release upload "$tag" dist/release/* --clobber
+          gh release edit "$tag" --draft=false
 
   publish-crate:
     needs: [meta, github-release]
@@ -89,7 +172,23 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
+          # A re-run skips a version that is already up, as npm does below.
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -A "dekit release (https://github.com/pvolok/dekit)" \
+            "https://crates.io/api/v1/crates/dekit/$VERSION")
+          case "$status" in
+            200)
+              echo "dekit $VERSION is already on crates.io"
+              exit 0
+              ;;
+            404) ;;
+            *)
+              echo "crates.io answered $status for dekit $VERSION" >&2
+              exit 1
+              ;;
+          esac
           cp LICENSE src/LICENSE
           cp packaging/crate/README.md src/README.md
           cargo publish -p dekit --locked --allow-dirty
@@ -119,15 +218,11 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          dist_tag=latest
-          case "${{ needs.meta.outputs.version }}" in
-            *-*) dist_tag=next ;;
-          esac
           node packaging/npm/build.mjs pack \
             --archives dist/release \
             --out dist/npm \
             --version "${{ needs.meta.outputs.version }}"
           node packaging/npm/build.mjs publish \
             --dir dist/npm \
-            --dist-tag "$dist_tag" \
+            --dist-tag "${{ needs.meta.outputs.npm_tag }}" \
             --version "${{ needs.meta.outputs.version }}"
