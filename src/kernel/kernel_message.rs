@@ -79,6 +79,15 @@ pub enum KernelCommand {
     tokio::sync::oneshot::Sender<Result<(), RegisterError>>,
   ),
 
+  /// Registers each task as `RegisterTask` does, all in one dispatch.
+  /// They are listed in the order given, whatever order their
+  /// dependencies make the kernel register them in. Answers with one
+  /// result for each, in that order.
+  RegisterTasks(
+    Vec<TaskRegistration>,
+    tokio::sync::oneshot::Sender<Vec<Result<(), RegisterError>>>,
+  ),
+
   /// Selector commands resolve the selector and act on the matches in the
   /// same dispatch, so no other message can interleave between the two.
   /// The ack is answered in that dispatch with the matched-task count.
@@ -198,6 +207,8 @@ pub enum RegisterError {
   IdTaken,
   ReservedSpace(TaskSpaceId),
   PathTaken(TaskKey),
+  /// A task is above the path, or under it: the path, then the other task.
+  PathNested(TaskKey, TaskKey),
   /// A dep selector matched no task.
   MissingDep(TaskSelector),
 }
@@ -211,6 +222,18 @@ impl fmt::Display for RegisterError {
       }
       RegisterError::PathTaken(key) => {
         write!(f, "a task already exists at '{}'", key)
+      }
+      RegisterError::PathNested(key, other) => {
+        let (above, below) = if other.path.depth() < key.path.depth() {
+          (other, key)
+        } else {
+          (key, other)
+        };
+        write!(
+          f,
+          "a task can't have tasks under it: '{}' is under '{}'",
+          below, above
+        )
       }
       RegisterError::MissingDep(selector) => {
         write!(f, "dep '{}' matches no task", selector)
@@ -415,6 +438,15 @@ impl TaskContext {
   ) -> tokio::sync::oneshot::Receiver<Result<(), RegisterError>> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     self.send(KernelCommand::RegisterTask(registration, ack_tx));
+    ack_rx
+  }
+
+  pub fn register_tasks(
+    &self,
+    registrations: Vec<TaskRegistration>,
+  ) -> tokio::sync::oneshot::Receiver<Vec<Result<(), RegisterError>>> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    self.send(KernelCommand::RegisterTasks(registrations, ack_tx));
     ack_rx
   }
 

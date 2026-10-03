@@ -14,7 +14,10 @@ on before its dependents start.
 `up` starts what is not running: tasks that are idle, stopped, or crashed.
 Running tasks and jobs that finished are left alone, so a second `up`
 changes nothing. The tasks saved by `down` are started once: stop one
-after `up` and the next `up` leaves it stopped, unless it autostarts.
+after `up` and the next `up` leaves it stopped, unless it autostarts. A
+saved task wins over a task from an edited `dekit.yaml` that would sit
+above or under it: that one is not added, with a warning in
+|cli/runner/status|.
 
 Only `up` starts tasks by itself. A runner started any other way (`dekit
 attach`, `dekit start web`, |cli/runner/start|) shows the saved tasks

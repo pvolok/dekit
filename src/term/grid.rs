@@ -814,6 +814,42 @@ impl Grid {
   }
 }
 
+impl Grid {
+  /// Draws a border; the returned block adds title pieces left to right.
+  pub fn block(&mut self, area: Rect, border: BorderType) -> Block<'_> {
+    self.draw_block(area, &border.chars(), Attrs::default());
+    Block {
+      grid: self,
+      area,
+      title: area.inner((0, 1)).take_top(1),
+    }
+  }
+}
+
+pub struct Block<'a> {
+  grid: &'a mut Grid,
+  area: Rect,
+  title: Rect,
+}
+
+impl Block<'_> {
+  pub fn title(&mut self, text: &str, attrs: Attrs) -> &mut Self {
+    let area = self.title.take_left(text.width() as u16);
+    self.grid.draw_text(area, text, attrs);
+    self
+  }
+
+  /// Skips `width` border cells before the next title piece.
+  pub fn gap(&mut self, width: u16) -> &mut Self {
+    self.title.take_left(width);
+    self
+  }
+
+  pub fn inner(&self) -> Rect {
+    self.area.inner(1)
+  }
+}
+
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Pos {
   pub col: u16,
@@ -869,79 +905,59 @@ impl Rect {
     }
   }
 
-  /// Returns a 1-height sub-rect for the `n`-th row (0-indexed) within this
-  /// rect. Returns `None` if `n >= self.height`.
-  pub fn row(self, n: u16) -> Option<Self> {
-    if n >= self.height {
-      return None;
-    }
-    Some(Rect {
-      x: self.x,
-      y: self.y + n,
-      width: self.width,
+  pub fn rows(self) -> impl Iterator<Item = Self> {
+    (self.y..self.bottom()).map(move |y| Rect {
+      y,
       height: 1,
+      ..self
     })
   }
 
-  pub fn split_h(self, len: u16) -> (Self, Self) {
-    let len = len.min(self.height);
-    let top = Rect {
-      height: len,
-      ..self
-    };
-    let bot = Rect {
-      y: self.y + len,
-      height: self.height - len,
-      ..self
-    };
-    (top, bot)
+  /// Splits off up to `height` rows from the top; `self` keeps the rest.
+  pub fn take_top(&mut self, height: u16) -> Self {
+    let height = height.min(self.height);
+    let top = Rect { height, ..*self };
+    self.y += height;
+    self.height -= height;
+    top
   }
 
-  pub fn split_v(self, len: u16) -> (Self, Self) {
-    let len = len.min(self.width);
-    let left = Rect { width: len, ..self };
-    let right = Rect {
-      x: self.x + len,
-      width: self.width - len,
-      ..self
-    };
-    (left, right)
-  }
-
-  pub fn move_left(self, offset: i32) -> Self {
-    let offset = offset.min(self.width as i32);
+  pub fn take_bottom(&mut self, height: u16) -> Self {
+    let height = height.min(self.height);
+    self.height -= height;
     Rect {
-      x: (self.x as i32 + offset) as u16,
-      width: (self.width as i32 - offset) as u16,
-      ..self
+      y: self.y + self.height,
+      height,
+      ..*self
     }
   }
 
-  #[allow(dead_code)]
-  pub fn move_right(self, offset: i32) -> Self {
-    let offset = offset.max(-(self.width as i32));
+  pub fn take_left(&mut self, width: u16) -> Self {
+    let width = width.min(self.width);
+    let left = Rect { width, ..*self };
+    self.x += width;
+    self.width -= width;
+    left
+  }
+
+  pub fn take_right(&mut self, width: u16) -> Self {
+    let width = width.min(self.width);
+    self.width -= width;
     Rect {
-      width: (self.width as i32 + offset) as u16,
-      ..self
+      x: self.x + self.width,
+      width,
+      ..*self
     }
   }
 
-  #[allow(dead_code)]
-  pub fn move_top(self, offset: i32) -> Self {
-    let offset = offset.min(self.height as i32);
+  pub fn centered(self, width: u16, height: u16) -> Self {
+    let width = width.min(self.width);
+    let height = height.min(self.height);
     Rect {
-      y: (self.y as i32 + offset) as u16,
-      height: (self.height as i32 - offset) as u16,
-      ..self
-    }
-  }
-
-  #[allow(dead_code)]
-  pub fn move_bottom(self, offset: i32) -> Self {
-    let offset = offset.max(-(self.height as i32));
-    Rect {
-      height: (self.height as i32 + offset) as u16,
-      ..self
+      x: self.x + (self.width - width) / 2,
+      y: self.y + (self.height - height) / 2,
+      width,
+      height,
     }
   }
 }

@@ -362,6 +362,7 @@ fn registration(
       space,
       path,
       label: config.label.take(),
+      after: None,
       vt: Some(vt),
       tags: std::mem::take(&mut config.tags),
       pinned: config.pinned,
@@ -688,7 +689,7 @@ async fn process_main(
               .ok()
               .map(TaskKey::default_space),
           };
-          let ack = ctx.register_task(process_task_registration(
+          let mut registration = process_task_registration(
             new_id,
             key,
             ProcessTaskConfig {
@@ -706,7 +707,9 @@ async fn process_main(
               tags: Vec::new(),
               pinned: true,
             },
-          ));
+          );
+          registration.def.after = Some(ctx.task_id);
+          let ack = ctx.register_task(registration);
           tokio::spawn(async move {
             if let Ok(Err(err)) = ack.await {
               log::warn!("Duplicate failed: {err}");

@@ -127,13 +127,31 @@ def plain_lines(screen):
 
 
 def task_rows(screen):
+    """(name, selected) for each row of the task list; the selected row is
+    the one with a background."""
     rows = []
-    for line in plain_lines(screen)[1:]:
-        cell = line[1:].split("┃")[0].split("│")[0]
+    for line in screen.rstrip("\n").split("\n")[1:]:
+        parts = re.split("[┃│]", line)
+        if len(parts) < 2:
+            break
+        raw = parts[1]
+        cell = re.sub(r"\x1b\[[0-9;:?]*[A-Za-z]", "", raw)
         if not cell.strip():
             break
-        rows.append((cell[1:].split()[0], cell[0] == "•"))
+        rows.append((cell.split()[0], highlighted(raw)))
     return rows
+
+
+def highlighted(text):
+    """Whether any visible character of `text` has a background color."""
+    style = {}
+    for part in re.split(r"(\x1b\[[0-9;:?]*[A-Za-z])", text):
+        if part.startswith("\x1b["):
+            if part.endswith("m"):
+                apply_sgr(style, part[2:-1])
+        elif part.strip() and "bg" in style:
+            return True
+    return False
 
 
 class Console:

@@ -224,6 +224,8 @@ pub enum TaskNotify {
   Added {
     path: Option<TaskPath>,
     label: Option<String>,
+    /// The task listed just before this one.
+    after: Option<TaskId>,
     kind: TaskKind,
     state: TaskState,
     vt: Option<SharedVt>,
@@ -392,6 +394,9 @@ pub struct TaskDef {
   pub space: TaskSpaceId,
   pub path: Option<TaskPath>,
   pub label: Option<String>,
+  /// Listed right after this task when their paths have the same parent
+  /// in one space; otherwise last under its parent.
+  pub after: Option<TaskId>,
   pub vt: Option<SharedVt>,
   pub tags: Vec<String>,
 }
@@ -409,6 +414,7 @@ impl Default for TaskDef {
       space: TaskSpaceId::default_space(),
       path: None,
       label: None,
+      after: None,
       vt: None,
       tags: Vec::new(),
     }

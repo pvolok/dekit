@@ -4,6 +4,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::config::Config;
 use crate::console::state::{Scope, State};
+use crate::console::task_tree::{Group, Node};
+use crate::console::task_view::TaskView;
+use crate::console::theme::{Rgb, TaskListTheme};
 use crate::kernel::task::{ExitInfo, TaskKind, TaskState};
 use crate::term::{
   Color, Grid,
@@ -11,38 +14,27 @@ use crate::term::{
   grid::{BorderType, Rect},
 };
 
+/// Blank cells between the border and each row.
+const PAD: u16 = 1;
+/// Indent per path level.
+const INDENT: u16 = 2;
+
 pub fn render_tasks(
   area: Rect,
   grid: &mut Grid,
   state: &mut State,
   config: &Config,
+  theme: &TaskListTheme,
 ) {
-  state.tasks_list.fit(area.inner(1), state.tasks.len());
-
-  if area.width <= 2 {
-    return;
-  }
-
   let active = state.scope == Scope::Tasks;
 
-  grid.draw_block(
-    area,
-    &if active {
-      BorderType::Thick
-    } else {
-      BorderType::Plain
-    }
-    .chars(),
-    Attrs::default(),
-  );
-  let title_area = Rect {
-    x: area.x + 1,
-    y: area.y,
-    width: area.width - 2,
-    height: 1,
+  let border = if active {
+    BorderType::Thick
+  } else {
+    BorderType::Plain
   };
-  let r = grid.draw_text(
-    title_area,
+  let mut block = grid.block(area, border);
+  block.title(
     config.tui.sidebar.title.as_str(),
     if active {
       Attrs::default().set_bold(true)
@@ -51,9 +43,7 @@ pub fn render_tasks(
     },
   );
   if state.quitting {
-    let area = title_area.inner((0, 0, 0, r.width + 1));
-    grid.draw_text(
-      area,
+    block.gap(1).title(
       "QUITTING",
       Attrs::default()
         .fg(Color::BLACK)
@@ -61,96 +51,98 @@ pub fn render_tasks(
         .set_bold(true),
     );
   }
+  let inner = block.inner();
+  grid.fill_area(inner, ' ', Attrs::default().bg(theme.bg.into()));
 
-  let range = state.tasks_list.visible_range();
-  for (row, index) in range.enumerate() {
-    let Some(task) = state.tasks.get(index) else {
+  let tasks = &mut state.tasks;
+  for list_row in tasks.rows(inner) {
+    let Some((path, node)) = tasks.row(list_row.index) else {
       continue;
     };
-
-    let selected = index == state.selected();
-    let attrs = if selected {
-      Attrs::default().bg(Color::Idx(240))
+    let bg = if list_row.selected {
+      theme.selected_bg
     } else {
-      Attrs::default()
+      theme.bg
     };
-    let mut row_area = Rect {
-      x: area.x + 1,
-      y: area.y + 1 + row as u16,
-      width: area.width.saturating_sub(2),
-      height: 1,
+    let paint = |color: Rgb| Attrs::default().bg(bg.into()).fg(color.into());
+    let (status_text, status_color) = match node {
+      Node::Task(task) => task_status(task, theme),
+      Node::Group(group) => group_status(group, theme),
     };
 
-    let r = grid.draw_text(row_area, if selected { "•" } else { " " }, attrs);
-    row_area.x += r.width;
-    row_area.width = row_area.width.saturating_sub(r.width);
+    grid.fill_area(list_row.area, ' ', paint(theme.text));
+    let depth = path.depth().saturating_sub(1) as u16;
+    let left = PAD + INDENT.saturating_mul(depth);
+    let mut area = list_row.area.inner((0, 0, 0, left));
+    let status = area.take_right(status_text.width() as u16);
+    grid.draw_text(status, &status_text, paint(status_color));
 
-    let r = grid.draw_text(row_area, &task.name(), attrs);
-    row_area.x += r.width;
-    row_area.width = row_area.width.saturating_sub(r.width);
-
-    let (status_text, status_attrs) = if task.is_up() {
-      (
-        Cow::from(" UP "),
-        attrs.clone().set_bold(true).fg(Color::BRIGHT_GREEN),
-      )
-    } else if let TaskState::Exited(ExitInfo {
-      ready_timeout: true,
-      ..
-    })
-    | TaskState::Backoff(ExitInfo {
-      ready_timeout: true,
-      ..
-    }) = task.status
-    {
-      (
-        Cow::from(" NOT READY "),
-        attrs.clone().fg(Color::BRIGHT_RED),
-      )
-    } else {
-      match (task.kind, task.exit_code()) {
-        (TaskKind::Service, Some(0)) => {
-          (Cow::from(" DOWN (0)"), attrs.clone().fg(Color::BRIGHT_BLUE))
-        }
-        (TaskKind::Service, Some(exit_code)) => (
-          Cow::from(format!(" DOWN ({})", exit_code)),
-          attrs.clone().fg(Color::BRIGHT_RED),
-        ),
-        (TaskKind::Job, Some(0)) => {
-          (Cow::from(" DONE"), attrs.clone().fg(Color::BRIGHT_BLUE))
-        }
-        (TaskKind::Job, Some(exit_code)) => (
-          Cow::from(format!(" FAILED ({})", exit_code)),
-          attrs.clone().fg(Color::BRIGHT_RED),
-        ),
-        (TaskKind::Service | TaskKind::Job, None) => {
-          (Cow::from(" DOWN "), attrs.clone().fg(Color::BRIGHT_BLACK))
-        }
-      }
-    };
-    let status_width = status_text.width() as u16;
-    let r = grid.draw_text(
-      Rect {
-        x: (row_area.x + row_area.width)
-          .saturating_sub(status_width)
-          .max(row_area.x),
-        width: status_width.min(row_area.width),
-        ..row_area
+    // Groups end like directories: `web/` open, `web/…` closed.
+    let (name, suffix) = match node {
+      // A label equal to the path would repeat the groups above.
+      Node::Task(task) => match &task.label {
+        Some(label) if label != path.as_str() => (label.as_str(), ""),
+        Some(_) | None => (path.name(), ""),
       },
-      &status_text,
-      status_attrs,
-    );
-    row_area.width = row_area.width.saturating_sub(r.width);
-
-    grid.fill_area(row_area, ' ', attrs);
+      Node::Group(group) if group.collapsed => (path.name(), "/…"),
+      Node::Group(_) => (path.name(), "/"),
+    };
+    let mut name_area = area.take_left((name.width() + suffix.width()) as u16);
+    let suffix_area = name_area.take_right(suffix.width() as u16);
+    if name.width() > name_area.width as usize {
+      grid.draw_text(name_area.take_right(1), "…", paint(theme.text));
+    }
+    grid.draw_text(name_area, name, paint(theme.text));
+    grid.draw_text(suffix_area, suffix, paint(theme.mark));
   }
 }
 
-/// Task index under a point inside the sidebar block.
-pub fn task_at(area: Rect, x: u16, y: u16, state: &State) -> Option<usize> {
-  let inner = area.inner(1);
-  if !inner.contains(x, y) {
-    return None;
+fn task_status(
+  task: &TaskView,
+  theme: &TaskListTheme,
+) -> (Cow<'static, str>, Rgb) {
+  if task.is_up() {
+    return (Cow::from(" UP "), theme.up);
   }
-  state.tasks_list.index_at((y - inner.y) as usize)
+  let color = match (task.failed(), task.exit_code()) {
+    (true, _) => theme.failed,
+    (false, Some(_)) => theme.done,
+    (false, None) => theme.down,
+  };
+  let text = if let TaskState::Exited(ExitInfo {
+    ready_timeout: true,
+    ..
+  })
+  | TaskState::Backoff(ExitInfo {
+    ready_timeout: true,
+    ..
+  }) = task.status
+  {
+    Cow::from(" NOT READY ")
+  } else {
+    match (task.kind, task.exit_code()) {
+      (TaskKind::Service, Some(code)) => {
+        Cow::from(format!(" DOWN ({}) ", code))
+      }
+      (TaskKind::Job, Some(0)) => Cow::from(" DONE "),
+      (TaskKind::Job, Some(code)) => Cow::from(format!(" FAILED ({}) ", code)),
+      (TaskKind::Service | TaskKind::Job, None) => Cow::from(" DOWN "),
+    }
+  };
+  (text, color)
+}
+
+/// How many tasks under a group are up.
+fn group_status(
+  group: &Group,
+  theme: &TaskListTheme,
+) -> (Cow<'static, str>, Rgb) {
+  let color = if group.failed > 0 {
+    theme.failed
+  } else if group.up == group.len() {
+    theme.up
+  } else {
+    theme.down
+  };
+  (Cow::from(format!(" {}/{} ", group.up, group.len())), color)
 }

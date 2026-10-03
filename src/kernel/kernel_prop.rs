@@ -401,6 +401,7 @@ impl Run {
       space: TaskSpaceId::default_space(),
       path: Some(TaskPath::new(format!("t{}", i + 1)).unwrap()),
       label: None,
+      after: None,
       vt: None,
       tags: vec![tag_name(i).to_string()],
     };

@@ -18,6 +18,7 @@ use super::{
     TaskSelector, task_name,
   },
   namespace::Namespace,
+  path_trie::PathConflict,
   sub_trie::SubMode,
   task::{
     Effects, ExitInfo, INIT_TASK_ID, ReadyMode, STOP_TIMEOUT, Task, TaskCmd,
@@ -81,6 +82,9 @@ enum SentCmd {
   Stop,
   Kill,
 }
+
+/// Pathless last; then by space and the place in it, or by id.
+type ListKey<'a> = (bool, Option<(&'a TaskSpaceId, Vec<usize>)>, TaskId);
 
 struct Graph {
   sender: UnboundedSender<KernelMessage>,
@@ -196,12 +200,23 @@ impl Graph {
     // A taken path refuses the whole registration, checked before the
     // factory runs so a refused task spawns nothing.
     let space = def.space.clone();
+    let after = def
+      .after
+      .and_then(|id| self.tasks.get(&id))
+      .filter(|task| task.space == space)
+      .and_then(|task| task.path.clone());
     let path = match def.path {
       Some(p) => {
         let key = TaskKey::new(space.clone(), p.clone());
-        match self.ns.insert(&key, task_id) {
+        match self.ns.insert(&key, task_id, after.as_ref()) {
           Ok(()) => Some(p),
-          Err(_) => return Err(RegisterError::PathTaken(key)),
+          Err(PathConflict::Taken(_)) => {
+            return Err(RegisterError::PathTaken(key));
+          }
+          Err(PathConflict::Nested(other)) => {
+            let other = TaskKey::new(space.clone(), other);
+            return Err(RegisterError::PathNested(key, other));
+          }
         }
       }
       None => None,
@@ -308,6 +323,9 @@ impl Graph {
     };
     let state = handle.state;
     let kind = handle.kind;
+    let after = path
+      .as_ref()
+      .and_then(|p| self.ns.before(&TaskKey::new(space.clone(), p.clone())));
     self.tasks.insert(task_id, handle);
     self.state_changed = true;
     if let Some(delay) = timer {
@@ -333,12 +351,88 @@ impl Graph {
       TaskNotify::Added {
         path,
         label,
+        after,
         kind,
         state,
         vt,
       },
     );
     Ok(())
+  }
+
+  /// Registers the tasks, listed in the order given, each after the ones
+  /// among them it depends on. A place is held for every path before the
+  /// first task is registered, and dropped again if its task is refused.
+  fn register_tasks(
+    &mut self,
+    tasks: Vec<(Option<&snap::Task>, TaskRegistration)>,
+  ) -> Vec<Result<(), RegisterError>> {
+    let keys: Vec<Option<TaskKey>> = tasks
+      .iter()
+      .map(|(_, registration)| {
+        let def = &registration.def;
+        let path = def.path.clone()?;
+        Some(TaskKey::new(def.space.clone(), path))
+      })
+      .collect();
+    for key in keys.iter().flatten() {
+      self.ns.place(key);
+    }
+
+    let slot: HashMap<TaskId, usize> = tasks
+      .iter()
+      .enumerate()
+      .map(|(i, (_, registration))| (registration.task_id, i))
+      .collect();
+    let mut missing_deps: Vec<usize> = vec![0; tasks.len()];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
+    for (i, (_, registration)) in tasks.iter().enumerate() {
+      for dep in &registration.def.deps {
+        let dep = match dep {
+          TaskSelector::Id(dep) => dep,
+          TaskSelector::Glob(_, _) | TaskSelector::Tag(_, _) => continue,
+        };
+        if let Some(&j) = slot.get(dep) {
+          missing_deps[i] += 1;
+          dependents[j].push(i);
+        }
+      }
+    }
+    let mut ready: VecDeque<usize> =
+      (0..tasks.len()).filter(|i| missing_deps[*i] == 0).collect();
+    let mut order = Vec::with_capacity(tasks.len());
+    while let Some(i) = ready.pop_front() {
+      order.push(i);
+      for &dependent in &dependents[i] {
+        missing_deps[dependent] -= 1;
+        if missing_deps[dependent] == 0 {
+          ready.push_back(dependent);
+        }
+      }
+    }
+    // The tasks of a dependency cycle: each is refused for the
+    // dependency it lacks.
+    order.extend((0..tasks.len()).filter(|i| missing_deps[*i] > 0));
+
+    let mut tasks: Vec<Option<(Option<&snap::Task>, TaskRegistration)>> =
+      tasks.into_iter().map(Some).collect();
+    let mut results: Vec<Result<(), RegisterError>> =
+      tasks.iter().map(|_| Ok(())).collect();
+    for i in order {
+      let (saved, registration) = tasks[i].take().expect("ordered once");
+      results[i] = self.register_task_with_id(
+        registration.task_id,
+        registration.def,
+        registration.factory,
+        saved,
+      );
+    }
+    for (key, result) in keys.iter().zip(&results) {
+      if let (Some(key), Err(_)) = (key, result) {
+        self.ns.prune(key);
+      }
+    }
+    results
   }
 
   /// Begin quitting. Returns true if a quit was already in progress (the
@@ -368,7 +462,10 @@ impl Graph {
     for (path, id) in replay {
       let t = &self.tasks[&id];
       let notify = TaskNotify::Added {
-        path: Some(path.clone()),
+        after: self
+          .ns
+          .before(&TaskKey::new(key.space.clone(), path.clone())),
+        path: Some(path),
         label: t.label.clone(),
         kind: t.kind,
         state: t.state,
@@ -1349,10 +1446,18 @@ impl Graph {
         })
       })
       .collect();
-    tasks.sort_by(|a, b| {
-      (&a.space, &a.path, a.id).cmp(&(&b.space, &b.path, b.id))
-    });
+    tasks.sort_by_cached_key(|task| self.list_key(task.id));
     tasks
+  }
+
+  /// Sorts tasks into list order: the tasks with a path as their space
+  /// lists them, space after space, then the others by id.
+  fn list_key(&self, id: TaskId) -> ListKey<'_> {
+    let place = self.tasks.get(&id).and_then(|task| {
+      let path = task.path.as_ref()?;
+      Some((&task.space, self.ns.position(&task.space, path)?))
+    });
+    (place.is_none(), place, id)
   }
 
   fn tasks_with_tag(&self, space: &SpaceSelector, tag: &str) -> Vec<TaskId> {
@@ -1419,9 +1524,6 @@ impl Graph {
       Some(t) => task_name(id, &t.space, t.path.as_ref()),
       None => task_name(id, &TaskSpaceId::default_space(), None),
     };
-    // The order `list_tasks` uses.
-    let ls_order =
-      |id: &TaskId| (self.tasks.get(id).map(|t| (&t.space, &t.path)), *id);
     let pinned = self
       .redges
       .get(&task_id)
@@ -1434,7 +1536,7 @@ impl Graph {
       .copied()
       .filter(|from| *from != INIT_TASK_ID)
       .collect();
-    required_by.sort_by_key(ls_order);
+    required_by.sort_by_cached_key(|id| self.list_key(*id));
     let mut deps: Vec<TaskId> = self
       .edges
       .get(&task_id)
@@ -1442,7 +1544,7 @@ impl Graph {
       .flatten()
       .copied()
       .collect();
-    deps.sort_by_key(ls_order);
+    deps.sort_by_cached_key(|id| self.list_key(*id));
     let required_by = required_by.into_iter().map(name).collect();
     let deps = deps
       .into_iter()
@@ -1705,7 +1807,8 @@ impl Graph {
         kind,
       });
     }
-    tasks.sort_by_key(|task| task.id);
+    // In list order: a resume lists the tasks as it finds them here.
+    tasks.sort_by_cached_key(|task| self.list_key(TaskId(task.id)));
     KernelSnapshot {
       next_task_id: self
         .next_task_id
@@ -1877,8 +1980,8 @@ impl Kernel {
   /// Rebuilds the graph from an upgrade snapshot before `run`. Each task
   /// comes with the registration its kind built from the snapshot, and
   /// its saved lifecycle state; a task without one (added from the config
-  /// since the snapshot) starts idle. The kernel registers them
-  /// dependencies first.
+  /// since the snapshot) starts idle. They are listed in the order given
+  /// and registered dependencies first.
   #[cfg_attr(windows, allow(dead_code))]
   pub fn restore(
     &mut self,
@@ -1890,56 +1993,29 @@ impl Kernel {
       .next_task_id
       .store(next_task_id, std::sync::atomic::Ordering::Relaxed);
     self.graph.now = Instant::now();
-    let slot: HashMap<TaskId, usize> = tasks
+    let ids: Vec<TaskId> = tasks
       .iter()
-      .enumerate()
-      .map(|(i, (_, registration))| (registration.task_id, i))
+      .map(|(_, registration)| registration.task_id)
       .collect();
-    let mut missing_deps: Vec<usize> = vec![0; tasks.len()];
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
-    for (i, (_, registration)) in tasks.iter().enumerate() {
+    let snapshot: HashSet<TaskId> = ids.iter().copied().collect();
+    for (_, registration) in &tasks {
       for dep in &registration.def.deps {
         let dep = match dep {
           TaskSelector::Id(dep) => dep,
           TaskSelector::Glob(_, _) | TaskSelector::Tag(_, _) => continue,
         };
-        let Some(&j) = slot.get(dep) else {
+        if !snapshot.contains(dep) {
           anyhow::bail!(
             "task {} has a dependency that is not in the snapshot",
             registration.task_id.0
           );
-        };
-        missing_deps[i] += 1;
-        dependents[j].push(i);
-      }
-    }
-    let mut ready: Vec<usize> =
-      (0..tasks.len()).filter(|i| missing_deps[*i] == 0).collect();
-    let mut tasks: Vec<Option<(Option<&snap::Task>, TaskRegistration)>> =
-      tasks.into_iter().map(Some).collect();
-    let mut registered = 0;
-    while let Some(i) = ready.pop() {
-      let (saved, registration) = tasks[i].take().expect("ready once");
-      let id = registration.task_id;
-      self
-        .graph
-        .register_task_with_id(
-          registration.task_id,
-          registration.def,
-          registration.factory,
-          saved,
-        )
-        .map_err(|err| anyhow::anyhow!("restoring task {}: {err}", id.0))?;
-      registered += 1;
-      for &dependent in &dependents[i] {
-        missing_deps[dependent] -= 1;
-        if missing_deps[dependent] == 0 {
-          ready.push(dependent);
         }
       }
     }
-    if registered != tasks.len() {
-      anyhow::bail!("the snapshot's dependencies form a cycle");
+    let results = self.graph.register_tasks(tasks);
+    for (id, result) in ids.into_iter().zip(results) {
+      result
+        .map_err(|err| anyhow::anyhow!("restoring task {}: {err}", id.0))?;
     }
     Ok(())
   }
@@ -2026,6 +2102,7 @@ impl Kernel {
       | KernelCommand::QuitWithoutSave
       | KernelCommand::QuitWithin { .. }
       | KernelCommand::RegisterTask(..)
+      | KernelCommand::RegisterTasks(..)
       | KernelCommand::Start(..)
       | KernelCommand::Stop(..)
       | KernelCommand::Kill(..)
@@ -2120,6 +2197,28 @@ impl Kernel {
             Err(RegisterError::ReservedSpace(registration.def.space))
           };
         let _ = ack.send(registered);
+      }
+      KernelCommand::RegisterTasks(registrations, ack) => {
+        let mut refused = Vec::with_capacity(registrations.len());
+        let mut allowed = Vec::with_capacity(registrations.len());
+        for registration in registrations {
+          if self.graph.can_register(msg.from, &registration.def.space) {
+            refused.push(None);
+            allowed.push((None, registration));
+          } else {
+            refused
+              .push(Some(RegisterError::ReservedSpace(registration.def.space)));
+          }
+        }
+        let mut registered = self.graph.register_tasks(allowed).into_iter();
+        let results = refused
+          .into_iter()
+          .map(|refused| match refused {
+            Some(err) => Err(err),
+            None => registered.next().expect("one result for each task"),
+          })
+          .collect();
+        let _ = ack.send(results);
       }
       KernelCommand::Start(selector, ack) => {
         let ids = self.graph.mutable_matching_ids(msg.from, &selector);

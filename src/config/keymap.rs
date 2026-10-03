@@ -84,6 +84,12 @@ impl KeymapConfig {
       Key::new(KeyCode::Char('k'), KeyMods::NONE),
       Action::PrevTask,
     );
+    for code in [KeyCode::Left, KeyCode::Char('h')] {
+      s.keymap_add_p(code.into(), Action::Collapse);
+    }
+    for code in [KeyCode::Right, KeyCode::Char('l')] {
+      s.keymap_add_p(code.into(), Action::Expand);
+    }
     s.keymap_add_p(
       Key::new(KeyCode::Char('s'), KeyMods::NONE),
       Action::StartTask,

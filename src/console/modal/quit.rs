@@ -30,18 +30,15 @@ impl Modal for QuitModal {
 
   fn render(&mut self, grid: &mut Grid, _keymap: &Keymap) {
     let area = self.area(grid.area());
-    grid.draw_block(area, &BorderType::Thick.chars(), Attrs::default());
-    let inner = area.inner(1);
+    let inner = grid.block(area, BorderType::Thick).inner();
     grid.fill_area(inner, ' ', Attrs::default());
     let lines = [
       "<e>   - stop the runner",
       "<d>   - detach client",
       "<Esc> - cancel",
     ];
-    for (i, line) in lines.iter().enumerate() {
-      if let Some(row) = inner.row(i as u16) {
-        grid.draw_text(row, line, Attrs::default());
-      }
+    for (row, line) in inner.rows().zip(lines) {
+      grid.draw_text(row, line, Attrs::default());
     }
   }
 }

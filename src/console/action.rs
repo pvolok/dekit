@@ -33,6 +33,10 @@ pub enum Action {
   ShowCommandsMenu,
   NextTask,
   PrevTask,
+  /// Open the selected group, or step into it when it is open.
+  Expand,
+  /// Close the selected group, or step out to the group it is in.
+  Collapse,
   SelectTask {
     index: usize,
   },
@@ -112,6 +116,8 @@ impl Action {
       Action::ShowCommandsMenu => "All commands".to_string(),
       Action::NextTask => "Next".to_string(),
       Action::PrevTask => "Prev".to_string(),
+      Action::Expand => "Expand group".to_string(),
+      Action::Collapse => "Collapse group".to_string(),
       Action::SelectTask { index } => format!("Select task #{}", index),
       Action::StartTask => "Start".to_string(),
       Action::StopTask => "Stop".to_string(),

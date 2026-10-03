@@ -76,6 +76,16 @@ impl Config {
     let mut stack = Vec::new();
     let mut task_paths = HashSet::new();
     config.load_file(&root, &path, "", true, &mut stack, &mut task_paths)?;
+    for task in &config.tasks {
+      let path = task.path.as_str();
+      if let Some(above) = path
+        .match_indices('/')
+        .map(|(i, _)| &path[..i])
+        .find(|prefix| task_paths.contains(*prefix))
+      {
+        bail!("a task can't have tasks under it: '{path}' is under '{above}'");
+      }
+    }
     if config.defaults.autorestart == Some(RestartMode::Always)
       && let Some(job) = config.tasks.iter().find(|task| match task.kind {
         TaskKind::Service => false,
@@ -601,6 +611,27 @@ mod tests {
       Err(err) => format!("{err:#}"),
     };
     assert!(err.contains("duplicate task path 'x'"), "{err}");
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn rejects_a_task_under_another() {
+    let root = temp_project("nested");
+    std::fs::write(
+      root.join("dekit.yaml"),
+      "tasks:\n  web: {cmd: ['true']}\nload:\n  - file: web.yaml\n    at: web\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("web.yaml"), "tasks:\n  dev: {cmd: ['true']}\n")
+      .unwrap();
+    let err = match Config::load_dir(&root) {
+      Ok(_) => panic!("expected a nested task error"),
+      Err(err) => format!("{err:#}"),
+    };
+    assert_eq!(
+      err,
+      "a task can't have tasks under it: 'web/dev' is under 'web'"
+    );
     let _ = std::fs::remove_dir_all(root);
   }
 

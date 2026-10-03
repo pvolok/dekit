@@ -35,6 +35,7 @@ pub mod v1 {
     pub live_fd: i32,
     pub listener_fd: i32,
     pub next_task_id: usize,
+    /// In list order.
     pub tasks: Vec<Task>,
     pub connections: Vec<Connection>,
   }

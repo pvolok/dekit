@@ -79,19 +79,14 @@ impl Modal for AddTaskModal {
 
   fn render(&mut self, grid: &mut Grid, _keymap: &Keymap) {
     let area = self.area(grid.area());
-    grid.draw_block(area, &BorderType::Plain.chars(), Attrs::default());
-    grid.draw_text(
-      Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
-      "Add task",
-      Attrs::default(),
-    );
-    let inner = area.inner(1);
+    let mut inner = grid
+      .block(area, BorderType::Plain)
+      .title("Add task", Attrs::default())
+      .inner();
     grid.fill_area(inner, ' ', Attrs::default());
-    let (input, error) = inner.split_h(1);
-    for (i, line) in self.error_lines(inner.width).iter().enumerate() {
-      if let Some(row) = error.row(i as u16) {
-        grid.draw_text(row, line, Attrs::default().fg(Color::BRIGHT_RED));
-      }
+    let input = inner.take_top(1);
+    for (row, line) in inner.rows().zip(self.error_lines(inner.width)) {
+      grid.draw_text(row, &line, Attrs::default().fg(Color::BRIGHT_RED));
     }
     grid.cursor_pos = Some(render_text_input(&self.input, input, grid));
   }

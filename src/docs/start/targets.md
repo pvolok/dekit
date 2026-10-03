@@ -17,7 +17,8 @@ target (|cli/up|, |cli/down|).
 - in a space — `@dekit/console`, or `@*/web` for every space
 - on a runner — `project::web`, `host::+ci`, `~/dev/api::web/*`
 
-Quote globs so the shell leaves them alone.
+Quote globs so the shell leaves them alone. A task can't have tasks under
+it: with `services/web` there is no task `services`.
 
 A runner is `project` (the nearest project), `host` (the machine-wide
 runner, |start/runners|), or a path (`/abs/dir`, `~/dir`, `./dir`) naming a

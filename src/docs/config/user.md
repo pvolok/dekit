@@ -61,6 +61,8 @@ Default bindings in `tasks`:
   desc: detach, quit
 - cmd: <j> <Down>, <k> <Up>
   desc: next-task, prev-task
+- cmd: <h> <Left>, <l> <Right>
+  desc: collapse, expand, a group in the task list
 - cmd: <M-1> ... <M-8>
   desc: "select-task {index: 0} ... 7"
 - cmd: <s>, <x>, <X>

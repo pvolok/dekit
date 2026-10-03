@@ -16,6 +16,5 @@ pub fn render_zoom_tip(area: Rect, grid: &mut Grid, keymap: &Keymap) {
     None => " No key bound to exit the zoom mode".to_string(),
   };
   let attrs = Attrs::default().fg(Color::BLACK).bg(Color::YELLOW);
-  grid.fill_area(area, ' ', attrs);
-  grid.draw_text(area, &text, attrs);
+  grid.draw_line(area, &text, attrs);
 }

@@ -49,7 +49,8 @@ run without a shell (a string is split into one as in
 |config/tasks#commands|), and an empty one is `invalid_params`; `script`
 is a `.js` or `.mjs` file to run instead (|js|). `env` values of `null`
 unset a variable, each `deps` target must match at least one task (else
-`no_match`), and a taken path is `path_taken`. The task takes the
+`no_match`), and a taken path, or one above or under another task, is
+`path_taken`. The task takes the
 project's `defaults` except `autorestart`, which is `never`.
 
 `up` takes no target. It pins and starts the tasks that were started when

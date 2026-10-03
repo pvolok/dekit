@@ -14,7 +14,7 @@ use crate::{
     Color, MouseProtocolEncoding, MouseProtocolMode, Reply, Screen, Size,
     TermEvent, VtEvent, Winsize,
     attrs::Attrs,
-    grid::{Pos as GridPos, Rect},
+    grid::Pos as GridPos,
     key::{Key, KeyCode, KeyMods},
     mouse::{MouseButton, MouseEvent, MouseEventKind},
     vt::emit,
@@ -569,9 +569,9 @@ impl TaskScreen {
     } else {
       " COPY ".to_string()
     };
-    let width = (label.len() as u16).min(size.width);
+    let mut top_row = grid.area().take_top(1);
     grid.draw_text(
-      Rect::new(size.width - width, 0, width, 1),
+      top_row.take_right(label.len() as u16),
       &label,
       Attrs::default().fg(Color::BLACK).bg(Color::BRIGHT_YELLOW),
     );

@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-use std::fmt;
+use indexmap::IndexMap;
 
 use super::task::TaskId;
 use super::task_path::TaskPath;
@@ -7,7 +6,8 @@ use super::task_path::TaskPath;
 #[derive(Debug)]
 struct TrieNode {
   task: Option<TaskId>,
-  children: BTreeMap<String, TrieNode>,
+  /// In list order.
+  children: IndexMap<String, TrieNode>,
 }
 
 fn join(prefix: &str, component: &str) -> String {
@@ -22,7 +22,7 @@ impl TrieNode {
   fn new() -> Self {
     Self {
       task: None,
-      children: BTreeMap::new(),
+      children: IndexMap::new(),
     }
   }
 
@@ -40,6 +40,32 @@ impl TrieNode {
     for (component, child) in &self.children {
       child.collect_all(&join(prefix, component), result);
     }
+  }
+
+  #[cfg(test)]
+  fn collect_ids(&self, result: &mut Vec<TaskId>) {
+    result.extend(self.task);
+    for child in self.children.values() {
+      child.collect_ids(result);
+    }
+  }
+
+  /// A task at or under this node.
+  fn any_task(&self, prefix: &str) -> Option<TaskPath> {
+    if self.task.is_some() {
+      return TaskPath::new(prefix).ok();
+    }
+    self
+      .children
+      .iter()
+      .find_map(|(component, child)| child.any_task(&join(prefix, component)))
+  }
+
+  /// The last task listed at or under this node.
+  fn last_task(&self) -> Option<TaskId> {
+    self
+      .task
+      .or_else(|| self.children.values().rev().find_map(TrieNode::last_task))
   }
 
   /// Walk the trie matching glob pattern components.
@@ -84,24 +110,18 @@ impl TrieNode {
   }
 }
 
-#[derive(Debug)]
-pub struct PathConflictError {
-  pub path: TaskPath,
-  pub existing_id: TaskId,
+/// Why a task cannot go at a path.
+#[derive(Debug, Eq, PartialEq)]
+pub enum PathConflict {
+  /// A task is at the path already.
+  Taken(TaskId),
+  /// A task is above or under the path. Tasks are always leaves.
+  Nested(TaskPath),
 }
 
-impl fmt::Display for PathConflictError {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(
-      f,
-      "path {} already occupied by task {:?}",
-      self.path, self.existing_id
-    )
-  }
-}
-
-impl std::error::Error for PathConflictError {}
-
+/// Task paths, the names under each path in list order: the order they
+/// were added. Tasks are leaves, and every non-task node has a task under
+/// it, but for the places `place` holds while a batch is registered.
 pub struct PathTrie {
   root: TrieNode,
 }
@@ -113,61 +133,99 @@ impl PathTrie {
     }
   }
 
-  /// Insert a task at the given path. Errors if path is already occupied.
+  /// Refused, with no change, if a task is at, above, or under `path`.
+  /// A new path is listed last among those beside it, or right after
+  /// `after` when that is one of them.
   pub fn insert(
     &mut self,
     path: &TaskPath,
     id: TaskId,
-  ) -> Result<(), PathConflictError> {
-    let mut node = &mut self.root;
-    for component in path.components() {
-      node = node
-        .children
-        .entry(component.to_string())
-        .or_insert_with(TrieNode::new);
+    after: Option<&TaskPath>,
+  ) -> Result<(), PathConflict> {
+    if let Some(above) = std::iter::successors(path.parent(), TaskPath::parent)
+      .find(|parent| self.resolve(parent).is_some())
+    {
+      return Err(PathConflict::Nested(above));
     }
-    if let Some(existing) = node.task {
-      return Err(PathConflictError {
-        path: path.clone(),
-        existing_id: existing,
-      });
+    if let Some(node) = self.walk_to(path) {
+      if let Some(existing) = node.task {
+        return Err(PathConflict::Taken(existing));
+      }
+      if let Some(below) = node.any_task(path.as_str()) {
+        return Err(PathConflict::Nested(below));
+      }
+    }
+    let beside = after
+      .filter(|after| after.parent() == path.parent())
+      .map(TaskPath::name);
+    let mut node = &mut self.root;
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+      let index = match node.children.get_index_of(component) {
+        Some(index) => index,
+        None => {
+          let last = node.children.len();
+          node.children.insert(component.to_string(), TrieNode::new());
+          let place = match beside.and_then(|b| node.children.get_index_of(b)) {
+            Some(index) if components.peek().is_none() => index + 1,
+            Some(_) | None => last,
+          };
+          node.children.move_index(last, place);
+          place
+        }
+      };
+      node = &mut node.children[index];
     }
     node.task = Some(id);
     Ok(())
   }
 
+  /// Holds the path's place in the lists until a task is inserted there
+  /// or `prune` drops it. Nothing is held where an insert would be
+  /// refused for a task above.
+  pub fn place(&mut self, path: &TaskPath) {
+    let mut node = &mut self.root;
+    for component in path.components() {
+      if node.task.is_some() {
+        return;
+      }
+      node = node
+        .children
+        .entry(component.to_string())
+        .or_insert_with(TrieNode::new);
+    }
+  }
+
   /// Remove the task at the given path. Returns the TaskId if found.
   /// Prunes empty ancestor nodes.
   pub fn remove(&mut self, path: &TaskPath) -> Option<TaskId> {
-    let components: Vec<&str> = path.components().collect();
-    Self::remove_recursive(&mut self.root, &components)
+    let mut node = &mut self.root;
+    for component in path.components() {
+      node = node.children.get_mut(component)?;
+    }
+    let id = node.task.take();
+    self.prune(path);
+    id
   }
 
-  fn remove_recursive(
-    node: &mut TrieNode,
-    components: &[&str],
-  ) -> Option<TaskId> {
-    if components.is_empty() {
-      return node.task.take();
-    }
-
-    let component = components[0];
-    let rest = &components[1..];
-
-    let result = if let Some(child) = node.children.get_mut(component) {
-      Self::remove_recursive(child, rest)
-    } else {
-      return None;
-    };
-
-    // Prune empty child
-    if let Some(child) = node.children.get(component) {
+  /// Drops the nodes along `path` that have no task at or under them.
+  pub fn prune(&mut self, path: &TaskPath) {
+    fn prune<'a>(
+      node: &mut TrieNode,
+      mut components: impl Iterator<Item = &'a str>,
+    ) {
+      let Some(component) = components.next() else {
+        return;
+      };
+      let Some(child) = node.children.get_mut(component) else {
+        return;
+      };
+      prune(child, components);
       if child.is_empty() {
-        node.children.remove(component);
+        node.children.shift_remove(component);
       }
     }
-
-    result
+    prune(&mut self.root, path.components());
   }
 
   /// Resolve a path to its TaskId. O(depth).
@@ -177,6 +235,46 @@ impl PathTrie {
       node = node.children.get(component)?;
     }
     node.task
+  }
+
+  /// The task listed just before `path`.
+  pub fn before(&self, path: &TaskPath) -> Option<TaskId> {
+    let mut node = &self.root;
+    let mut before = None;
+    for component in path.components() {
+      let index = node.children.get_index_of(component)?;
+      let earlier = node.children.get_range(..index)?;
+      // A task under a later path part is listed after one beside an
+      // earlier part.
+      before = earlier
+        .values()
+        .rev()
+        .find_map(TrieNode::last_task)
+        .or(before);
+      node = &node.children[index];
+    }
+    before
+  }
+
+  /// Where a path is listed: its index among the names beside it, at each
+  /// part of the path. Paths in list order have these in order.
+  pub fn position(&self, path: &TaskPath) -> Option<Vec<usize>> {
+    let mut node = &self.root;
+    let mut position = Vec::new();
+    for component in path.components() {
+      let (index, _, child) = node.children.get_full(component)?;
+      position.push(index);
+      node = child;
+    }
+    Some(position)
+  }
+
+  /// Every task, in list order.
+  #[cfg(test)]
+  pub fn tasks(&self) -> Vec<TaskId> {
+    let mut result = Vec::new();
+    self.root.collect_ids(&mut result);
+    result
   }
 
   /// Recursively collect all tasks under a prefix path.
@@ -226,9 +324,11 @@ mod tests {
   #[test]
   fn test_insert_and_resolve() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("web"), TaskId(1)).unwrap();
-    trie.insert(&path("services/api"), TaskId(2)).unwrap();
-    trie.insert(&path("services/worker"), TaskId(3)).unwrap();
+    trie.insert(&path("web"), TaskId(1), None).unwrap();
+    trie.insert(&path("services/api"), TaskId(2), None).unwrap();
+    trie
+      .insert(&path("services/worker"), TaskId(3), None)
+      .unwrap();
 
     assert_eq!(trie.resolve(&path("web")), Some(TaskId(1)));
     assert_eq!(trie.resolve(&path("services/api")), Some(TaskId(2)));
@@ -240,16 +340,44 @@ mod tests {
   #[test]
   fn test_insert_conflict() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("web"), TaskId(1)).unwrap();
-    let err = trie.insert(&path("web"), TaskId(2)).unwrap_err();
-    assert_eq!(err.existing_id, TaskId(1));
+    trie.insert(&path("web"), TaskId(1), None).unwrap();
+    let err = trie.insert(&path("web"), TaskId(2), None).unwrap_err();
+    assert_eq!(err, PathConflict::Taken(TaskId(1)));
+  }
+
+  #[test]
+  fn refuses_a_task_above_or_under_another() {
+    let mut trie = PathTrie::new();
+    trie.insert(&path("web"), TaskId(1), None).unwrap();
+    trie.insert(&path("api/v1/http"), TaskId(2), None).unwrap();
+
+    assert_eq!(
+      trie.insert(&path("web/dev/a"), TaskId(3), None),
+      Err(PathConflict::Nested(path("web")))
+    );
+    assert_eq!(
+      trie.insert(&path("api"), TaskId(3), None),
+      Err(PathConflict::Nested(path("api/v1/http")))
+    );
+    assert_eq!(
+      trie.insert(&path("api/v1"), TaskId(3), None),
+      Err(PathConflict::Nested(path("api/v1/http")))
+    );
+    assert!(
+      trie.descendants(&path("web")).is_empty(),
+      "nothing was made"
+    );
+
+    trie.remove(&path("web"));
+    trie.insert(&path("web/dev/a"), TaskId(3), None).unwrap();
+    trie.insert(&path("api/v2"), TaskId(4), None).unwrap();
   }
 
   #[test]
   fn test_remove() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("a/b"), TaskId(1)).unwrap();
-    trie.insert(&path("a/c"), TaskId(2)).unwrap();
+    trie.insert(&path("a/b"), TaskId(1), None).unwrap();
+    trie.insert(&path("a/c"), TaskId(2), None).unwrap();
 
     assert_eq!(trie.remove(&path("a/b")), Some(TaskId(1)));
     assert_eq!(trie.resolve(&path("a/b")), None);
@@ -270,42 +398,61 @@ mod tests {
   #[test]
   fn test_descendants() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("services/api"), TaskId(1)).unwrap();
-    trie.insert(&path("services/web"), TaskId(2)).unwrap();
-    trie.insert(&path("services/web/v2"), TaskId(3)).unwrap();
-    trie.insert(&path("tools/lint"), TaskId(4)).unwrap();
+    trie.insert(&path("services/api"), TaskId(1), None).unwrap();
+    trie
+      .insert(&path("services/web/v1"), TaskId(2), None)
+      .unwrap();
+    trie
+      .insert(&path("services/web/v2"), TaskId(3), None)
+      .unwrap();
+    trie.insert(&path("tools/lint"), TaskId(4), None).unwrap();
 
     let desc = trie.descendants(&path("services"));
     assert_eq!(desc.len(), 3);
     assert_eq!(desc[0], (path("services/api"), TaskId(1)));
-    assert_eq!(desc[1], (path("services/web"), TaskId(2)));
+    assert_eq!(desc[1], (path("services/web/v1"), TaskId(2)));
     assert_eq!(desc[2], (path("services/web/v2"), TaskId(3)));
   }
 
   #[test]
   fn test_glob_star() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("services/api"), TaskId(1)).unwrap();
-    trie.insert(&path("services/web"), TaskId(2)).unwrap();
-    trie.insert(&path("services/web/v2"), TaskId(3)).unwrap();
-    trie.insert(&path("tools/lint"), TaskId(4)).unwrap();
+    trie.insert(&path("services/api"), TaskId(1), None).unwrap();
+    trie
+      .insert(&path("services/web/v1"), TaskId(2), None)
+      .unwrap();
+    trie
+      .insert(&path("services/web/v2"), TaskId(3), None)
+      .unwrap();
+    trie.insert(&path("tools/lint"), TaskId(4), None).unwrap();
 
     let results = trie.glob("services/*");
+    assert_eq!(results, [(path("services/api"), TaskId(1))]);
+
+    let results = trie.glob("services/web/*");
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0], (path("services/api"), TaskId(1)));
-    assert_eq!(results[1], (path("services/web"), TaskId(2)));
+    assert_eq!(results[0], (path("services/web/v1"), TaskId(2)));
+    assert_eq!(results[1], (path("services/web/v2"), TaskId(3)));
   }
 
   #[test]
   fn test_glob_double_star() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("services/api"), TaskId(1)).unwrap();
-    trie.insert(&path("services/web"), TaskId(2)).unwrap();
-    trie.insert(&path("services/web/v2"), TaskId(3)).unwrap();
-    trie.insert(&path("tools/lint"), TaskId(4)).unwrap();
+    trie.insert(&path("services/api"), TaskId(1), None).unwrap();
+    trie
+      .insert(&path("services/web/v1"), TaskId(2), None)
+      .unwrap();
+    trie
+      .insert(&path("services/web/v2"), TaskId(3), None)
+      .unwrap();
+    trie.insert(&path("tools/lint"), TaskId(4), None).unwrap();
 
     let results = trie.glob("services/**");
     assert_eq!(results.len(), 3);
+
+    // A trailing `**` matches the path itself too.
+    let results = trie.glob("services/api/**");
+    assert_eq!(results, [(path("services/api"), TaskId(1))]);
 
     let results = trie.glob("**");
     assert_eq!(results.len(), 4);
@@ -318,13 +465,82 @@ mod tests {
   #[test]
   fn test_glob_mixed() {
     let mut trie = PathTrie::new();
-    trie.insert(&path("a/b/c"), TaskId(1)).unwrap();
-    trie.insert(&path("a/x/c"), TaskId(2)).unwrap();
-    trie.insert(&path("a/b/d"), TaskId(3)).unwrap();
+    trie.insert(&path("a/b/c"), TaskId(1), None).unwrap();
+    trie.insert(&path("a/x/c"), TaskId(2), None).unwrap();
+    trie.insert(&path("a/b/d"), TaskId(3), None).unwrap();
 
     let results = trie.glob("a/*/c");
     assert_eq!(results.len(), 2);
     assert_eq!(results[0], (path("a/b/c"), TaskId(1)));
     assert_eq!(results[1], (path("a/x/c"), TaskId(2)));
+  }
+
+  fn listed(trie: &PathTrie) -> Vec<usize> {
+    trie.tasks().iter().map(|id| id.0).collect()
+  }
+
+  #[test]
+  fn lists_paths_as_added_with_a_group_at_its_first_task() {
+    let mut trie = PathTrie::new();
+    for (i, p) in ["web/dev", "db", "web/ui", "api/a/b"].iter().enumerate() {
+      trie.insert(&path(p), TaskId(i + 1), None).unwrap();
+    }
+    assert_eq!(listed(&trie), [1, 3, 2, 4]);
+    assert_eq!(trie.before(&path("web/dev")), None);
+    assert_eq!(trie.before(&path("web/ui")), Some(TaskId(1)));
+    assert_eq!(trie.before(&path("db")), Some(TaskId(3)));
+    assert_eq!(trie.before(&path("api/a/b")), Some(TaskId(2)));
+
+    trie.remove(&path("web/dev"));
+    assert_eq!(listed(&trie), [3, 2, 4], "the others keep their order");
+    trie.remove(&path("web/ui"));
+    trie.insert(&path("web/dev"), TaskId(5), None).unwrap();
+    assert_eq!(listed(&trie), [2, 4, 5], "an emptied group is gone");
+  }
+
+  #[test]
+  fn lists_a_path_right_after_the_one_it_names() {
+    let mut trie = PathTrie::new();
+    trie.insert(&path("db"), TaskId(1), None).unwrap();
+    trie.insert(&path("web/api"), TaskId(2), None).unwrap();
+    trie.insert(&path("web/ui"), TaskId(3), None).unwrap();
+    trie
+      .insert(&path("web/api-2"), TaskId(4), Some(&path("web/api")))
+      .unwrap();
+    trie
+      .insert(&path("db-2"), TaskId(5), Some(&path("db")))
+      .unwrap();
+    assert_eq!(listed(&trie), [1, 5, 2, 4, 3]);
+
+    // Not beside the one it names: listed last.
+    trie
+      .insert(&path("cache"), TaskId(6), Some(&path("web/api")))
+      .unwrap();
+    assert_eq!(listed(&trie), [1, 5, 2, 4, 3, 6]);
+  }
+
+  #[test]
+  fn a_held_place_is_filled_or_dropped() {
+    let mut trie = PathTrie::new();
+    trie.insert(&path("a"), TaskId(1), None).unwrap();
+    for p in ["web/api", "db", "web/ui", "a/under"] {
+      trie.place(&path(p));
+    }
+    assert_eq!(listed(&trie), [1]);
+    assert_eq!(trie.insert(&path("web"), TaskId(9), None), Ok(()));
+    trie.remove(&path("web"));
+
+    trie.insert(&path("db"), TaskId(2), None).unwrap();
+    trie.insert(&path("web/ui"), TaskId(3), None).unwrap();
+    assert_eq!(listed(&trie), [1, 3, 2]);
+    assert_eq!(trie.before(&path("web/ui")), Some(TaskId(1)));
+    assert_eq!(trie.before(&path("db")), Some(TaskId(3)));
+
+    trie.prune(&path("web/api"));
+    trie.prune(&path("a/under"));
+    assert_eq!(listed(&trie), [1, 3, 2]);
+    assert_eq!(trie.root.children.len(), 3);
+    assert_eq!(trie.root.children["web"].children.len(), 1);
+    assert!(trie.root.children["a"].children.is_empty());
   }
 }

@@ -20,12 +20,13 @@ use crate::{
       rename_task::RenameTaskModal,
     },
     state::{Scope, State},
+    task_tree::{Node, TaskTree},
     task_view::TaskView,
+    theme::TaskListTheme,
     ui_keymap::render_keymap,
-    ui_tasks::{render_tasks, task_at},
+    ui_tasks::render_tasks,
     ui_term::render_term,
     ui_zoom_tip::render_zoom_tip,
-    widgets::list::ListState,
   },
   kernel::{
     copy_mode::CopyMove as KernelCopyMove,
@@ -36,7 +37,7 @@ use crate::{
       TaskNotification, TaskNotify, TaskState,
     },
     task_key::TaskKey,
-    task_path::{TaskPath, is_valid_component_char},
+    task_path::{TaskPath, path_name, unique},
     task_screen::{
       DEFAULT_SIZE, ObserverId, ScreenNotify, ScrollUnit as KernelScrollUnit,
       TaskScreen, TaskScreenCmd, TaskScreenEffect,
@@ -69,31 +70,6 @@ fn kernel_scroll_unit(unit: ScrollUnit) -> KernelScrollUnit {
     ScrollUnit::HalfScreen => KernelScrollUnit::HalfScreen,
     ScrollUnit::Screen => KernelScrollUnit::Screen,
   }
-}
-
-/// A task path component made from free text such as a shell command.
-fn path_name(text: &str) -> String {
-  let name: String = text
-    .chars()
-    .map(|c| if is_valid_component_char(c) { c } else { '-' })
-    .collect();
-  let name = name.trim_matches('-').to_string();
-  if name.is_empty() {
-    "task".to_string()
-  } else {
-    name
-  }
-}
-
-/// `base`, or `base-2`, `base-3`, ... — the first that is not `taken`.
-fn unique(base: &str, taken: impl Fn(&str) -> bool) -> String {
-  if !taken(base) {
-    return base.to_string();
-  }
-  (2..)
-    .map(|n| format!("{}-{}", base, n))
-    .find(|name| !taken(name))
-    .unwrap()
 }
 
 fn winsize(size: Size) -> Winsize {
@@ -139,6 +115,7 @@ pub fn console_task_registration(
 pub struct App {
   config: Arc<Config>,
   keymap: Keymap,
+  theme: TaskListTheme,
   state: State,
   modal: Option<Box<dyn Modal>>,
   receiver: UnboundedReceiver<TaskCmd>,
@@ -169,13 +146,13 @@ impl App {
     App {
       state: State {
         scope: Scope::Tasks,
-        tasks: Vec::new(),
-        tasks_list: ListState::default(),
+        tasks: TaskTree::new(),
         hide_keymap_window: !config.tui.tips.show,
         quitting: false,
       },
       config,
       keymap,
+      theme: TaskListTheme::default(),
       modal: None,
       receiver,
       screen: TaskScreen::new(pc.task_id, vt.clone(), 1),
@@ -197,7 +174,7 @@ impl App {
       let size = self.layout().term_area().size();
       if size != term_size {
         term_size = size;
-        for task in &self.state.tasks {
+        for task in self.state.tasks.iter() {
           self.pc.send_msg(
             task.id,
             TaskScreenCmd::Input {
@@ -246,7 +223,13 @@ impl App {
     grid.cursor_pos = None;
     grid.cursor_style = CursorStyle::Default;
 
-    render_tasks(layout.sidebar, grid, &mut self.state, &self.config);
+    render_tasks(
+      layout.sidebar,
+      grid,
+      &mut self.state,
+      &self.config,
+      &self.theme,
+    );
     render_term(layout.term, grid, &self.state);
     render_keymap(layout.keymap, grid, &self.state, &self.keymap);
     render_zoom_tip(layout.zoom_banner, grid, &self.keymap);
@@ -284,22 +267,27 @@ impl App {
     id: TaskId,
     label: Option<String>,
     path: Option<TaskPath>,
+    after: Option<TaskId>,
     kind: TaskKind,
     status: TaskState,
     vt: Option<SharedVt>,
   ) {
-    let Some(vt) = vt else {
+    // Console tasks always have a path.
+    let (Some(vt), Some(path)) = (vt, path) else {
       return;
     };
-    self.state.tasks.push(TaskView {
-      id,
-      label,
-      path,
-      kind,
-      status,
-      vt,
-      present: None,
-    });
+    self.state.tasks.add(
+      TaskView {
+        id,
+        label,
+        path: Arc::new(path),
+        kind,
+        status,
+        vt,
+        present: None,
+      },
+      after,
+    );
     if self.screen.has_observers() {
       self.observe(id);
     }
@@ -317,13 +305,13 @@ impl App {
   }
 
   fn observe_all(&self) {
-    for task in &self.state.tasks {
+    for task in self.state.tasks.iter() {
       self.observe(task.id);
     }
   }
 
   fn unobserve_all(&mut self) {
-    for task in &mut self.state.tasks {
+    for task in self.state.tasks.iter_mut() {
       task.present = None;
       self.pc.send_msg(
         task.id,
@@ -453,19 +441,15 @@ impl App {
       if pressed && self.state.scope == Scope::Term {
         self.state.scope = Scope::Tasks;
       }
-      let selected = self.state.selected();
+      let tasks = &mut self.state.tasks;
       match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-          if let Some(index) = task_at(layout.sidebar, x, y, &self.state) {
-            self.state.select(index);
+          if let Some(row) = tasks.row_at(x, y) {
+            tasks.click(row.index);
           }
         }
-        MouseEventKind::ScrollDown => {
-          self.state.select(selected + 1);
-        }
-        MouseEventKind::ScrollUp => {
-          self.state.select(selected.saturating_sub(1));
-        }
+        MouseEventKind::ScrollDown => tasks.scroll_by(3),
+        MouseEventKind::ScrollUp => tasks.scroll_by(-3),
         MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
         | MouseEventKind::Up(_)
         | MouseEventKind::Drag(_)
@@ -545,39 +529,29 @@ impl App {
         self.state.hide_keymap_window = !self.state.hide_keymap_window;
       }
 
-      Action::NextTask => {
-        let count = self.state.tasks.len();
-        if count > 0 {
-          self.state.select((self.state.selected() + 1) % count);
-        }
-      }
-      Action::PrevTask => {
-        let count = self.state.tasks.len();
-        if count > 0 {
-          self
-            .state
-            .select((self.state.selected() + count - 1) % count);
-        }
-      }
-      Action::SelectTask { index } => self.state.select(index),
+      Action::NextTask => self.state.tasks.next(),
+      Action::PrevTask => self.state.tasks.prev(),
+      Action::Expand => self.state.tasks.expand(),
+      Action::Collapse => self.state.tasks.collapse(),
+      Action::SelectTask { index } => self.state.tasks.select_task(index),
 
       Action::StartTask => {
-        self.issue_current(current, |target| Command::Start { target })
+        self.issue_selected(|target| Command::Start { target })
       }
       Action::StopTask => {
-        self.issue_current(current, |target| Command::Stop { target })
+        self.issue_selected(|target| Command::Stop { target })
       }
       Action::KillTask => {
-        self.issue_current(current, |target| Command::Kill { target })
+        self.issue_selected(|target| Command::Kill { target })
       }
       Action::VetoTask => {
-        self.issue_current(current, |target| Command::Veto { target })
+        self.issue_selected(|target| Command::Veto { target })
       }
       Action::RestartTask => {
-        self.issue_current(current, |target| Command::Restart { target })
+        self.issue_selected(|target| Command::Restart { target })
       }
       Action::ForceRestartTask => {
-        self.issue_current(current, |target| Command::ForceRestart { target })
+        self.issue_selected(|target| Command::ForceRestart { target })
       }
       Action::RestartAll => {
         self.issue_all(|target| Command::Restart { target })
@@ -592,12 +566,13 @@ impl App {
       Action::AddTask { cmd, name } => {
         let label =
           self.unique_label(&name.unwrap_or_else(|| cmd.clone()), None);
+        // Taken while a task is there or under it.
         let path = unique(&path_name(&label), |path| {
           self
             .state
             .tasks
             .iter()
-            .any(|t| t.path.as_ref().is_some_and(|p| p.as_str() == path))
+            .any(|t| t.path.components().next() == Some(path))
         });
         let argv = if self.config.system_shell {
           Ok(crate::parse_shell::system_argv(&cmd))
@@ -726,14 +701,14 @@ impl App {
     issue(&self.pc, &self.config, command);
   }
 
-  fn issue_current(
-    &self,
-    current: Option<TaskId>,
-    make: fn(Target) -> Command,
-  ) {
-    if let Some(id) = current {
-      self.issue(make(Target::Id(id)));
-    }
+  /// Runs a command on the selected task or every task in the selected group.
+  fn issue_selected(&self, make: fn(Target) -> Command) {
+    let target = match self.state.tasks.selected() {
+      Some((_, Node::Task(task))) => Target::Id(task.id),
+      Some((path, Node::Group(_))) => Target::glob(&format!("{path}/**")),
+      None => return,
+    };
+    self.issue(make(target));
   }
 
   fn issue_all(&self, make: fn(Target) -> Command) {
@@ -750,7 +725,7 @@ impl App {
     match notify {
       ScreenNotify::Attached | ScreenNotify::Render | ScreenNotify::Bell => (),
       ScreenNotify::CopyPresent { screen, vt } => {
-        if let Some(task) = self.state.task_mut(screen) {
+        if let Some(task) = self.state.tasks.task_mut(screen) {
           task.present = vt;
         }
       }
@@ -768,26 +743,15 @@ impl App {
       TaskNotify::Added {
         path,
         label,
+        after,
         kind,
         state,
         vt,
-      } => self.add_task(id, label, path, kind, state, vt),
-      TaskNotify::StateChanged(state) => {
-        if let Some(task) = self.state.task_mut(id) {
-          task.status = state;
-        }
-      }
-      TaskNotify::Removed => {
-        let index = self.state.tasks.iter().position(|t| t.id == id);
-        self.state.tasks.retain(|t| t.id != id);
-        let selected = self.state.selected();
-        match index {
-          Some(index) if index < selected => self.state.select(selected - 1),
-          _ => self.state.select(selected),
-        }
-      }
+      } => self.add_task(id, label, path, after, kind, state, vt),
+      TaskNotify::StateChanged(state) => self.state.tasks.set_status(id, state),
+      TaskNotify::Removed => self.state.tasks.remove(id),
       TaskNotify::LabelChanged(label) => {
-        if let Some(task) = self.state.task_mut(id) {
+        if let Some(task) = self.state.tasks.task_mut(id) {
           task.label = label;
         }
       }

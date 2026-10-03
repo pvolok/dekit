@@ -1,11 +1,23 @@
-use std::fmt;
+use std::{cmp::Ordering, fmt};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(
-  Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+/// Ordered component by component, so a path comes right before
+/// everything under it: `a`, `a/b`, `a-b`.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct TaskPath(String);
+
+impl Ord for TaskPath {
+  fn cmp(&self, other: &Self) -> Ordering {
+    self.components().cmp(other.components())
+  }
+}
+
+impl PartialOrd for TaskPath {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
 
 #[derive(Debug)]
 pub struct InvalidPath(pub String);
@@ -20,6 +32,32 @@ impl std::error::Error for InvalidPath {}
 
 pub fn is_valid_component_char(c: char) -> bool {
   c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+}
+
+/// A path component made from free text, such as an mprocs name or a
+/// shell command: every other character becomes `_`, as in log file
+/// names, so a name and its path give the same log file.
+pub fn path_name(text: &str) -> String {
+  let name: String = text
+    .chars()
+    .map(|c| if is_valid_component_char(c) { c } else { '_' })
+    .collect();
+  if name.is_empty() {
+    "task".to_string()
+  } else {
+    name
+  }
+}
+
+/// `base`, or `base-2`, `base-3`, ... — the first that is not `taken`.
+pub fn unique(base: &str, taken: impl Fn(&str) -> bool) -> String {
+  if !taken(base) {
+    return base.to_string();
+  }
+  (2..)
+    .map(|n| format!("{}-{}", base, n))
+    .find(|name| !taken(name))
+    .unwrap()
 }
 
 impl TaskPath {
@@ -209,6 +247,17 @@ mod tests {
 
     let p = TaskPath::new("services/api").unwrap();
     assert_eq!(p.components().collect::<Vec<_>>(), vec!["services", "api"]);
+  }
+
+  #[test]
+  fn sorts_a_path_before_everything_under_it() {
+    let mut paths: Vec<TaskPath> = ["b", "a-b", "a/c", "a", "a/b/c", "a.b"]
+      .into_iter()
+      .map(|p| TaskPath::new(p).unwrap())
+      .collect();
+    paths.sort();
+    let paths: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
+    assert_eq!(paths, ["a", "a/b/c", "a/c", "a-b", "a.b", "b"]);
   }
 
   #[test]

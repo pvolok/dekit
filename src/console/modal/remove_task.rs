@@ -38,8 +38,7 @@ impl Modal for RemoveTaskModal {
 
   fn render(&mut self, grid: &mut Grid, _keymap: &Keymap) {
     let area = self.area(grid.area());
-    grid.draw_block(area, &BorderType::Thick.chars(), Attrs::default());
-    let inner = area.inner(1);
+    let inner = grid.block(area, BorderType::Thick).inner();
     grid.fill_area(inner, ' ', Attrs::default());
     grid.draw_text(inner, "Remove task? (y/n)", Attrs::default());
   }

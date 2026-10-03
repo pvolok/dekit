@@ -39,7 +39,8 @@ use crate::{
   },
   task::{
     config_tasks::{
-      config_task_registration, config_task_resumed, resolve_task_deps,
+      Listed, config_task_registration, config_task_resumed, list_order,
+      resolve_task_deps,
     },
     process_task::{process_task_from_snapshot, resumed_instance},
   },
@@ -246,10 +247,12 @@ impl Task for Unstarted {
 /// around the saved child and screen, a config task the snapshot lacks
 /// is added idle, and a saved task the config lacks stays as saved. So a
 /// restart or upgrade applies an edited `dekit.yaml` without touching a
-/// running child; its new command is used at the next start.
+/// running child; its new command is used at the next start. A config
+/// task above or under a saved task is left out, with a warning.
 struct Prepared<'a> {
   next_task_id: usize,
   tasks: Vec<(Option<&'a snap::Task>, TaskRegistration)>,
+  warnings: Vec<String>,
   console: TaskId,
   connections: Vec<Connection>,
 }
@@ -275,7 +278,8 @@ fn prepare<'a>(
   snapshot: &'a snap::Snapshot,
   config: &Arc<Config>,
 ) -> anyhow::Result<Prepared<'a>> {
-  let mut tasks = Vec::with_capacity(snapshot.tasks.len());
+  let mut from_config = Vec::with_capacity(config.tasks.len());
+  let mut from_snapshot = HashMap::new();
   let mut console = None;
 
   // Config tasks first: a saved one keeps its id, a new one takes the
@@ -298,21 +302,43 @@ fn prepare<'a>(
       }
     })
     .collect();
-  let deps_by_task = resolve_task_deps(&config.tasks, &ids)?;
-  let mut from_config = HashSet::new();
+  let deps_by_task = resolve_task_deps(config, &ids)?;
+  let (order, left_out) = list_order(config, &snapshot.tasks);
+  let mut warnings = Vec::new();
+  let mut dropped = HashSet::new();
+  for (i, j) in left_out {
+    let saved = &snapshot.tasks[j];
+    warnings.push(format!(
+      "config task {} not added: it would be above or under saved task {}",
+      config.tasks[i].path,
+      saved.path.as_deref().unwrap_or_default()
+    ));
+    dropped.insert(ids[i]);
+  }
+  let mut in_config = HashSet::new();
   for (i, cfg) in config.tasks.iter().enumerate() {
-    let deps = deps_by_task[i]
-      .iter()
-      .copied()
-      .map(TaskSelector::Id)
-      .collect();
+    if dropped.contains(&ids[i]) {
+      from_config.push(None);
+      continue;
+    }
+    let mut deps = Vec::new();
+    for (dep, dep_id) in cfg.deps.iter().zip(&deps_by_task[i]) {
+      if dropped.contains(dep_id) {
+        warnings.push(format!(
+          "task {}: dropped its dependency on {dep}, which was left out",
+          cfg.path
+        ));
+      } else {
+        deps.push(TaskSelector::Id(*dep_id));
+      }
+    }
     let saved = saved_by_path.get(cfg.path.as_str()).copied();
     let registration = match saved {
       Some(saved) => {
         let snap::TaskKind::Process(process) = &saved.kind else {
           anyhow::bail!("task {} is not a process task", cfg.path);
         };
-        from_config.insert(saved.id);
+        in_config.insert(saved.id);
         config_task_resumed(
           config,
           cfg.clone(),
@@ -334,11 +360,11 @@ fn prepare<'a>(
         false,
       ),
     };
-    tasks.push((saved, registration));
+    from_config.push(Some((saved, registration)));
   }
 
-  for task in &snapshot.tasks {
-    if from_config.contains(&task.id) {
+  for (j, task) in snapshot.tasks.iter().enumerate() {
+    if in_config.contains(&task.id) {
       continue;
     }
     let space = if task.space.is_empty() {
@@ -378,8 +404,15 @@ fn prepare<'a>(
         )
       }
     };
-    tasks.push((Some(task), registration));
+    from_snapshot.insert(j, (Some(task), registration));
   }
+  let tasks = order
+    .into_iter()
+    .filter_map(|entry| match entry {
+      Listed::Config(i) => from_config[i].take(),
+      Listed::Saved(j) => from_snapshot.remove(&j),
+    })
+    .collect();
   let console =
     console.ok_or_else(|| anyhow::anyhow!("snapshot has no console"))?;
 
@@ -418,6 +451,7 @@ fn prepare<'a>(
   Ok(Prepared {
     next_task_id,
     tasks,
+    warnings,
     console,
     connections,
   })
@@ -442,8 +476,10 @@ fn take_over(
   let mut kernel = Kernel::new();
   kernel.save_on_quit(crate::dekit::server::save_on_quit(runner));
   kernel.restore(prepared.next_task_id, prepared.tasks)?;
+  let mut warnings = config.warnings.clone();
+  warnings.extend(prepared.warnings);
   // Before the upgrade is answered: its requester reads the record next.
-  lock_guard.publish(runner, &config.warnings)?;
+  lock_guard.publish(runner, &warnings)?;
   Ok((
     kernel,
     prepared.console,

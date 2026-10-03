@@ -42,12 +42,10 @@ impl Modal for RenameTaskModal {
 
   fn render(&mut self, grid: &mut Grid, _keymap: &Keymap) {
     let area = self.area(grid.area());
-    grid.draw_block(area, &BorderType::Thick.chars(), Attrs::default());
-    grid.draw_text(
-      Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
-      "Rename task",
-      Attrs::default(),
-    );
-    grid.cursor_pos = Some(render_text_input(&self.input, area.inner(1), grid));
+    let inner = grid
+      .block(area, BorderType::Thick)
+      .title("Rename task", Attrs::default())
+      .inner();
+    grid.cursor_pos = Some(render_text_input(&self.input, inner, grid));
   }
 }

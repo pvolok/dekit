@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
   kernel_message::SpaceSelector,
-  path_trie::{PathConflictError, PathTrie},
+  path_trie::{PathConflict, PathTrie},
   sub_trie::{SubMode, SubTrie},
   task::TaskId,
   task_key::{TaskKey, TaskSpaceId},
@@ -51,8 +51,12 @@ impl Namespace {
     &mut self,
     key: &TaskKey,
     id: TaskId,
-  ) -> Result<(), PathConflictError> {
-    self.space_mut(&key.space).paths.insert(&key.path, id)
+    after: Option<&TaskPath>,
+  ) -> Result<(), PathConflict> {
+    self
+      .space_mut(&key.space)
+      .paths
+      .insert(&key.path, id, after)
   }
 
   pub fn remove(&mut self, key: &TaskKey) -> Option<TaskId> {
@@ -60,6 +64,30 @@ impl Namespace {
       .spaces
       .get_mut(&key.space)
       .and_then(|space| space.paths.remove(&key.path))
+  }
+
+  pub fn place(&mut self, key: &TaskKey) {
+    self.space_mut(&key.space).paths.place(&key.path);
+  }
+
+  pub fn prune(&mut self, key: &TaskKey) {
+    if let Some(space) = self.spaces.get_mut(&key.space) {
+      space.paths.prune(&key.path);
+    }
+  }
+
+  /// The task listed just before the one at `key`.
+  pub fn before(&self, key: &TaskKey) -> Option<TaskId> {
+    self.spaces.get(&key.space)?.paths.before(&key.path)
+  }
+
+  /// See `PathTrie::position`.
+  pub fn position(
+    &self,
+    space: &TaskSpaceId,
+    path: &TaskPath,
+  ) -> Option<Vec<usize>> {
+    self.spaces.get(space)?.paths.position(path)
   }
 
   pub fn glob(&self, space: &SpaceSelector, pattern: &str) -> Vec<TaskId> {

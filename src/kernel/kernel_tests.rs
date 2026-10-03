@@ -278,6 +278,19 @@ async fn registration_ack_reports_the_outcome() {
       .spawn_async_with_id(fx.pc.alloc_id(), path_def("y"), |_, _| async {});
   assert_eq!(free.await, Ok(Ok(())));
 
+  let under = fx.pc.spawn_async_with_id(
+    fx.pc.alloc_id(),
+    path_def("x/a"),
+    |_, _| async {},
+  );
+  let Ok(Err(err)) = under.await else {
+    panic!("expected a refusal");
+  };
+  assert_eq!(
+    err.to_string(),
+    "a task can't have tasks under it: 'x/a' is under 'x'"
+  );
+
   fx.quit(handle).await;
 }
 
@@ -968,6 +981,132 @@ fn add_edge_to_unregistered_id_is_refused() {
   assert!(fx.rx.try_recv().is_err(), "task was disturbed");
 }
 
+/// A batch is listed in the order given, whatever order its dependencies
+/// register it in. A refused task leaves no place behind, and a task
+/// that names another is listed right after it.
+#[tokio::test]
+async fn lists_a_batch_in_the_order_given() {
+  let mut fx = Fixture::new();
+  let handle = fx.run();
+  let pc = fx.pc.clone();
+
+  let (tx, mut added) = unbounded_channel();
+  let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
+  let ack = pc.spawn_async_with_id(
+    pc.alloc_id(),
+    TaskDef::default(),
+    move |pc, mut cmds| async move {
+      pc.subscribe_path(
+        TaskKey::default_space(TaskPath::root()),
+        SubMode::Subtree,
+      );
+      subscribed_tx.send(()).unwrap();
+      while let Some(cmd) = cmds.recv().await {
+        match cmd {
+          TaskCmd::Freeze(number) => pc.send(KernelCommand::TaskFrozen(
+            number,
+            TaskKindSnapshot::Console {},
+          )),
+          TaskCmd::Msg(msg) => {
+            if let Ok(n) = msg.downcast::<TaskNotification>()
+              && let TaskNotify::Added { after, .. } = n.notify
+            {
+              tx.send((n.from, after)).unwrap();
+            }
+          }
+          TaskCmd::Start
+          | TaskCmd::Stop
+          | TaskCmd::Kill
+          | TaskCmd::Duplicate(_)
+          | TaskCmd::Thaw => (),
+        }
+      }
+    },
+  );
+  assert!(ack.await.unwrap().is_ok());
+  subscribed_rx.await.unwrap();
+
+  let registration = |id: TaskId, def: TaskDef| {
+    let tx = fx.tx.clone();
+    TaskRegistration {
+      task_id: id,
+      def,
+      factory: Box::new(move |ctx| {
+        Box::new(RecordingTask {
+          name: "task",
+          tx,
+          ctx,
+        })
+      }),
+    }
+  };
+  let ids: Vec<TaskId> = (0..5).map(|_| pc.alloc_id()).collect();
+  let [refused, web, api_a, db, api_b] = ids[..] else {
+    unreachable!()
+  };
+  let needs = |path: &str, dep: TaskId| TaskDef {
+    deps: vec![TaskSelector::Id(dep)],
+    ..path_def(path)
+  };
+  let results = pc
+    .register_tasks(vec![
+      registration(refused, needs("gone/x", TaskId(usize::MAX))),
+      registration(web, needs("web", db)),
+      registration(api_a, needs("api/a", db)),
+      registration(db, path_def("db")),
+      registration(api_b, path_def("api/b")),
+    ])
+    .await
+    .unwrap();
+  let registered: Vec<bool> = results.iter().map(Result::is_ok).collect();
+  assert_eq!(registered, [false, true, true, true, true]);
+
+  // Each task is announced with the task listed before it at that time.
+  let mut announced = Vec::new();
+  for _ in 0..4 {
+    announced.push(added.recv().await.unwrap());
+  }
+  assert_eq!(
+    announced,
+    [(db, None), (api_b, None), (web, None), (api_a, Some(web))]
+  );
+
+  let copy = pc.alloc_id();
+  let def = TaskDef {
+    after: Some(api_a),
+    ..path_def("api/a-2")
+  };
+  let ack = pc.register_task(registration(copy, def));
+  assert!(ack.await.unwrap().is_ok());
+  assert_eq!(added.recv().await.unwrap(), (copy, Some(api_a)));
+  let last = pc.alloc_id();
+  let ack = pc.register_task(registration(last, path_def("gone/y")));
+  assert!(ack.await.unwrap().is_ok());
+  assert_eq!(added.recv().await.unwrap(), (last, Some(db)));
+
+  let listed = ["web", "api/a", "api/a-2", "api/b", "db", "gone/y"];
+  let rx = pc.query(KernelQuery::ListTasks(TaskSelector::Glob(
+    SpaceSelector::default_space(),
+    "**".to_string(),
+  )));
+  let KernelQueryResponse::TaskList(tasks) = rx.await.unwrap() else {
+    panic!("unexpected query response");
+  };
+  let names: Vec<String> = tasks.iter().map(|task| task.name()).collect();
+  assert_eq!(names, listed);
+
+  let snapshot = freeze(&fx).await;
+  let saved: Vec<&str> = snapshot
+    .tasks
+    .iter()
+    .filter_map(|task| task.path.as_deref())
+    .collect();
+  assert_eq!(saved, listed);
+
+  fx.pc.send(KernelCommand::Thaw);
+  fx.quit(handle).await;
+}
+
 async fn label_of(pc: &TaskContext, id: TaskId) -> Option<String> {
   let rx = pc.query(KernelQuery::ListTasks(TaskSelector::all()));
   let resp = tokio::time::timeout(Duration::from_secs(1), rx)
@@ -1589,14 +1728,15 @@ async fn explain_reports_block_reason() {
   assert!(!explain.supported);
   assert!(explain.pinned);
   assert!(!explain.vetoed);
-  assert_eq!(explain.required_by, ["a-user", "b-user", "c-user"]);
+  // In list order: without an order, as the tasks were created.
+  assert_eq!(explain.required_by, ["c-user", "a-user", "b-user"]);
   assert_eq!(explain.deps.len(), 2);
-  assert_eq!(explain.deps[0].name, "base");
-  assert!(explain.deps[0].satisfied);
-  assert_eq!(explain.deps[1].name, "dep");
-  assert_eq!(explain.deps[1].state, TaskState::Running);
-  assert!(explain.deps[1].wanted);
-  assert!(!explain.deps[1].satisfied);
+  assert_eq!(explain.deps[0].name, "dep");
+  assert_eq!(explain.deps[0].state, TaskState::Running);
+  assert!(explain.deps[0].wanted);
+  assert!(!explain.deps[0].satisfied);
+  assert_eq!(explain.deps[1].name, "base");
+  assert!(explain.deps[1].satisfied);
 
   fx.quit(handle).await;
 }

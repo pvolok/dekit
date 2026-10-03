@@ -1,3 +1,5 @@
+use unicode_width::UnicodeWidthStr;
+
 use crate::console::action::Action;
 use crate::console::{
   keymap::{Keymap, KeymapGroup},
@@ -19,12 +21,10 @@ pub fn render_keymap(
     return;
   }
 
-  grid.draw_block(area, &BorderType::Plain.chars(), Attrs::default());
-  grid.draw_text(
-    Rect::new(area.x + 1, area.y, area.width - 2, 1),
-    "Help",
-    Attrs::default(),
-  );
+  let mut line = grid
+    .block(area, BorderType::Plain)
+    .title("Help", Attrs::default())
+    .inner();
 
   let group = state.keymap_group();
   let items: &[Action] = match group {
@@ -48,7 +48,6 @@ pub fn render_keymap(
     ],
   };
 
-  let mut line = area.inner(1);
   let plain = Attrs::default();
   let yellow = Attrs::default().fg(Color::YELLOW);
   for action in items {
@@ -60,7 +59,7 @@ pub fn render_keymap(
       (key.to_string(), yellow),
       (format!(": {}> ", action.desc()), plain),
     ] {
-      line = line.move_left(grid.draw_text(line, &text, attrs).width as i32);
+      grid.draw_text(line.take_left(text.width() as u16), &text, attrs);
     }
   }
 }

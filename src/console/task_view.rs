@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::kernel::{
   kernel_message::SharedVt,
   task::{TaskId, TaskKind, TaskState},
@@ -7,7 +9,7 @@ use crate::kernel::{
 pub struct TaskView {
   pub id: TaskId,
   pub label: Option<String>,
-  pub path: Option<TaskPath>,
+  pub path: Arc<TaskPath>,
   pub kind: TaskKind,
   pub status: TaskState,
   pub vt: SharedVt,
@@ -20,8 +22,7 @@ impl TaskView {
     self
       .label
       .clone()
-      .or_else(|| self.path.as_ref().map(|p| p.name().to_string()))
-      .unwrap_or_else(|| format!("task-{}", self.id.0))
+      .unwrap_or_else(|| self.path.name().to_string())
   }
 
   pub fn exit_code(&self) -> Option<i32> {
@@ -39,5 +40,21 @@ impl TaskView {
 
   pub fn is_up(&self) -> bool {
     self.status.is_active()
+  }
+
+  /// Ended badly: a non-zero exit, or not ready in time.
+  pub fn failed(&self) -> bool {
+    match self.status {
+      TaskState::Done(info)
+      | TaskState::Exited(info)
+      | TaskState::Backoff(info) => {
+        info.ready_timeout || info.code.is_some_and(|code| code != 0)
+      }
+      TaskState::Idle
+      | TaskState::Starting
+      | TaskState::Running
+      | TaskState::Ready
+      | TaskState::Stopping => false,
+    }
   }
 }

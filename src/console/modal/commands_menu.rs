@@ -1,4 +1,5 @@
 use tui_input::Input;
+use unicode_width::UnicodeWidthStr;
 
 use crate::console::action::{Action, ScrollUnit};
 use crate::console::{
@@ -32,38 +33,43 @@ struct MenuItem {
 
 impl CommandsMenuModal {
   pub fn new() -> Self {
+    let items = menu_items("");
+    let mut list = ListState::new(0);
+    list.reset(items.len());
     CommandsMenuModal {
       input: Input::default(),
-      list: ListState::default(),
-      items: menu_items(""),
+      list,
+      items,
     }
   }
 }
 
 impl Modal for CommandsMenuModal {
   fn handle_key(&mut self, key: &Key) -> ModalResult {
-    let count = self.items.len();
     match (key.code, key.mods) {
       (KeyCode::Enter, KeyMods::NONE) => {
-        return match self.items.get(self.list.selected()) {
+        let item = self.list.selected().and_then(|i| self.items.get(i));
+        return match item {
           Some(item) => ModalResult::Run(item.action.clone()),
           None => ModalResult::Close,
         };
       }
       (KeyCode::Esc, KeyMods::NONE) => return ModalResult::Close,
       (KeyCode::Up, KeyMods::NONE) | (KeyCode::Char('p'), KeyMods::CONTROL) => {
-        if count > 0 {
-          self
-            .list
-            .select((self.list.selected() + count - 1) % count, count);
-        }
+        self.list.prev();
         return ModalResult::Keep;
       }
       (KeyCode::Down, KeyMods::NONE)
       | (KeyCode::Char('n'), KeyMods::CONTROL) => {
-        if count > 0 {
-          self.list.select((self.list.selected() + 1) % count, count);
-        }
+        self.list.next();
+        return ModalResult::Keep;
+      }
+      (KeyCode::PageUp, KeyMods::NONE) => {
+        self.list.move_by(-(self.list.page() as isize));
+        return ModalResult::Keep;
+      }
+      (KeyCode::PageDown, KeyMods::NONE) => {
+        self.list.move_by(self.list.page() as isize);
         return ModalResult::Keep;
       }
       _ => (),
@@ -72,6 +78,7 @@ impl Modal for CommandsMenuModal {
       && self.input.handle(req).is_some_and(|change| change.value)
     {
       self.items = menu_items(&self.input.value().to_lowercase());
+      self.list.reset(self.items.len());
     }
     ModalResult::Keep
   }
@@ -82,120 +89,88 @@ impl Modal for CommandsMenuModal {
 
   fn render(&mut self, grid: &mut Grid, keymap: &Keymap) {
     let area = self.area(grid.area());
-    let inner = area.inner(1);
-    grid.draw_block(area, &BorderType::Rounded.chars(), Attrs::default());
+    let mut inner = grid
+      .block(area, BorderType::Rounded)
+      .gap(1)
+      .title(" Commands ", Attrs::default().set_bold(true))
+      .inner();
     grid.fill_area(inner, ' ', Attrs::default());
-    grid.draw_text(
-      Rect::new(area.x + 2, area.y, inner.width, 1),
-      " Commands ",
-      Attrs::default().set_bold(true),
-    );
 
-    let (top, list_area) = inner.split_h(2);
-    let (input_row, sep_row) = top.split_h(1);
-    self.list.fit(list_area, self.items.len());
+    let mut input_row = inner.take_top(1);
+    let sep_row = inner.take_top(1);
+    let list_area = inner;
 
     // Input row: "/ <input>   selected/total"
-    let counter = if self.items.is_empty() {
-      String::new()
-    } else {
-      format!("{}/{}", self.list.selected() + 1, self.items.len())
+    let counter = match self.list.selected() {
+      Some(i) => format!("{}/{}", i + 1, self.items.len()),
+      None => String::new(),
     };
-    let counter_width = counter.len() as u16;
     grid.draw_text(
-      Rect::new(
-        input_row.right().saturating_sub(counter_width),
-        input_row.y,
-        counter_width,
-        1,
-      ),
+      input_row.take_left(2),
+      "/ ",
+      Attrs::default().fg(Color::YELLOW),
+    );
+    grid.draw_text(
+      input_row.take_right(counter.width() as u16),
       &counter,
       Attrs::default().fg(Color::BRIGHT_BLACK),
     );
-    grid.draw_text(input_row, "/ ", Attrs::default().fg(Color::YELLOW));
-    let input_area = Rect::new(
-      input_row.x + 2,
-      input_row.y,
-      input_row.width.saturating_sub(3 + counter_width),
-      1,
-    );
+    let input_area = input_row.inner((0, 1, 0, 0));
     grid.cursor_pos = Some(render_text_input(&self.input, input_area, grid));
     grid.cursor_style = CursorStyle::BlinkingBar;
 
-    // Separator
+    // Separator, joined to the border on both sides
+    let mut sep = Rect {
+      x: area.x,
+      width: area.width,
+      ..sep_row
+    };
+    grid.draw_text(sep.take_left(1), VERTICAL_RIGHT, Attrs::default());
+    grid.draw_text(sep.take_right(1), VERTICAL_LEFT, Attrs::default());
     grid.draw_text(
-      Rect::new(area.x, sep_row.y, 1, 1),
-      VERTICAL_RIGHT,
-      Attrs::default(),
-    );
-    grid.draw_text(
-      Rect::new(area.right() - 1, sep_row.y, 1, 1),
-      VERTICAL_LEFT,
-      Attrs::default(),
-    );
-    grid.draw_text(
-      sep_row,
-      &HORIZONTAL.repeat(sep_row.width as usize),
+      sep,
+      &HORIZONTAL.repeat(sep.width as usize),
       Attrs::default(),
     );
 
     // List
     let search = self.input.value().to_lowercase();
-    for (row, i) in self.list.visible_range().enumerate() {
-      let item = &self.items[i];
-      let Some(row_rect) = list_area.row(row as u16) else {
-        break;
-      };
-      let bg = if self.list.selected() == i {
+    for row in self.list.rows(list_area) {
+      let item = &self.items[row.index];
+      let bg = if row.selected {
         Color::Rgb(100, 100, 100)
       } else {
         Color::Default
       };
       let base = Attrs::default().bg(bg);
       let hl = Attrs::default().bg(bg).fg(Color::YELLOW);
-      if self.list.selected() == i {
-        grid.fill_area(row_rect, ' ', base);
-        grid.draw_text(row_rect, "\u{258e}", hl);
+      if row.selected {
+        grid.fill_area(row.area, ' ', base);
+        grid.draw_text(row.area, "\u{258e}", hl);
       }
 
-      let name = Rect::new(row_rect.x + 2, row_rect.y, 20, 1);
+      // The description gets what the name and the key leave.
+      let mut rest = row.area.inner((0, 1, 0, 2));
       draw_highlighted(
         grid,
-        name,
+        rest.take_left(20),
         &item.name,
         &search,
         Attrs::default().bg(bg).set_bold(true),
         Attrs::default().bg(bg).fg(Color::YELLOW).set_bold(true),
       );
-      let desc = Rect::new(
-        row_rect.x + 22,
-        row_rect.y,
-        row_rect.width.saturating_sub(22),
-        1,
-      );
+      if let Some(key) = keymap.key(KeymapGroup::Tasks, &item.action) {
+        let key = key.to_string();
+        grid.draw_text(rest.take_right(key.width() as u16), &key, hl);
+      }
       draw_highlighted(
         grid,
-        desc,
+        rest,
         &item.desc,
         &search,
         Attrs::default().bg(bg).fg(Color::Rgb(160, 160, 160)),
         hl,
       );
-
-      if let Some(key) = keymap.key(KeymapGroup::Tasks, &item.action) {
-        let key = key.to_string();
-        let width = key.len() as u16;
-        grid.draw_text(
-          Rect::new(
-            row_rect.right().saturating_sub(width + 1),
-            row_rect.y,
-            width,
-            1,
-          ),
-          &key,
-          hl,
-        );
-      }
     }
   }
 }
@@ -209,8 +184,7 @@ fn draw_highlighted(
   hl: Attrs,
 ) {
   let mut draw = |area: &mut Rect, s: &str, attrs: Attrs| {
-    let r = grid.draw_text(*area, s, attrs);
-    *area = area.move_left(r.width as i32);
+    grid.draw_text(area.take_left(s.width() as u16), s, attrs);
   };
   if search.is_empty() {
     draw(&mut area, text, base);
@@ -243,6 +217,8 @@ fn menu_items(search: &str) -> Vec<MenuItem> {
     Action::ShowCommandsMenu,
     Action::NextTask,
     Action::PrevTask,
+    Action::Expand,
+    Action::Collapse,
     Action::StartTask,
     Action::StopTask,
     Action::KillTask,

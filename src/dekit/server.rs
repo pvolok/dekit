@@ -801,9 +801,9 @@ async fn handle_rpc(
           CommandError::Register(RegisterError::MissingDep(_)) => {
             codes::NO_MATCH
           }
-          CommandError::Register(RegisterError::PathTaken(_)) => {
-            codes::PATH_TAKEN
-          }
+          CommandError::Register(
+            RegisterError::PathTaken(_) | RegisterError::PathNested(..),
+          ) => codes::PATH_TAKEN,
           CommandError::Register(RegisterError::ReservedSpace(_)) => {
             codes::BAD_TARGET
           }

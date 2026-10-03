@@ -21,5 +21,5 @@ load:
 write `deps: [/db]` for the project's own `db`.
 
 A glob that matches no file is an error, and so are two tasks with the
-same path. A fragment must be inside the project and must not be named
+same path and a task under another, like `web` with `web/dev`. A fragment must be inside the project and must not be named
 `dekit.yaml`.

@@ -21,9 +21,10 @@ impl AppLayout {
       config.tui.sidebar.width as u16
     };
     let zoom_banner_h = if zoom && config.tui.zoom_tip { 1 } else { 0 };
-    let (top, keymap) = area.split_h(area.height.saturating_sub(keymap_h));
-    let (sidebar, term) = top.split_v(sidebar_w);
-    let (zoom_banner, term) = term.split_h(zoom_banner_h);
+    let mut term = area;
+    let keymap = term.take_bottom(keymap_h);
+    let sidebar = term.take_left(sidebar_w);
+    let zoom_banner = term.take_top(zoom_banner_h);
 
     Self {
       sidebar,

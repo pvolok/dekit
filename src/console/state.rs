@@ -1,7 +1,6 @@
 use crate::console::{
-  keymap::KeymapGroup, task_view::TaskView, widgets::list::ListState,
+  keymap::KeymapGroup, task_tree::TaskTree, task_view::TaskView,
 };
-use crate::kernel::task::TaskId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Scope {
@@ -38,27 +37,14 @@ impl Scope {
 
 pub struct State {
   pub scope: Scope,
-  pub tasks: Vec<TaskView>,
-  pub tasks_list: ListState,
+  pub tasks: TaskTree,
   pub hide_keymap_window: bool,
   pub quitting: bool,
 }
 
 impl State {
-  pub fn selected(&self) -> usize {
-    self.tasks_list.selected()
-  }
-
-  pub fn select(&mut self, index: usize) {
-    self.tasks_list.select(index, self.tasks.len());
-  }
-
   pub fn current_task(&self) -> Option<&TaskView> {
-    self.tasks.get(self.tasks_list.selected())
-  }
-
-  pub fn task_mut(&mut self, id: TaskId) -> Option<&mut TaskView> {
-    self.tasks.iter_mut().find(|t| t.id == id)
+    self.tasks.current()
   }
 
   pub fn keymap_group(&self) -> KeymapGroup {
