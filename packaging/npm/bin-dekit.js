@@ -17,7 +17,7 @@ try {
   binary = path.join(path.dirname(packageJson), 'bin', binName);
 } catch (error) {
   console.error(`dekit: no prebuilt binary for ${process.platform} ${process.arch} (missing ${pkg})`);
-  console.error('dekit: reinstall with npm install -g dekit, or see https://github.com/pvolok/dekit');
+  console.error('dekit: reinstall with npm install -g @dekit/cli, or see https://dekit.run');
   process.exit(1);
 }
 

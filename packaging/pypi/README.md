@@ -7,22 +7,21 @@ dekit runs your project's tasks, such as servers, databases and workers, in deve
 ## Install
 
 ```sh
-npm install -g @dekit/cli
+pip install dekit-cli
 ```
 
-This installs the `dekit` command. The `@dekit/cli` package is a small JavaScript launcher plus a platform-specific optional dependency containing the native binary. It does not run install scripts.
+Or as a tool, with uv or pipx:
 
-Supported npm platforms:
+```sh
+uv tool install dekit-cli
+pipx install dekit-cli
+```
 
-- macOS arm64: `@dekit/dekit-darwin-arm64`
-- macOS x64: `@dekit/dekit-darwin-x64`
-- Linux arm64: `@dekit/dekit-linux-arm64`
-- Linux x64: `@dekit/dekit-linux-x64`
-- Windows x64: `@dekit/dekit-win32-x64`
+This installs the `dekit` command, a native binary. Wheels are published for macOS (arm64, x64), Linux (arm64, x64) and Windows (x64).
 
-dekit also installs with a script (`curl -fsSL https://dekit.run/install.sh | sh`, or `irm https://dekit.run/install.ps1 | iex` on Windows) or from PyPI (`pip install dekit-cli`).
+dekit also installs with a script (`curl -fsSL https://dekit.run/install.sh | sh`, or `irm https://dekit.run/install.ps1 | iex` on Windows) or from npm (`npm install -g @dekit/cli`).
 
-`dekit update` updates only a dekit from the script. Update this one with `npm install -g @dekit/cli@latest`, then run `dekit runner upgrade --all` to switch running runners to it.
+`dekit update` updates only a dekit from the script. Update this one with `pip install -U dekit-cli` (or `uv tool upgrade dekit-cli`), then run `dekit runner upgrade --all` to switch running runners to it.
 
 ## Quick start
 

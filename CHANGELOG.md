@@ -1,5 +1,20 @@
 ## Unreleased
 
+## 0.10.1 - 2026-10-08
+
+- Install from npm (`npm install -g @dekit/cli`) or PyPI
+  (`pip install dekit-cli`)
+- The console groups tasks by path: `web/api` and `web/ui` sit under a
+  `web/` group that collapses and expands with `<h>` and `<l>`
+- `dekit ls` and the console list tasks in the order of `dekit.yaml`
+- `q` in the console asks how to quit: `q` down, `x` quit without saving,
+  `d` detach
+- `dekit` with no command starts the runner like `dekit up` when it is not
+  running
+- A binary started as `mprocs` (through a link) runs `dekit mprocs`
+- `dekit update` updates only a dekit from the install script; for other
+  installs it says to update that way
+
 ## 0.10.0 - 2026-09-28
 
 First release of dekit, the next version of mprocs under a new name. It

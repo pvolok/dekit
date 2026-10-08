@@ -32,6 +32,18 @@ Windows (PowerShell):
 irm https://dekit.run/install.ps1 | iex
 ```
 
+npm:
+
+```sh
+npm install -g @dekit/cli
+```
+
+PyPI:
+
+```sh
+pip install dekit-cli
+```
+
 ## Quick start
 
 `dekit.yaml` at the project root:

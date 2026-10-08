@@ -1,5 +1,7 @@
 {
   "package": "dekit",
+  "npmPackage": "@dekit/cli",
+  "pypiPackage": "dekit-cli",
   "platforms": [
     {
       "target": "x86_64-unknown-linux-musl",
@@ -9,7 +11,8 @@
       "binary": "dekit",
       "npmPackage": "@dekit/dekit-linux-x64",
       "npmOs": "linux",
-      "npmCpu": "x64"
+      "npmCpu": "x64",
+      "pypiPlatform": "manylinux_2_17_x86_64.manylinux2014_x86_64.musllinux_1_1_x86_64"
     },
     {
       "target": "aarch64-unknown-linux-musl",
@@ -19,7 +22,8 @@
       "binary": "dekit",
       "npmPackage": "@dekit/dekit-linux-arm64",
       "npmOs": "linux",
-      "npmCpu": "arm64"
+      "npmCpu": "arm64",
+      "pypiPlatform": "manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64"
     },
     {
       "target": "x86_64-apple-darwin",
@@ -29,7 +33,8 @@
       "binary": "dekit",
       "npmPackage": "@dekit/dekit-darwin-x64",
       "npmOs": "darwin",
-      "npmCpu": "x64"
+      "npmCpu": "x64",
+      "pypiPlatform": "macosx_10_12_x86_64"
     },
     {
       "target": "aarch64-apple-darwin",
@@ -39,7 +44,8 @@
       "binary": "dekit",
       "npmPackage": "@dekit/dekit-darwin-arm64",
       "npmOs": "darwin",
-      "npmCpu": "arm64"
+      "npmCpu": "arm64",
+      "pypiPlatform": "macosx_11_0_arm64"
     },
     {
       "target": "x86_64-pc-windows-msvc",
@@ -49,7 +55,8 @@
       "binary": "dekit.exe",
       "npmPackage": "@dekit/dekit-win32-x64",
       "npmOs": "win32",
-      "npmCpu": "x64"
+      "npmCpu": "x64",
+      "pypiPlatform": "win_amd64"
     }
   ]
 }

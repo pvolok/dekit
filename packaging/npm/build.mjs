@@ -45,8 +45,8 @@ function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-// `npm pack` of a scoped package @dekit/dekit-linux-x64 produces
-// dekit-dekit-linux-x64-<version>.tgz; the root package produces dekit-<version>.tgz.
+// `npm pack` of a scoped package such as @dekit/dekit-linux-x64 produces
+// dekit-dekit-linux-x64-<version>.tgz.
 function packageDirName(name) {
   return name.replace('@', '').replace('/', '-');
 }
@@ -95,7 +95,7 @@ function platformPackage(platform, binary, outDir, version) {
 }
 
 function rootPackage(outDir, version) {
-  const workDir = join(outDir, '.work', config.package);
+  const workDir = join(outDir, '.work', packageDirName(config.npmPackage));
   rmSync(workDir, { recursive: true, force: true });
   mkdirSync(join(workDir, 'bin'), { recursive: true });
 
@@ -109,7 +109,7 @@ function rootPackage(outDir, version) {
   );
 
   writeJson(join(workDir, 'package.json'), {
-    name: config.package,
+    name: config.npmPackage,
     version,
     description: 'Process manager for dev and prod',
     keywords: ['process-manager', 'supervisor', 'task-runner', 'tui', 'cli', 'mprocs'],
@@ -160,7 +160,7 @@ function publishAll(dir, distTag, version, dryRun) {
       name: platform.npmPackage,
       file: `${packageDirName(platform.npmPackage)}-${version}.tgz`,
     })),
-    { name: config.package, file: `${config.package}-${version}.tgz` },
+    { name: config.npmPackage, file: `${packageDirName(config.npmPackage)}-${version}.tgz` },
   ];
 
   for (const { name, file } of packages) {

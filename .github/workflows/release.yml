@@ -18,6 +18,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
+      npm_tag: ${{ steps.version.outputs.npm_tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,13 +31,16 @@ jobs:
             exit 1
           fi
           prerelease=false
+          npm_tag=latest
           case "$version" in
             *-*)
               prerelease=true
+              npm_tag=next
               ;;
           esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "npm_tag=$npm_tag" >> "$GITHUB_OUTPUT"
 
       - name: Check the release notes
         run: packaging/release-notes.sh "${{ steps.version.outputs.version }}" > /dev/null
@@ -49,8 +53,80 @@ jobs:
       artifact-prefix: release
       retention-days: 7
 
-  github-release:
+  # The checks below run before anything is published and must pass.
+  check-npm:
     needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist/release
+          merge-multiple: true
+
+      - name: Check the npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
+
+      - name: Pack and dry-run the npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          node packaging/npm/build.mjs pack \
+            --archives dist/release \
+            --out dist/npm \
+            --version "${{ needs.meta.outputs.version }}"
+          node packaging/npm/build.mjs publish \
+            --dir dist/npm \
+            --dist-tag "${{ needs.meta.outputs.npm_tag }}" \
+            --version "${{ needs.meta.outputs.version }}" \
+            --dry-run
+
+  # PyPI has no dry run and trusted publishing has no read-only call, so
+  # only the wheels themselves are checked.
+  check-pypi:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist/release
+          merge-multiple: true
+
+      - name: Build and check the wheels
+        run: |
+          set -euo pipefail
+          python packaging/pypi/build.py \
+            --archives dist/release \
+            --out dist/pypi \
+            --version "${{ needs.meta.outputs.version }}"
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install twine dist/pypi/*-manylinux_*_x86_64.*.whl
+          "$RUNNER_TEMP/venv/bin/twine" check --strict dist/pypi/*.whl
+          "$RUNNER_TEMP/venv/bin/dekit" --version
+
+  github-release:
+    needs: [meta, build, check-npm, check-pypi]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -90,3 +166,74 @@ jobs:
           fi
           gh release upload "$tag" dist/release/* --clobber
           gh release edit "$tag" --draft=false
+
+  publish-npm:
+    needs: [meta, github-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist/release
+          merge-multiple: true
+
+      - name: Pack and publish npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          node packaging/npm/build.mjs pack \
+            --archives dist/release \
+            --out dist/npm \
+            --version "${{ needs.meta.outputs.version }}"
+          node packaging/npm/build.mjs publish \
+            --dir dist/npm \
+            --dist-tag "${{ needs.meta.outputs.npm_tag }}" \
+            --version "${{ needs.meta.outputs.version }}"
+
+  # Trusted publishing: PyPI trusts this workflow in the `pypi`
+  # environment, so no token is stored.
+  publish-pypi:
+    needs: [meta, github-release]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/dekit-cli
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist/release
+          merge-multiple: true
+
+      - name: Build the wheels
+        run: |
+          python packaging/pypi/build.py \
+            --archives dist/release \
+            --out dist/pypi \
+            --version "${{ needs.meta.outputs.version }}"
+
+      # A re-run skips the wheels that are already up, as npm does above.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/pypi/
+          skip-existing: true
