@@ -11,7 +11,7 @@ binary: `dekit mprocs` reads `mprocs.yaml`, takes the same flags, answers
 
 ## What is different
 
-- The runner is a separate process. Close the terminal and the tasks keep running; `dekit attach` comes back to them.
+- The runner is a separate process. Close the terminal and the tasks keep running; `dekit` comes back to them.
 - `dekit.yaml` replaces `mprocs.yaml`. Tasks live under `tasks:` and gain `ready`, `type: job`, and `tags` (|config/tasks|).
 - `autorestart: true` is `autorestart: on-failure` in `dekit.yaml`.
 - `mprocs.yaml` runs `shell` lines through the system shell, `/bin/sh` or PowerShell, as mprocs did. `dekit.yaml` has no `shell`: a `cmd` is a program and its arguments, run without a shell (|config/tasks#commands|); a line that needs a shell runs one, as in `cmd: ["bash", "-c", "..."]`.

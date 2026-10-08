@@ -15,10 +15,12 @@ pub enum Action {
     cmds: Vec<Action>,
   },
 
-  QuitOrAsk,
+  ShowQuit,
   /// Detach the attachment that pressed the key.
   Detach,
   /// Stop the runner; it keeps the tasks for its next start.
+  Down,
+  /// Stop the runner without saving the tasks.
   Quit,
   /// Execute a kernel command as-is.
   Command {
@@ -105,9 +107,10 @@ impl Action {
   pub fn desc(&self) -> String {
     match self {
       Action::Batch { cmds: _ } => "Send multiple events".to_string(),
-      Action::QuitOrAsk => "Detach or quit".to_string(),
+      Action::ShowQuit => "Quit".to_string(),
       Action::Detach => "Detach".to_string(),
-      Action::Quit => "Quit the runner".to_string(),
+      Action::Down => "Stop the runner and save".to_string(),
+      Action::Quit => "Stop the runner without saving".to_string(),
       Action::Command { command } => format!("Run {:?}", command),
       Action::ToggleFocus => "Toggle focus".to_string(),
       Action::FocusTasks => "Focus task list".to_string(),

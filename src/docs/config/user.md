@@ -58,7 +58,7 @@ Default bindings in `tasks`:
 - cmd: <C-a>
   desc: toggle-focus, between the task list and the terminal (in every group)
 - cmd: <q>, <Q>
-  desc: detach, quit
+  desc: show-quit, down without asking (|cli/attach|)
 - cmd: <j> <Down>, <k> <Up>
   desc: next-task, prev-task
 - cmd: <h> <Left>, <l> <Right>
@@ -92,6 +92,7 @@ Default bindings in `tasks`:
 In `term_copy`: `<Esc>` copy-mode-leave, `<v>` copy-mode-end, `<c>`
 copy-mode-copy, `<h>` `<j>` `<k>` `<l>` or the arrows copy-mode-move, and
 the same scroll keys. Other actions: focus-tasks, focus-term, restart-all,
-force-restart-all, veto-task, close-current-modal, quit-or-ask, and
+force-restart-all, veto-task, close-current-modal, detach, quit (stops
+the runner without saving, like |cli/runner/stop|), and
 `{action: command, command: {...}}` to run any command from
 |config/hooks|.

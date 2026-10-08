@@ -19,9 +19,11 @@ saved task wins over a task from an edited `dekit.yaml` that would sit
 above or under it: that one is not added, with a warning in
 |cli/runner/status|.
 
-Only `up` starts tasks by itself. A runner started any other way (`dekit
-attach`, `dekit start web`, |cli/runner/start|) shows the saved tasks
-idle, with their last screens, and starts only what it was asked to.
+Only `up` starts tasks by itself; `dekit` with no command runs it when
+the runner is not running (|cli|). A runner started any other way
+(`dekit attach`, `dekit start web`, |cli/runner/start|) shows the saved
+tasks idle, with their last screens, and starts only what it was asked
+to.
 
 The runner keeps going after you close the terminal; `dekit attach` gets
 you back in. `up` takes a runner like `down`: `host`, `project`, or a path

@@ -17,9 +17,11 @@ a click, and starting, stopping, or restarting it acts on every task in
 it.
 
 The runner is started if it is not running, with no tasks (|cli/up|
-starts them); `--no-start` fails instead. In
-the console, `q` detaches and leaves everything running, and `Q` stops the
-runner like |cli/down|. Other keys are in |config/user|.
+starts them); `--no-start` fails instead. In the console, `q` asks how
+to quit: `q` again stops the runner like |cli/down|, `x` stops it
+without saving like |cli/runner/stop|, and `d` detaches and leaves
+everything running. `Q` stops the runner like |cli/down| without
+asking. Other keys are in |config/user|.
 
 :::usage
 

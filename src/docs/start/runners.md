@@ -35,8 +35,8 @@ cannot stop machine-wide tasks by accident.
 ## Stopping a runner
 
 `dekit down` stops the runner and saves its tasks and screens; the next
-start brings them back idle, and `dekit up` starts the ones you had
-started. `dekit runner stop` stops it without saving, so
+start brings them back idle, and `dekit up`, or `dekit` with no command,
+starts the ones you had started. `dekit runner stop` stops it without saving, so
 the next start begins from `dekit.yaml`.
 
 Script tasks (`script:` in `dekit.yaml`) get `DEKIT_RUNNER_ROOT` and

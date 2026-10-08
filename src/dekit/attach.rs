@@ -463,6 +463,17 @@ mod tests {
     }
   }
 
+  async fn press(sender: &mut ConnSender, c: char) {
+    let key = Key::new(KeyCode::Char(c), KeyMods::NONE);
+    sender
+      .send_ctl(CtlMsg::Event(Event {
+        name: EVENT_INPUT.to_string(),
+        params: serde_json::to_value(TermEvent::Key(key)).unwrap(),
+      }))
+      .await
+      .unwrap();
+  }
+
   /// Reads `Out` frames until one contains `needle`.
   async fn wait_for(receiver: &mut ConnReceiver, needle: &[u8]) -> bool {
     timeout(Duration::from_secs(2), async {
@@ -613,14 +624,7 @@ mod tests {
     assert!(wait_for(&mut receiver, b"Tasks").await);
 
     // Input reaches the console: `?` toggles the help window.
-    let key = Key::new(KeyCode::Char('?'), KeyMods::NONE);
-    sender
-      .send_ctl(CtlMsg::Event(Event {
-        name: EVENT_INPUT.to_string(),
-        params: serde_json::to_value(TermEvent::Key(key)).unwrap(),
-      }))
-      .await
-      .unwrap();
+    press(&mut sender, '?').await;
     let repainted = timeout(Duration::from_secs(2), next_out(&mut receiver))
       .await
       .unwrap();
@@ -630,7 +634,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn console_quit_key_detaches_without_stopping_runner() {
+  async fn console_quit_modal_detaches_without_stopping_runner() {
     let config = Arc::new(Config::make_default());
     let (pc, _, kernel_handle) = console_kernel(&config);
 
@@ -638,17 +642,9 @@ mod tests {
       attach(&pc, &config, "@dekit/console", false).await;
     assert!(wait_for(&mut receiver, b"Tasks").await);
 
-    sender
-      .send_ctl(CtlMsg::Event(Event {
-        name: EVENT_INPUT.to_string(),
-        params: serde_json::to_value(TermEvent::Key(Key::new(
-          KeyCode::Char('q'),
-          KeyMods::NONE,
-        )))
-        .unwrap(),
-      }))
-      .await
-      .unwrap();
+    press(&mut sender, 'q').await;
+    assert!(wait_for(&mut receiver, b"leave everything running").await);
+    press(&mut sender, 'd').await;
 
     // The attachment closes, but the runner remains available for another.
     assert!(

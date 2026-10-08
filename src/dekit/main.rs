@@ -1305,8 +1305,19 @@ pub async fn dekit_main() -> anyhow::Result<()> {
           );
         }
       } else {
-        // No args: same as `attach`.
+        // No args: `attach`, with an `up` first when the runner is not
+        // running yet.
         let runner = resolve_runner(&matches)?;
+        match lockfile::get_runner_state(&runner)? {
+          lockfile::RunnerState::Ready(_) => {}
+          lockfile::RunnerState::Absent
+          | lockfile::RunnerState::Starting
+          | lockfile::RunnerState::Stale(_)
+          | lockfile::RunnerState::Failed(_) => {
+            rpc_request(&runner, RpcRequest::Command(Command::Up), true)
+              .await?;
+          }
+        }
         let (sender, receiver) = connect_client_socket(&runner, true).await?;
         client_main(console(), false, sender, receiver).await?;
       }

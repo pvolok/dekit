@@ -504,15 +504,19 @@ impl App {
         }
       }
 
-      Action::QuitOrAsk => self.modal = Some(Box::new(QuitModal)),
+      Action::ShowQuit => self.modal = Some(Box::new(QuitModal)),
       Action::Detach => {
         if let Some(observer) = observer {
           self.handle_screen_cmd(TaskScreenCmd::Detach { observer });
         }
       }
-      Action::Quit => {
+      Action::Down => {
         self.state.quitting = true;
         self.issue(Command::Down);
+      }
+      Action::Quit => {
+        self.state.quitting = true;
+        self.issue(Command::Quit);
       }
       Action::Command { command } => self.issue(command),
 

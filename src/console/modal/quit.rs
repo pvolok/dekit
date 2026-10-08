@@ -17,24 +17,29 @@ impl Modal for QuitModal {
       return ModalResult::Keep;
     }
     match key.code {
-      KeyCode::Char('e') => ModalResult::Run(Action::Quit),
+      KeyCode::Char('q') => ModalResult::Run(Action::Down),
+      KeyCode::Char('x') => ModalResult::Run(Action::Quit),
       KeyCode::Char('d') => ModalResult::Detach,
-      KeyCode::Char('n') | KeyCode::Esc => ModalResult::Close,
+      KeyCode::Esc => ModalResult::Close,
       _ => ModalResult::Keep,
     }
   }
 
   fn size(&self, _frame: Rect) -> (u16, u16) {
-    (36, 5)
+    (45, 6)
   }
 
   fn render(&mut self, grid: &mut Grid, _keymap: &Keymap) {
     let area = self.area(grid.area());
-    let inner = grid.block(area, BorderType::Thick).inner();
+    let inner = grid
+      .block(area, BorderType::Thick)
+      .title("Quit", Attrs::default())
+      .inner();
     grid.fill_area(inner, ' ', Attrs::default());
     let lines = [
-      "<e>   - stop the runner",
-      "<d>   - detach client",
+      "<q>   - stop all, save for the next start",
+      "<x>   - stop all, don't save",
+      "<d>   - detach, leave everything running",
       "<Esc> - cancel",
     ];
     for (row, line) in inner.rows().zip(lines) {

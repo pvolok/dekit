@@ -83,10 +83,10 @@ impl AppEvent {
       AppEvent::Batch { cmds } => Action::Batch {
         cmds: cmds.into_iter().map(AppEvent::to_action).collect(),
       },
-      AppEvent::QuitOrAsk => Action::QuitOrAsk,
+      AppEvent::QuitOrAsk => Action::ShowQuit,
       // mprocs is foreground: quitting it quits its in-process runner,
       // by key or over `--ctl`.
-      AppEvent::Quit => Action::Quit,
+      AppEvent::Quit => Action::Down,
       // mprocs force-quit: a hard kill of everything, then quit.
       AppEvent::ForceQuit => Action::Command {
         command: Command::Batch {
