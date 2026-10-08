@@ -32,7 +32,17 @@ impl Installed {
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::copy(DEKIT, bin.join("dekit")).unwrap();
     let exe = std::fs::canonicalize(bin.join("dekit")).unwrap();
-    Installed { runner, exe }
+    let dekit = Installed { runner, exe };
+    // As the script leaves it, but by a path that is not canonical.
+    let receipt = bin.join("../bin/dekit");
+    std::fs::create_dir_all(dekit.receipt().parent().unwrap()).unwrap();
+    std::fs::write(dekit.receipt(), format!("{}\n", receipt.display()))
+      .unwrap();
+    dekit
+  }
+
+  fn receipt(&self) -> PathBuf {
+    self.runner.runtime.path.join("dekit/install")
   }
 
   fn run(&self, args: &[&str]) -> Output {
@@ -170,6 +180,8 @@ fn update_replaces_the_binary_and_upgrades_its_runner() {
   let screen = dekit.runner.ok(&["screen", "sleeper"]);
   assert!(screen.contains(&format!("pid {child}")), "{screen}");
   assert!(dekit.runner.ok(&["ls"]).contains("ready"));
+  let receipt = std::fs::read_to_string(dekit.receipt()).unwrap();
+  assert_eq!(receipt, format!("{}\n", dekit.exe.display()));
 
   // Nothing is left to do the second time.
   let again = dekit.run(&["--json", "update"]);
@@ -202,6 +214,23 @@ fn update_with_a_bad_checksum_changes_nothing() {
   let after = dekit.record();
   assert_eq!(after["version"], "0.0.1");
   assert_eq!(after["pid"], before["pid"]);
+}
+
+#[test]
+fn update_without_a_receipt_changes_nothing() {
+  let dekit = Installed::new("upr");
+  dekit.publish(None);
+  std::fs::remove_file(dekit.receipt()).unwrap();
+  let inode = dekit.inode();
+
+  let out = dekit.run(&["update"]);
+  assert!(!out.status.success());
+  assert!(
+    stderr(&out).contains("not installed by the install script"),
+    "{}",
+    stderr(&out)
+  );
+  assert_eq!(dekit.inode(), inode);
 }
 
 #[test]

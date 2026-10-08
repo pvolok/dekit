@@ -86,6 +86,11 @@
             try { Remove-Item $Old -Force } catch {}
         }
 
+        # The receipt lets this binary run `dekit update`.
+        $DataDir = Join-Path $env:LOCALAPPDATA "dekit"
+        New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $DataDir "install"), (Resolve-Path $Target).Path)
+
         Write-Host "$Installed installed to $Target"
 
         # Only a first install touches PATH.

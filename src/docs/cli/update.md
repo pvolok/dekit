@@ -8,6 +8,8 @@ related: [cli/runner/upgrade, config/kernel, start/getting-started]
 Updates the dekit you ran and then switches its running runners to the new
 version. Their tasks keep running and attached terminals stay attached.
 It runs the install script again, into the directory of this binary.
+A dekit installed another way, such as with a package manager, is updated
+that way; then |cli/runner/upgrade| with `--all` switches the runners.
 
 The last step is |cli/runner/upgrade| with `--all`. Runners on another
 binary, such as a project with a `kernel:` pin (|config/kernel|), are

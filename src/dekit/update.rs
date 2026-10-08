@@ -1,14 +1,19 @@
-//! `dekit update`: installs the new dekit the way this one was installed,
-//! then the new binary switches the runners (`runner upgrade --all`).
+//! `dekit update`: runs the install script again into the directory of
+//! this binary, then the new binary switches the runners
+//! (`runner upgrade --all`). Only a dekit the script installed updates
+//! itself; the script leaves a receipt with its path.
 //!
 //! Released binaries keep calling `INSTALL_URL` with `DEKIT_INSTALL_DIR`
-//! and `DEKIT_VERSION`, and `runner upgrade --all` on what it installs.
-//! Neither may change meaning.
+//! and `DEKIT_VERSION`, reading the receipt, and running
+//! `runner upgrade --all` on what it installs. None of these may change
+//! meaning.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
+
+use crate::runner::user_data_dir;
 
 const INSTALL_URL: &str = if cfg!(windows) {
   "https://dekit.run/install.ps1"
@@ -16,68 +21,23 @@ const INSTALL_URL: &str = if cfg!(windows) {
   "https://dekit.run/install.sh"
 };
 
-enum Install {
-  Script,
-  /// The npm prefix whose global `node_modules` holds this binary.
-  NpmGlobal(PathBuf),
-  /// The `--root` that `cargo install` tracked this binary in.
-  Cargo(PathBuf),
-  /// In a `node_modules` that is not npm's global one: the project or
-  /// the package manager that owns it decides the version.
-  Package(PathBuf),
-}
-
 pub fn update(version: Option<&str>, json: bool) -> anyhow::Result<()> {
   // Read before the install: a replaced binary has no path on Linux.
   let exe = dunce::canonicalize(std::env::current_exe()?)?;
-  let version = version.unwrap_or("latest");
-  // With --json, stdout carries only the runners' results.
-  let out = || {
-    if json {
-      Stdio::from(std::io::stderr())
-    } else {
-      Stdio::inherit()
-    }
-  };
-
-  match install_of(&exe) {
-    Install::Script => run_installer(&exe, version, out())?,
-    Install::NpmGlobal(prefix) => {
-      let package = format!("dekit@{}", registry_version(version)?);
-      let prefix = prefix.to_string_lossy();
-      let args = ["install", "-g", "--prefix", &prefix, &package];
-      run_package_manager("npm", &args, out())?
-    }
-    Install::Cargo(root) => {
-      let root = root.to_string_lossy();
-      let mut args = vec!["install", "dekit", "--locked", "--root", &root];
-      let version = registry_version(version)?;
-      if version != "latest" {
-        args.extend(["--version", version]);
-      }
-      run_package_manager("cargo", &args, out())?
-    }
-    Install::Package(root) => {
-      let modules = root.join("node_modules");
-      if cfg!(windows) {
-        bail!(
-          "this dekit is installed in {}; stop the runners that use it (`dekit down`), then update it with the package manager that put it there",
-          modules.display()
-        );
-      }
-      bail!(
-        "this dekit is installed in {}; update it with the package manager that put it there, then run `dekit runner upgrade --all`",
-        modules.display()
-      );
-    }
-  }
-
-  if !exe.is_file() {
+  if !installed_by_script(&exe) {
     bail!(
-      "dekit was updated, but it is no longer at {}; run `dekit runner upgrade --all` with the new one",
-      exe.display()
+      "this dekit was not installed by the install script (https://dekit.run); update it the way you installed it, then run `dekit runner upgrade --all`"
     );
   }
+  let version = version.unwrap_or("latest");
+  // With --json, stdout carries only the runners' results.
+  let out = if json {
+    Stdio::from(std::io::stderr())
+  } else {
+    Stdio::inherit()
+  };
+  run_installer(&exe, version, out)?;
+
   let mut upgrade = Command::new(&exe);
   upgrade.args(["runner", "upgrade", "--all"]);
   if json {
@@ -92,113 +52,18 @@ pub fn update(version: Option<&str>, json: bool) -> anyhow::Result<()> {
   Ok(())
 }
 
-fn install_of(exe: &Path) -> Install {
-  let modules = exe
-    .ancestors()
-    .filter(|dir| dir.file_name().is_some_and(|name| name == "node_modules"))
-    .last();
-  if let Some(modules) = modules {
-    // The prefix the global `node_modules` would belong to, so any npm
-    // on PATH can answer, whichever Node installed this one.
-    let prefix = if cfg!(windows) {
-      modules.parent()
-    } else {
-      modules.parent().and_then(Path::parent)
-    };
-    let project = modules.with_file_name("package.json").exists();
-    return match prefix {
-      Some(prefix)
-        if !project && npm_global_root(prefix).as_deref() == Some(modules) =>
-      {
-        Install::NpmGlobal(prefix.to_path_buf())
-      }
-      Some(_) | None => {
-        Install::Package(modules.parent().unwrap_or(modules).to_path_buf())
-      }
-    };
-  }
-  // `cargo install` records what it installed next to the `bin` dir.
-  let root = exe.parent().and_then(Path::parent);
-  if let Some(root) = root
-    && cargo_installed(&root.join(".crates2.json"))
-  {
-    return Install::Cargo(root.to_path_buf());
-  }
-  Install::Script
-}
-
-fn cargo_installed(crates: &Path) -> bool {
-  let Ok(text) = std::fs::read_to_string(crates) else {
+/// The receipt holds the path of the binary the script installed last.
+fn installed_by_script(exe: &Path) -> bool {
+  let Ok(dir) = user_data_dir() else {
     return false;
   };
-  let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+  let Ok(path) = std::fs::read_to_string(dir.join("install")) else {
     return false;
   };
-  let bin = if cfg!(windows) { "dekit.exe" } else { "dekit" };
-  json["installs"].as_object().is_some_and(|installs| {
-    installs.iter().any(|(package, install)| {
-      package.starts_with("dekit ")
-        && install["bins"]
-          .as_array()
-          .is_some_and(|bins| bins.iter().any(|name| name == bin))
-    })
-  })
-}
-
-fn npm_global_root(prefix: &Path) -> Option<PathBuf> {
-  let output = Command::new("npm")
-    .args(["root", "-g", "--prefix"])
-    .arg(prefix)
-    .output()
-    .ok()?;
-  if !output.status.success() {
-    return None;
-  }
-  dunce::canonicalize(String::from_utf8(output.stdout).ok()?.trim()).ok()
-}
-
-/// A version as npm and crates.io name it.
-fn registry_version(version: &str) -> anyhow::Result<&str> {
-  if version == "canary" {
-    bail!(
-      "canary builds come from the install script only (https://dekit.run)"
-    );
-  }
-  Ok(version.strip_prefix('v').unwrap_or(version))
-}
-
-fn run_package_manager(
-  program: &str,
-  args: &[&str],
-  out: Stdio,
-) -> anyhow::Result<()> {
-  let command = format!("{program} {}", args.join(" "));
-  // A running dekit.exe cannot be replaced, and this one is running.
-  if cfg!(windows) {
-    bail!(
-      "stop the runners that use this dekit (`dekit down`), then run: {command}"
-    );
-  }
-  let status = Command::new(program)
-    .args(args)
-    .stdout(out)
-    .status()
-    .with_context(|| format!("cannot run `{command}`"))?;
-  if !status.success() {
-    bail!("`{command}` failed");
-  }
-  Ok(())
+  dunce::canonicalize(path.trim_end()).is_ok_and(|path| path == exe)
 }
 
 fn run_installer(exe: &Path, version: &str, out: Stdio) -> anyhow::Result<()> {
-  // The installer writes `dekit` into the directory it is given.
-  let name = if cfg!(windows) { "dekit.exe" } else { "dekit" };
-  if exe.file_name().is_none_or(|file| file != name) {
-    bail!(
-      "this binary is {}, and the installer replaces only `{name}`; install dekit again from https://dekit.run",
-      exe.display()
-    );
-  }
   let dir = exe.parent().context("the dekit binary has no directory")?;
   let url = std::env::var("DEKIT_INSTALL_URL")
     .unwrap_or_else(|_| INSTALL_URL.to_string());

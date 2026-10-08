@@ -93,6 +93,11 @@ main() {
   chmod 755 "$new"
   mv -f "$new" "$install_dir/dekit"
 
+  # The receipt lets this binary run `dekit update`.
+  data_dir=${XDG_DATA_HOME:-"$HOME/.local/share"}/dekit
+  mkdir -p "$data_dir"
+  printf '%s\n' "$(cd "$install_dir" && pwd -P)/dekit" >"$data_dir/install"
+
   printf '%s installed to %s\n' "$installed" "$install_dir/dekit"
 
   case ":$PATH:" in

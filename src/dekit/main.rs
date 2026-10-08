@@ -849,6 +849,19 @@ pub fn cli() -> ClapCommand {
 }
 
 pub async fn dekit_main() -> anyhow::Result<()> {
+  // Started through an `mprocs` link: the same as `dekit mprocs`.
+  let mut args = std::env::args_os();
+  let name = args.next().map(PathBuf::from);
+  if name.as_deref().and_then(Path::file_stem) == Some("mprocs".as_ref()) {
+    let mut argv = vec!["mprocs".to_string()];
+    for arg in args {
+      argv.push(arg.into_string().map_err(|arg| {
+        anyhow!("invalid UTF-8 in argument {}", arg.to_string_lossy())
+      })?);
+    }
+    return crate::mprocs::mprocs::run_app(argv).await;
+  }
+
   let matches = cli().get_matches();
   let json = matches.get_flag("json");
 
