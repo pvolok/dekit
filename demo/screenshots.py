@@ -128,30 +128,20 @@ def plain_lines(screen):
 
 def task_rows(screen):
     """(name, selected) for each row of the task list; the selected row is
-    the one with a background."""
+    the one whose background differs from its border's."""
     rows = []
-    for line in screen.rstrip("\n").split("\n")[1:]:
-        parts = re.split("[┃│]", line)
-        if len(parts) < 2:
+    for cells in styled_lines(screen)[1:]:
+        text = "".join(ch for ch, _ in cells)
+        bars = [i for i, ch in enumerate(text) if ch in "┃│"]
+        if len(bars) < 2:
             break
-        raw = parts[1]
-        cell = re.sub(r"\x1b\[[0-9;:?]*[A-Za-z]", "", raw)
-        if not cell.strip():
+        border, inside = bars[0], text[bars[0] + 1 : bars[1]]
+        if not inside.strip():
             break
-        rows.append((cell.split()[0], highlighted(raw)))
+        first = border + 1 + len(inside) - len(inside.lstrip())
+        selected = cells[first][1].get("bg") != cells[border][1].get("bg")
+        rows.append((inside.split()[0], selected))
     return rows
-
-
-def highlighted(text):
-    """Whether any visible character of `text` has a background color."""
-    style = {}
-    for part in re.split(r"(\x1b\[[0-9;:?]*[A-Za-z])", text):
-        if part.startswith("\x1b["):
-            if part.endswith("m"):
-                apply_sgr(style, part[2:-1])
-        elif part.strip() and "bg" in style:
-            return True
-    return False
 
 
 class Console:
@@ -211,6 +201,22 @@ def color(spec):
         return "#%02x%02x%02x" % (levels[value // 36], levels[value // 6 % 6], levels[value % 6])
     gray = 8 + (value - 232) * 10
     return "#%02x%02x%02x" % (gray, gray, gray)
+
+
+def styled_lines(text):
+    """Each line as (char, style) cells. As in a terminal, the SGR state
+    carries over to the next line."""
+    style, lines = {}, []
+    for raw in text.rstrip("\n").split("\n"):
+        cells = []
+        for part in re.split(r"(\x1b\[[0-9;:?]*[A-Za-z])", raw.replace("\r", "")):
+            if part.startswith("\x1b["):
+                if part.endswith("m"):
+                    apply_sgr(style, part[2:-1])
+                continue
+            cells += [(ch, dict(style)) for ch in part]
+        lines.append(cells)
+    return lines
 
 
 def apply_sgr(style, params):
@@ -278,18 +284,13 @@ def for_freeze(text, width=0):
     every run gets one sequence with the colors spelled out, inverse is
     swapped by hand, and bold brightens the color as in many terminals."""
     lines = []
-    for raw in text.rstrip("\n").split("\n"):
-        style, cells = {}, []
-        for part in re.split(r"(\x1b\[[0-9;:?]*[A-Za-z])", raw.replace("\r", "")):
-            if part.startswith("\x1b["):
-                if part.endswith("m"):
-                    apply_sgr(style, part[2:-1])
-                continue
-            for ch in part:
-                if ch == "\t":
-                    cells += [(" ", resolve({}))] * (8 - len(cells) % 8)
-                else:
-                    cells.append((ch, resolve(style)))
+    for styled in styled_lines(text):
+        cells = []
+        for ch, style in styled:
+            if ch == "\t":
+                cells += [(" ", resolve({}))] * (8 - len(cells) % 8)
+            else:
+                cells.append((ch, resolve(style)))
         while cells and cells[-1][0] == " " and cells[-1][1][1] is None:
             cells.pop()
         cells += [(" ", resolve({}))] * (width - len(cells))

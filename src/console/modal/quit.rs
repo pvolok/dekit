@@ -1,9 +1,9 @@
 use crate::console::action::Action;
 use crate::console::keymap::Keymap;
+use crate::console::theme::Theme;
 use crate::term::{
   Grid,
-  attrs::Attrs,
-  grid::{BorderType, Rect},
+  grid::Rect,
   key::{Key, KeyCode},
 };
 
@@ -26,16 +26,17 @@ impl Modal for QuitModal {
   }
 
   fn size(&self, _frame: Rect) -> (u16, u16) {
-    (45, 6)
+    (47, 6)
   }
 
-  fn render(&mut self, grid: &mut Grid, _keymap: &Keymap) {
+  fn render(&mut self, grid: &mut Grid, _keymap: &Keymap, theme: &Theme) {
     let area = self.area(grid.area());
-    let inner = grid
-      .block(area, BorderType::Thick)
-      .title("Quit", Attrs::default())
-      .inner();
-    grid.fill_area(inner, ' ', Attrs::default());
+    let style = theme.block.modal();
+    let inner = style
+      .draw(grid, area)
+      .title(" Quit ", style.title)
+      .inner()
+      .inner((0, 1));
     let lines = [
       "<q>   - stop all, save for the next start",
       "<x>   - stop all, don't save",
@@ -43,7 +44,7 @@ impl Modal for QuitModal {
       "<Esc> - cancel",
     ];
     for (row, line) in inner.rows().zip(lines) {
-      grid.draw_text(row, line, Attrs::default());
+      grid.draw_text(row, line, style.text);
     }
   }
 }

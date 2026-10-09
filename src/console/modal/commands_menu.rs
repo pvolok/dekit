@@ -4,15 +4,16 @@ use unicode_width::UnicodeWidthStr;
 use crate::console::action::{Action, ScrollUnit};
 use crate::console::{
   keymap::{Keymap, KeymapGroup},
+  theme::Theme,
   widgets::{
     list::ListState,
     text_input::{render_text_input, to_input_request},
   },
 };
 use crate::term::{
-  Color, CursorStyle, Grid,
+  CursorStyle, Grid,
   attrs::Attrs,
-  grid::{BorderType, Rect},
+  grid::Rect,
   key::{Key, KeyCode, KeyMods},
   line_symbols::{HORIZONTAL, VERTICAL_LEFT, VERTICAL_RIGHT},
 };
@@ -87,14 +88,13 @@ impl Modal for CommandsMenuModal {
     (60, 30)
   }
 
-  fn render(&mut self, grid: &mut Grid, keymap: &Keymap) {
+  fn render(&mut self, grid: &mut Grid, keymap: &Keymap, theme: &Theme) {
     let area = self.area(grid.area());
-    let mut inner = grid
-      .block(area, BorderType::Rounded)
-      .gap(1)
-      .title(" Commands ", Attrs::default().set_bold(true))
+    let style = theme.block.modal();
+    let mut inner = style
+      .draw(grid, area)
+      .title(" Commands ", style.title)
       .inner();
-    grid.fill_area(inner, ' ', Attrs::default());
 
     let mut input_row = inner.take_top(1);
     let sep_row = inner.take_top(1);
@@ -105,18 +105,15 @@ impl Modal for CommandsMenuModal {
       Some(i) => format!("{}/{}", i + 1, self.items.len()),
       None => String::new(),
     };
-    grid.draw_text(
-      input_row.take_left(2),
-      "/ ",
-      Attrs::default().fg(Color::YELLOW),
-    );
+    grid.draw_text(input_row.take_left(2), "/ ", style.key);
     grid.draw_text(
       input_row.take_right(counter.width() as u16),
       &counter,
-      Attrs::default().fg(Color::BRIGHT_BLACK),
+      style.dim,
     );
     let input_area = input_row.inner((0, 1, 0, 0));
-    grid.cursor_pos = Some(render_text_input(&self.input, input_area, grid));
+    grid.cursor_pos =
+      Some(render_text_input(&self.input, input_area, grid, style.text));
     grid.cursor_style = CursorStyle::BlinkingBar;
 
     // Separator, joined to the border on both sides
@@ -125,27 +122,26 @@ impl Modal for CommandsMenuModal {
       width: area.width,
       ..sep_row
     };
-    grid.draw_text(sep.take_left(1), VERTICAL_RIGHT, Attrs::default());
-    grid.draw_text(sep.take_right(1), VERTICAL_LEFT, Attrs::default());
-    grid.draw_text(
-      sep,
-      &HORIZONTAL.repeat(sep.width as usize),
-      Attrs::default(),
-    );
+    grid.draw_text(sep.take_left(1), VERTICAL_RIGHT, style.border);
+    grid.draw_text(sep.take_right(1), VERTICAL_LEFT, style.border);
+    grid.draw_text(sep, &HORIZONTAL.repeat(sep.width as usize), style.border);
 
     // List
     let search = self.input.value().to_lowercase();
     for row in self.list.rows(list_area) {
       let item = &self.items[row.index];
       let bg = if row.selected {
-        Color::Rgb(100, 100, 100)
+        theme.block.selected_bg
       } else {
-        Color::Default
+        theme.block.modal_bg
       };
-      let base = Attrs::default().bg(bg);
-      let hl = Attrs::default().bg(bg).fg(Color::YELLOW);
+      let on_bg = |attrs: Attrs| Attrs {
+        bgcolor: bg.into(),
+        ..attrs
+      };
+      let hl = on_bg(style.key);
       if row.selected {
-        grid.fill_area(row.area, ' ', base);
+        grid.fill_area(row.area, ' ', on_bg(style.text));
         grid.draw_text(row.area, "\u{258e}", hl);
       }
 
@@ -156,21 +152,14 @@ impl Modal for CommandsMenuModal {
         rest.take_left(20),
         &item.name,
         &search,
-        Attrs::default().bg(bg).set_bold(true),
-        Attrs::default().bg(bg).fg(Color::YELLOW).set_bold(true),
+        on_bg(style.text).set_bold(true),
+        on_bg(style.key).set_bold(true),
       );
       if let Some(key) = keymap.key(KeymapGroup::Tasks, &item.action) {
         let key = key.to_string();
         grid.draw_text(rest.take_right(key.width() as u16), &key, hl);
       }
-      draw_highlighted(
-        grid,
-        rest,
-        &item.desc,
-        &search,
-        Attrs::default().bg(bg).fg(Color::Rgb(160, 160, 160)),
-        hl,
-      );
+      draw_highlighted(grid, rest, &item.desc, &search, on_bg(style.dim), hl);
     }
   }
 }

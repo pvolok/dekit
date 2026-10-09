@@ -1,12 +1,12 @@
 use crate::command::Command;
 use crate::console::action::Action;
 use crate::console::keymap::Keymap;
+use crate::console::theme::Theme;
 use crate::kernel::task::TaskId;
 use crate::target::Target;
 use crate::term::{
   Grid,
-  attrs::Attrs,
-  grid::{BorderType, Rect},
+  grid::Rect,
   key::{Key, KeyCode},
 };
 
@@ -36,10 +36,14 @@ impl Modal for RemoveTaskModal {
     (36, 3)
   }
 
-  fn render(&mut self, grid: &mut Grid, _keymap: &Keymap) {
+  fn render(&mut self, grid: &mut Grid, _keymap: &Keymap, theme: &Theme) {
     let area = self.area(grid.area());
-    let inner = grid.block(area, BorderType::Thick).inner();
-    grid.fill_area(inner, ' ', Attrs::default());
-    grid.draw_text(inner, "Remove task? (y/n)", Attrs::default());
+    let style = theme.block.modal();
+    let inner = style
+      .draw(grid, area)
+      .title(" Remove task ", style.title)
+      .inner()
+      .inner((0, 1));
+    grid.draw_text(inner, "Remove task? (y/n)", style.text);
   }
 }

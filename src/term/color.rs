@@ -59,19 +59,32 @@ impl Color {
 }
 
 impl Color {
-  pub fn dim(self, factor: u8) -> Self {
+  /// Only RGB colors move; the others have no value to move from.
+  pub fn blend(self, to: Rgb, amount: u8) -> Self {
     match self {
-      Color::Default => self,
-      Color::Idx(_) => self,
-      Color::Rgb(r, g, b) => {
-        let f = factor as u16;
-        Color::Rgb(
-          (r as u16 * f / 255) as u8,
-          (g as u16 * f / 255) as u8,
-          (b as u16 * f / 255) as u8,
-        )
-      }
+      Color::Rgb(r, g, b) => Rgb(r, g, b).blend(to, amount).into(),
+      Color::Default | Color::Idx(_) => self,
     }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rgb(pub u8, pub u8, pub u8);
+
+impl Rgb {
+  /// Moves `amount`/255 of the way to `to`.
+  pub fn blend(self, to: Rgb, amount: u8) -> Rgb {
+    let amount = amount as u16;
+    let mix = |a: u8, b: u8| {
+      ((a as u16 * (255 - amount) + b as u16 * amount) / 255) as u8
+    };
+    Rgb(mix(self.0, to.0), mix(self.1, to.1), mix(self.2, to.2))
+  }
+}
+
+impl From<Rgb> for Color {
+  fn from(Rgb(r, g, b): Rgb) -> Self {
+    Color::Rgb(r, g, b)
   }
 }
 

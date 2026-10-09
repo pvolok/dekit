@@ -22,7 +22,7 @@ use crate::{
     state::{Scope, State},
     task_tree::{Node, TaskTree},
     task_view::TaskView,
-    theme::TaskListTheme,
+    theme::{BlockTheme, Theme},
     ui_keymap::render_keymap,
     ui_tasks::render_tasks,
     ui_term::render_term,
@@ -45,9 +45,9 @@ use crate::{
   },
   target::Target,
   term::{
-    CursorStyle, Screen, Size, TermEvent, Winsize,
+    CursorStyle, Grid, Screen, Size, TermEvent, Winsize,
     attrs::Attrs,
-    grid::Rect,
+    grid::{Pos, Rect},
     key::{Key, KeyEventKind},
     mouse::{MouseButton, MouseEventKind},
   },
@@ -115,7 +115,7 @@ pub fn console_task_registration(
 pub struct App {
   config: Arc<Config>,
   keymap: Keymap,
-  theme: TaskListTheme,
+  theme: Theme,
   state: State,
   modal: Option<Box<dyn Modal>>,
   receiver: UnboundedReceiver<TaskCmd>,
@@ -152,7 +152,7 @@ impl App {
       },
       config,
       keymap,
-      theme: TaskListTheme::default(),
+      theme: Theme::dark(),
       modal: None,
       receiver,
       screen: TaskScreen::new(pc.task_id, vt.clone(), 1),
@@ -219,7 +219,11 @@ impl App {
       return;
     };
     let grid = vt.grid_mut();
-    grid.erase_all(Attrs::default());
+    grid.erase_all(
+      Attrs::default()
+        .bg(self.theme.block.bg.into())
+        .fg(self.theme.block.text.into()),
+    );
     grid.cursor_pos = None;
     grid.cursor_style = CursorStyle::Default;
 
@@ -230,13 +234,14 @@ impl App {
       &self.config,
       &self.theme,
     );
-    render_term(layout.term, grid, &self.state);
-    render_keymap(layout.keymap, grid, &self.state, &self.keymap);
-    render_zoom_tip(layout.zoom_banner, grid, &self.keymap);
+    render_term(layout.term, grid, &self.state, &self.theme);
+    render_keymap(layout.keymap, grid, &self.state, &self.keymap, &self.theme);
+    render_zoom_tip(layout.zoom_banner, grid, &self.keymap, &self.theme);
     if let Some(modal) = &mut self.modal {
+      shade(grid, &self.theme.block);
       grid.cursor_pos = None;
       grid.cursor_style = CursorStyle::Default;
-      modal.render(grid, &self.keymap);
+      modal.render(grid, &self.keymap, &self.theme);
     }
 
     match grid.cursor_pos {
@@ -532,6 +537,13 @@ impl App {
       Action::ToggleKeymapWindow => {
         self.state.hide_keymap_window = !self.state.hide_keymap_window;
       }
+      Action::ToggleTheme => {
+        self.theme = if self.theme.dark {
+          Theme::light()
+        } else {
+          Theme::dark()
+        };
+      }
 
       Action::NextTask => self.state.tasks.next(),
       Action::PrevTask => self.state.tasks.prev(),
@@ -758,6 +770,22 @@ impl App {
         if let Some(task) = self.state.tasks.task_mut(id) {
           task.label = label;
         }
+      }
+    }
+  }
+}
+
+fn shade(grid: &mut Grid, theme: &BlockTheme) {
+  let area = grid.area();
+  for row in area.y..area.bottom() {
+    for col in area.x..area.right() {
+      if let Some(cell) = grid.drawing_cell_mut(Pos { col, row }) {
+        let attrs = cell.attrs();
+        cell.set_attrs(Attrs {
+          fgcolor: attrs.fgcolor.blend(theme.shade, theme.shade_amount),
+          bgcolor: attrs.bgcolor.blend(theme.shade, theme.shade_amount),
+          ..*attrs
+        });
       }
     }
   }

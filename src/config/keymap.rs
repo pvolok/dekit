@@ -181,6 +181,8 @@ impl KeymapConfig {
       Key::new(KeyCode::Char('?'), KeyMods::NONE),
       Action::ToggleKeymapWindow,
     );
+    #[cfg(debug_assertions)]
+    s.keymap_add_p(KeyCode::Char('T').into(), Action::ToggleTheme);
 
     s.keymap_add_p(
       Key::new(KeyCode::Char('v'), KeyMods::NONE),

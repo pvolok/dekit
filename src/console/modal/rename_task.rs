@@ -3,12 +3,12 @@ use tui_input::Input;
 use crate::console::action::Action;
 use crate::console::{
   keymap::Keymap,
+  theme::Theme,
   widgets::text_input::{render_text_input, to_input_request},
 };
 use crate::term::{
   Grid,
-  attrs::Attrs,
-  grid::{BorderType, Rect},
+  grid::Rect,
   key::{Key, KeyCode},
 };
 
@@ -40,12 +40,15 @@ impl Modal for RenameTaskModal {
     (42, 3)
   }
 
-  fn render(&mut self, grid: &mut Grid, _keymap: &Keymap) {
+  fn render(&mut self, grid: &mut Grid, _keymap: &Keymap, theme: &Theme) {
     let area = self.area(grid.area());
-    let inner = grid
-      .block(area, BorderType::Thick)
-      .title("Rename task", Attrs::default())
-      .inner();
-    grid.cursor_pos = Some(render_text_input(&self.input, inner, grid));
+    let style = theme.block.modal();
+    let inner = style
+      .draw(grid, area)
+      .title(" Rename task ", style.title)
+      .inner()
+      .inner((0, 1));
+    grid.cursor_pos =
+      Some(render_text_input(&self.input, inner, grid, style.text));
   }
 }

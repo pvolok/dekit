@@ -3,32 +3,32 @@ use unicode_width::UnicodeWidthStr;
 use crate::console::{
   state::State,
   task_tree::{Group, Node},
+  theme::{BlockStyle, Theme},
 };
 use crate::kernel::task_path::TaskPath;
 use crate::term::{
-  Color, Grid, Screen,
+  Grid, Palette, Screen,
   attrs::Attrs,
-  grid::{BorderType, Pos, Rect},
+  grid::{Pos, Rect},
 };
 
-pub fn render_term(area: Rect, grid: &mut Grid, state: &State) {
+pub fn render_term(area: Rect, grid: &mut Grid, state: &State, theme: &Theme) {
   if area.width < 3 || area.height < 3 {
     return;
   }
 
   let active = state.scope.is_term();
-  let border = if active {
-    BorderType::Thick
-  } else {
-    BorderType::Plain
-  };
+  let style = theme.block.panel(active);
 
   let task = match state.tasks.selected() {
     Some((_, Node::Task(task))) => task,
     Some((path, Node::Group(group))) => {
-      return render_group(area, grid, border, active, path, group);
+      return render_group(area, grid, &style, theme, path, group);
     }
-    None => return,
+    None => {
+      style.draw(grid, area);
+      return;
+    }
   };
 
   let handle = task.present.as_ref().unwrap_or(&task.vt);
@@ -37,17 +37,15 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &State) {
   };
   let screen = &*screen;
 
-  let mut block = grid.block(area, border);
-  block.title("Terminal", Attrs::default().set_bold(active));
+  let mut block = style.draw(grid, area);
+  block.title(" Terminal ", style.title);
   let title = screen.title();
   if !title.is_empty() {
-    block
-      .title(" ", Attrs::default())
-      .title(title, Attrs::default().fg(Color::BRIGHT_BLACK));
+    block.title(title, style.dim).title(" ", style.dim);
   }
 
   let inner = block.inner();
-  render_screen(screen, inner, grid);
+  render_screen(screen, inner, grid, &theme.palette);
 
   if active && !screen.hide_cursor() {
     let (row, col) = screen.cursor_position();
@@ -63,36 +61,46 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &State) {
 fn render_group(
   area: Rect,
   grid: &mut Grid,
-  border: BorderType,
-  active: bool,
+  style: &BlockStyle,
+  theme: &Theme,
   path: &TaskPath,
   group: &Group,
 ) {
-  let inner = grid
-    .block(area, border)
-    .title(path.as_str(), Attrs::default().set_bold(active))
-    .inner();
+  let inner = style
+    .draw(grid, area)
+    .title(&format!(" {} ", path.as_str()), style.title)
+    .inner()
+    .inner((0, 1));
   let mut lines = inner.rows();
   if let Some(mut line) = lines.next() {
     let noun = if group.len() == 1 { "task" } else { "tasks" };
     let summary = format!("{} {}, {} up", group.len(), noun, group.up);
     let area = line.take_left(summary.width() as u16);
-    grid.draw_text(area, &summary, Attrs::default());
+    grid.draw_text(area, &summary, style.text);
     if group.failed > 0 {
       let failed = format!(", {} failed", group.failed);
-      grid.draw_text(line, &failed, Attrs::default().fg(Color::BRIGHT_RED));
+      let attrs = Attrs {
+        fgcolor: theme.tasks.failed.into(),
+        ..style.text
+      };
+      grid.draw_text(line, &failed, attrs);
     }
   }
   if let Some(line) = lines.nth(1) {
     grid.draw_text(
       line,
       "Start, stop, and restart act on every task in the group.",
-      Attrs::default().fg(Color::BRIGHT_BLACK),
+      style.dim,
     );
   }
 }
 
-fn render_screen(screen: &Screen, area: Rect, grid: &mut Grid) {
+fn render_screen(
+  screen: &Screen,
+  area: Rect,
+  grid: &mut Grid,
+  palette: &Palette,
+) {
   for row in 0..area.height {
     for col in 0..area.width {
       let Some(to_cell) = grid.drawing_cell_mut(Pos {
@@ -106,6 +114,12 @@ fn render_screen(screen: &Screen, area: Rect, grid: &mut Grid) {
         if !cell.has_contents() {
           to_cell.set_str(" ");
         }
+        let attrs = cell.attrs();
+        to_cell.set_attrs(Attrs {
+          fgcolor: palette.fg(attrs.fgcolor).into(),
+          bgcolor: palette.bg(attrs.bgcolor).into(),
+          ..*attrs
+        });
       }
     }
   }

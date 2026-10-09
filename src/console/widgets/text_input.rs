@@ -8,7 +8,12 @@ use crate::term::{
 };
 
 /// Draws the input and returns the cursor position.
-pub fn render_text_input(input: &Input, area: Rect, grid: &mut Grid) -> Pos {
+pub fn render_text_input(
+  input: &Input,
+  area: Rect,
+  grid: &mut Grid,
+  attrs: Attrs,
+) -> Pos {
   let value = input.value();
 
   let left_trim = input.cursor().saturating_sub(area.width as usize);
@@ -22,8 +27,8 @@ pub fn render_text_input(input: &Input, area: Rect, grid: &mut Grid) -> Pos {
     (value, input.cursor())
   };
 
-  grid.fill_area(area, ' ', Attrs::default());
-  grid.draw_text(area, value, Attrs::default());
+  grid.fill_area(area, ' ', attrs);
+  grid.draw_text(area, value, attrs);
 
   Pos {
     col: area.x + cursor as u16,

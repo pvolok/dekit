@@ -4,13 +4,14 @@ use unicode_width::UnicodeWidthStr;
 use crate::console::action::Action;
 use crate::console::{
   keymap::Keymap,
+  theme::Theme,
   widgets::text_input::{render_text_input, to_input_request},
 };
 use crate::help::layout::{Span, wrap};
 use crate::term::{
-  Color, Grid,
+  Grid,
   attrs::Attrs,
-  grid::{BorderType, Rect},
+  grid::Rect,
   key::{Key, KeyCode},
 };
 
@@ -69,26 +70,32 @@ impl Modal for AddTaskModal {
       // Wide enough for the error, up to 80 columns; it wraps below the
       // input.
       Some(error) => {
-        let width = ((error.width() + 2).clamp(42, 80) as u16).min(frame.width);
-        let lines = self.error_lines(width.saturating_sub(2)).len() as u16;
+        let width = ((error.width() + 4).clamp(42, 80) as u16).min(frame.width);
+        let lines = self.error_lines(width.saturating_sub(4)).len() as u16;
         (width, 3 + lines)
       }
       None => (42, 3),
     }
   }
 
-  fn render(&mut self, grid: &mut Grid, _keymap: &Keymap) {
+  fn render(&mut self, grid: &mut Grid, _keymap: &Keymap, theme: &Theme) {
     let area = self.area(grid.area());
-    let mut inner = grid
-      .block(area, BorderType::Plain)
-      .title("Add task", Attrs::default())
-      .inner();
-    grid.fill_area(inner, ' ', Attrs::default());
+    let style = theme.block.modal();
+    let mut inner = style
+      .draw(grid, area)
+      .title(" Add task ", style.title)
+      .inner()
+      .inner((0, 1));
     let input = inner.take_top(1);
+    let error = Attrs {
+      fgcolor: theme.tasks.failed.into(),
+      ..style.text
+    };
     for (row, line) in inner.rows().zip(self.error_lines(inner.width)) {
-      grid.draw_text(row, &line, Attrs::default().fg(Color::BRIGHT_RED));
+      grid.draw_text(row, &line, error);
     }
-    grid.cursor_pos = Some(render_text_input(&self.input, input, grid));
+    grid.cursor_pos =
+      Some(render_text_input(&self.input, input, grid, style.text));
   }
 }
 
@@ -111,9 +118,9 @@ mod tests {
       .unwrap_err()
       .to_string();
     let mut modal = AddTaskModal::with_error("a && b".into(), error.clone());
-    modal.render(&mut grid, &Keymap::new());
+    modal.render(&mut grid, &Keymap::new(), &Theme::dark());
 
-    let inner = modal.area(grid.area()).inner(1);
+    let inner = modal.area(grid.area()).inner((1, 2));
     let rows: Vec<String> = (inner.y..inner.bottom())
       .map(|y| {
         let (x, y) = (inner.x as i32, y as i32);

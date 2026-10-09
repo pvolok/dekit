@@ -816,8 +816,13 @@ impl Grid {
 
 impl Grid {
   /// Draws a border; the returned block adds title pieces left to right.
-  pub fn block(&mut self, area: Rect, border: BorderType) -> Block<'_> {
-    self.draw_block(area, &border.chars(), Attrs::default());
+  pub fn block(
+    &mut self,
+    area: Rect,
+    border: BorderType,
+    attrs: Attrs,
+  ) -> Block<'_> {
+    self.draw_block(area, &border.chars(), attrs);
     Block {
       grid: self,
       area,

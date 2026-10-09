@@ -4,27 +4,23 @@ use crate::console::action::Action;
 use crate::console::{
   keymap::{Keymap, KeymapGroup},
   state::State,
+  theme::Theme,
 };
-use crate::term::{
-  Color, Grid,
-  attrs::Attrs,
-  grid::{BorderType, Rect},
-};
+use crate::term::{Grid, grid::Rect};
 
 pub fn render_keymap(
   area: Rect,
   grid: &mut Grid,
   state: &State,
   keymap: &Keymap,
+  theme: &Theme,
 ) {
   if area.width <= 3 || area.height < 3 {
     return;
   }
 
-  let mut line = grid
-    .block(area, BorderType::Plain)
-    .title("Help", Attrs::default())
-    .inner();
+  let style = theme.block.panel(false);
+  let mut line = style.draw(grid, area).title(" Help ", style.title).inner();
 
   let group = state.keymap_group();
   let items: &[Action] = match group {
@@ -48,16 +44,16 @@ pub fn render_keymap(
     ],
   };
 
-  let plain = Attrs::default();
-  let yellow = Attrs::default().fg(Color::YELLOW);
   for action in items {
     let Some(key) = keymap.key(group, action) else {
       continue;
     };
     for (text, attrs) in [
-      (" <".to_string(), plain),
-      (key.to_string(), yellow),
-      (format!(": {}> ", action.desc()), plain),
+      (" <".to_string(), style.dim),
+      (key.to_string(), style.key),
+      (": ".to_string(), style.dim),
+      (action.desc(), style.text),
+      ("> ".to_string(), style.dim),
     ] {
       grid.draw_text(line.take_left(text.width() as u16), &text, attrs);
     }

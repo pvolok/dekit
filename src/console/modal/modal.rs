@@ -1,4 +1,4 @@
-use crate::console::{action::Action, keymap::Keymap};
+use crate::console::{action::Action, keymap::Keymap, theme::Theme};
 use crate::term::{Grid, grid::Rect, key::Key};
 
 pub enum ModalResult {
@@ -16,7 +16,7 @@ pub trait Modal: Send {
   /// Width and height, given the frame the modal is centered in.
   fn size(&self, frame: Rect) -> (u16, u16);
 
-  fn render(&mut self, grid: &mut Grid, keymap: &Keymap);
+  fn render(&mut self, grid: &mut Grid, keymap: &Keymap, theme: &Theme);
 
   fn area(&self, frame: Rect) -> Rect {
     let (w, h) = self.size(frame);

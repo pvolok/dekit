@@ -6,13 +6,9 @@ use crate::config::config::Config;
 use crate::console::state::{Scope, State};
 use crate::console::task_tree::{Group, Node};
 use crate::console::task_view::TaskView;
-use crate::console::theme::{Rgb, TaskListTheme};
+use crate::console::theme::{TaskListTheme, Theme};
 use crate::kernel::task::{ExitInfo, TaskKind, TaskState};
-use crate::term::{
-  Color, Grid,
-  attrs::Attrs,
-  grid::{BorderType, Rect},
-};
+use crate::term::{Grid, Rgb, attrs::Attrs, grid::Rect};
 
 /// Blank cells between the border and each row.
 const PAD: u16 = 1;
@@ -24,35 +20,15 @@ pub fn render_tasks(
   grid: &mut Grid,
   state: &mut State,
   config: &Config,
-  theme: &TaskListTheme,
+  theme: &Theme,
 ) {
-  let active = state.scope == Scope::Tasks;
-
-  let border = if active {
-    BorderType::Thick
-  } else {
-    BorderType::Plain
-  };
-  let mut block = grid.block(area, border);
-  block.title(
-    config.tui.sidebar.title.as_str(),
-    if active {
-      Attrs::default().set_bold(true)
-    } else {
-      Attrs::default()
-    },
-  );
+  let style = theme.block.panel(state.scope == Scope::Tasks);
+  let mut block = style.draw(grid, area);
+  block.title(&format!(" {} ", config.tui.sidebar.title), style.title);
   if state.quitting {
-    block.gap(1).title(
-      "QUITTING",
-      Attrs::default()
-        .fg(Color::BLACK)
-        .bg(Color::RED)
-        .set_bold(true),
-    );
+    block.title(" QUITTING ", style.alert);
   }
   let inner = block.inner();
-  grid.fill_area(inner, ' ', Attrs::default().bg(theme.bg.into()));
 
   let tasks = &mut state.tasks;
   for list_row in tasks.rows(inner) {
@@ -60,17 +36,17 @@ pub fn render_tasks(
       continue;
     };
     let bg = if list_row.selected {
-      theme.selected_bg
+      theme.block.selected_bg
     } else {
-      theme.bg
+      theme.block.bg
     };
     let paint = |color: Rgb| Attrs::default().bg(bg.into()).fg(color.into());
     let (status_text, status_color) = match node {
-      Node::Task(task) => task_status(task, theme),
-      Node::Group(group) => group_status(group, theme),
+      Node::Task(task) => task_status(task, &theme.tasks),
+      Node::Group(group) => group_status(group, &theme.tasks),
     };
 
-    grid.fill_area(list_row.area, ' ', paint(theme.text));
+    grid.fill_area(list_row.area, ' ', paint(theme.block.text));
     let depth = path.depth().saturating_sub(1) as u16;
     let left = PAD + INDENT.saturating_mul(depth);
     let mut area = list_row.area.inner((0, 0, 0, left));
@@ -90,10 +66,10 @@ pub fn render_tasks(
     let mut name_area = area.take_left((name.width() + suffix.width()) as u16);
     let suffix_area = name_area.take_right(suffix.width() as u16);
     if name.width() > name_area.width as usize {
-      grid.draw_text(name_area.take_right(1), "…", paint(theme.text));
+      grid.draw_text(name_area.take_right(1), "…", paint(theme.block.text));
     }
-    grid.draw_text(name_area, name, paint(theme.text));
-    grid.draw_text(suffix_area, suffix, paint(theme.mark));
+    grid.draw_text(name_area, name, paint(theme.block.text));
+    grid.draw_text(suffix_area, suffix, paint(theme.tasks.mark));
   }
 }
 
