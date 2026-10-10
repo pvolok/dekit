@@ -1,6 +1,9 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, pin::Pin, sync::Arc, time::Duration};
 
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::{
+  sync::mpsc::{UnboundedReceiver, unbounded_channel},
+  time::Sleep,
+};
 
 use crate::{
   dekit::server::{
@@ -16,12 +19,13 @@ use crate::{
     task_screen::{ObserverId, ScreenNotify, ScrollUnit, TaskScreenCmd},
   },
   protocol::{
-    Bye, ConnReceiver, ConnSender, CtlMsg, Msg, ScreenCommand, codes,
+    Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Msg, ScreenCommand,
+    codes,
     ctl::{EVENT_INPUT, EVENT_SCREEN, Hello},
     ok_result, screen,
   },
   target::Target,
-  term::{ScreenDiffer, Size, TermEvent, Winsize, vt::emit},
+  term::{ScreenDiffer, Size, TermEvent, Winsize, reveal, vt::emit},
   upgrade::snapshot as snap,
 };
 
@@ -61,13 +65,14 @@ pub async fn attach_session(
     return;
   }
   run_attached(
-    ctx, reg, fd, hello, task.id, vt, size, until_exit, sender, receiver,
+    ctx, reg, fd, hello, task.id, vt, size, until_exit, false, sender, receiver,
   )
   .await;
 }
 
 /// An attach session inherited across an upgrade: the task is re-observed
-/// and the client gets a full repaint.
+/// and the client gets a full repaint, swept in over what the old image
+/// left on its terminal once the screen has settled.
 pub async fn resume_session(
   ctx: Arc<ServerCtx>,
   mut reg: ConnReg,
@@ -80,12 +85,8 @@ pub async fn resume_session(
   receiver: ConnReceiver,
 ) {
   let Ok((_, vt)) = resolve_screen(&ctx.pc, &Target::Id(task)).await else {
-    let bye = CtlMsg::Bye(Bye {
-      code: codes::QUIT.to_string(),
-      message: "task did not survive the upgrade".to_string(),
-      state: None,
-      screen: None,
-    });
+    let bye =
+      CtlMsg::Bye(Bye::new(codes::QUIT, "task did not survive the upgrade"));
     if sender.queue_ctl(bye).is_ok() {
       finish(
         &mut sender,
@@ -106,7 +107,7 @@ pub async fn resume_session(
     return;
   }
   run_attached(
-    &ctx, reg, fd, &hello, task, vt, size, until_exit, sender, receiver,
+    &ctx, reg, fd, &hello, task, vt, size, until_exit, true, sender, receiver,
   )
   .await;
 }
@@ -120,6 +121,7 @@ async fn run_attached(
   vt: SharedVt,
   size: Size,
   until_exit: bool,
+  resumed: bool,
   mut sender: ConnSender,
   mut receiver: ConnReceiver,
 ) {
@@ -137,6 +139,7 @@ async fn run_attached(
         y_px: 0,
       },
       sink,
+      client_version: Some(hello.version.clone()),
     },
   );
   let mut until = None;
@@ -164,6 +167,7 @@ async fn run_attached(
     notifies,
     until,
     ended,
+    resumed,
     &mut sender,
     &mut receiver,
     &mut reg.ctl,
@@ -184,17 +188,15 @@ async fn run_attached(
       // it could ask can never leak the task.
       pc.send(KernelCommand::Remove(TaskSelector::Id(task), None));
       Bye {
-        code: codes::TASK_EXITED.to_string(),
-        message: String::new(),
         state,
         screen,
+        ..Bye::new(codes::TASK_EXITED, "")
       }
     }
-    SessionEnd::Closed => Bye {
-      code: codes::QUIT.to_string(),
-      message: String::new(),
-      state: None,
-      screen: None,
+    SessionEnd::Closed => Bye::new(codes::QUIT, ""),
+    SessionEnd::Switch { kind, root } => Bye {
+      switch: Some(ByeSwitch { kind, root }),
+      ..Bye::new(codes::QUIT, "")
     },
   };
   if sender.queue_ctl(CtlMsg::Bye(bye)).is_ok() {
@@ -207,6 +209,24 @@ async fn run_attached(
     )
     .await;
   }
+}
+
+/// How long a resumed session waits for the screen to stop changing
+/// before sweeping it in, and the most it waits in all.
+const REVEAL_SETTLE: Duration = Duration::from_millis(80);
+const REVEAL_SETTLE_MAX: Duration = Duration::from_millis(300);
+
+/// The sweep of a resumed session's first paint (`term::reveal`).
+enum Reveal {
+  Off,
+  /// Waiting for the screen to settle; `deadline` caps the wait.
+  Settling {
+    deadline: tokio::time::Instant,
+  },
+  /// Frames still to write, one per `FRAME_INTERVAL`.
+  Sweeping {
+    frames: VecDeque<Vec<u8>>,
+  },
 }
 
 /// What the session reports when frozen for an upgrade.
@@ -235,6 +255,8 @@ enum SessionEnd {
   Closed,
   /// `until_exit`: the attached task's execution finished.
   TaskExited,
+  /// The console sends the client on to another runner.
+  Switch { kind: String, root: String },
 }
 
 async fn kernel_task_state(
@@ -257,6 +279,7 @@ async fn session(
   mut notifies: UnboundedReceiver<ScreenNotify>,
   mut until: Option<UnboundedReceiver<bool>>,
   mut ended: bool,
+  resumed: bool,
   sender: &mut ConnSender,
   receiver: &mut ConnReceiver,
   ctl: &mut UnboundedReceiver<ConnCtl>,
@@ -269,6 +292,21 @@ async fn session(
   let mut batch = Vec::new();
   // Frozen for an upgrade: nothing read or painted until thawed.
   let mut frozen = false;
+  // After an upgrade the client still shows the old kernel's paint, and
+  // the first paint of the new one is swept in over it. Paints are held
+  // until the screen has been quiet for a moment (the console redraws on
+  // re-attach), at most `REVEAL_SETTLE_MAX`, so the sweep reveals the
+  // task's settled screen. The sweep is paced by the loop, never awaited
+  // inline: a client that stops reading stalls it, not its own input.
+  let mut reveal = if resumed {
+    Reveal::Settling {
+      deadline: tokio::time::Instant::now() + REVEAL_SETTLE_MAX,
+    }
+  } else {
+    Reveal::Off
+  };
+  let mut reveal_timer: Pin<Box<Sleep>> =
+    Box::pin(tokio::time::sleep(REVEAL_SETTLE));
   loop {
     if ended && !frozen {
       // The task reports its exit only after its output reached the
@@ -329,10 +367,58 @@ async fn session(
               // For terminals without OSC 52, while the runner is local.
               tokio::task::spawn_blocking(move || crate::clipboard::copy(&text));
             }
+            ScreenNotify::Switch { kind, root } => {
+              return SessionEnd::Switch { kind, root };
+            }
           }
         }
-        if paint {
+        match &reveal {
+          Reveal::Off if paint => {
+            render(&mut differ, vt, &present, &mut title, &mut out);
+          }
+          Reveal::Settling { deadline, .. } if paint => {
+            let quiet = tokio::time::Instant::now() + REVEAL_SETTLE;
+            reveal_timer.as_mut().reset(quiet.min(*deadline));
+          }
+          // The paint after the sweep catches up on anything drawn
+          // meanwhile.
+          Reveal::Off | Reveal::Settling { .. } | Reveal::Sweeping { .. } => (),
+        }
+        if !out.is_empty() && sender.queue_out(out.into()).is_err() {
+          return SessionEnd::Closed;
+        }
+      }
+      _ = reveal_timer.as_mut(), if !matches!(reveal, Reveal::Off) && !frozen && sender.pending().is_empty() => {
+        let mut frames = match std::mem::replace(&mut reveal, Reveal::Off) {
+          Reveal::Off => unreachable!("guarded"),
+          Reveal::Settling { .. } => {
+            match present.as_ref().unwrap_or(vt).read() {
+              Ok(screen) => VecDeque::from(reveal::frames(&*screen)),
+              Err(_) => VecDeque::new(),
+            }
+          }
+          Reveal::Sweeping { frames } => frames,
+        };
+        let mut out = Vec::new();
+        let swept = match frames.pop_front() {
+          Some(frame) => {
+            out = frame;
+            true
+          }
+          None => false,
+        };
+        if frames.is_empty() {
+          // Also places the cursor the sweep hid and resets what it
+          // left.
+          if swept {
+            differ.cursor_hidden();
+          }
           render(&mut differ, vt, &present, &mut title, &mut out);
+        } else {
+          reveal = Reveal::Sweeping { frames };
+          reveal_timer
+            .as_mut()
+            .reset(tokio::time::Instant::now() + reveal::FRAME_INTERVAL);
         }
         if !out.is_empty() && sender.queue_out(out.into()).is_err() {
           return SessionEnd::Closed;
@@ -356,6 +442,12 @@ async fn session(
             Ok(event) => {
               if let TermEvent::Resize(width, height) = event {
                 freeze.size = Size { width, height };
+                // The frames were cut for the old size; the paint the
+                // resize brings repaints everything instead.
+                if matches!(reveal, Reveal::Sweeping { .. }) {
+                  reveal = Reveal::Off;
+                  differ.cursor_hidden();
+                }
               }
               pc.send_msg(task, TaskScreenCmd::Input { observer, event });
             }
@@ -440,8 +532,8 @@ mod tests {
       task_path::TaskPath,
     },
     protocol::{
-      ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request, RpcRequest,
-      client_handshake, ctl::EVENT_INPUT,
+      Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request,
+      RpcRequest, client_handshake, codes, ctl::EVENT_INPUT,
     },
     term::{
       TermEvent,
@@ -476,7 +568,15 @@ mod tests {
 
   /// Reads `Out` frames until one contains `needle`.
   async fn wait_for(receiver: &mut ConnReceiver, needle: &[u8]) -> bool {
-    timeout(Duration::from_secs(2), async {
+    wait_for_within(receiver, needle, Duration::from_secs(2)).await
+  }
+
+  async fn wait_for_within(
+    receiver: &mut ConnReceiver,
+    needle: &[u8],
+    limit: Duration,
+  ) -> bool {
+    timeout(limit, async {
       let mut out = Vec::new();
       while let Some(frame) = next_out(receiver).await {
         out.extend(frame);
@@ -666,6 +766,79 @@ mod tests {
     finish(pc, sender, receiver, session, kernel_handle).await;
   }
 
+  /// Reads control messages until the bye.
+  async fn wait_for_bye(receiver: &mut ConnReceiver) -> Option<Bye> {
+    timeout(Duration::from_secs(2), async {
+      loop {
+        match receiver.recv().await {
+          Some(Ok(Msg::Ctl(CtlMsg::Bye(bye)))) => return Some(bye),
+          Some(Ok(_)) => (),
+          Some(Err(_)) | None => return None,
+        }
+      }
+    })
+    .await
+    .unwrap()
+  }
+
+  /// A config whose console sends the attachment to another runner on
+  /// `F5`.
+  fn switching_config() -> Arc<Config> {
+    use crate::console::keymap::KeymapGroup;
+    let mut config = Config::make_default();
+    config.keymap.group_mut(KeymapGroup::Tasks).insert(
+      Key::new(KeyCode::F(5), KeyMods::NONE),
+      crate::console::action::Action::SwitchRunner {
+        kind: "project".to_string(),
+        root: "/home/me/other".to_string(),
+      },
+    );
+    Arc::new(config)
+  }
+
+  async fn press_key(sender: &mut ConnSender, key: Key) {
+    sender
+      .send_ctl(CtlMsg::Event(Event {
+        name: EVENT_INPUT.to_string(),
+        params: serde_json::to_value(TermEvent::Key(key)).unwrap(),
+      }))
+      .await
+      .unwrap();
+  }
+
+  #[tokio::test]
+  async fn console_switch_ends_the_session_with_the_next_runner() {
+    let config = switching_config();
+    let (pc, _, kernel_handle) = console_kernel(&config);
+
+    let (mut sender, mut receiver, session) =
+      attach(&pc, &config, "@dekit/console", false).await;
+    assert!(wait_for(&mut receiver, b"Tasks").await);
+
+    press_key(&mut sender, Key::new(KeyCode::F(5), KeyMods::NONE)).await;
+    let bye = wait_for_bye(&mut receiver).await.unwrap();
+    assert_eq!(bye.code, codes::QUIT);
+    assert_eq!(
+      bye.switch,
+      Some(ByeSwitch {
+        kind: "project".to_string(),
+        root: "/home/me/other".to_string(),
+      })
+    );
+    timeout(Duration::from_secs(2), session)
+      .await
+      .unwrap()
+      .unwrap();
+    drop(sender);
+    drop(receiver);
+
+    // The console and the runner go on for the next attachment.
+    let (sender, mut receiver, session) =
+      attach(&pc, &config, "@dekit/console", false).await;
+    assert!(wait_for(&mut receiver, b"Tasks").await);
+    finish(pc, sender, receiver, session, kernel_handle).await;
+  }
+
   /// A kernel running just the console, as `@dekit/console`.
   fn console_kernel(
     config: &Arc<Config>,
@@ -765,7 +938,14 @@ mod tests {
       "{:?}",
       String::from_utf8_lossy(&first)
     );
-    assert!(wait_for(&mut receiver, b"Tasks").await);
+    // The sweep hides the cursor and paints the screen tinted as the
+    // band crosses, then whole once it is done: a second of frames, so
+    // this waits well past it.
+    assert!(wait_for(&mut receiver, b"\x1b[?25l").await);
+    assert!(wait_for(&mut receiver, b"48;2;").await);
+    assert!(
+      wait_for_within(&mut receiver, b"Tasks", Duration::from_secs(10)).await
+    );
 
     finish(pc, sender, receiver, session, kernel_handle).await;
   }

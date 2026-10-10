@@ -14,15 +14,18 @@ use crate::{
     modal::{
       add_task::AddTaskModal,
       commands_menu::CommandsMenuModal,
+      main_menu::MainMenuModal,
       modal::{Modal, ModalResult},
       quit::QuitModal,
       remove_task::RemoveTaskModal,
       rename_task::RenameTaskModal,
+      runner_select::RunnerSelectModal,
     },
     state::{Scope, State},
     task_tree::{Node, TaskTree},
     task_view::TaskView,
     theme::{BlockTheme, Theme},
+    ui_header::{HeaderInfo, render_header},
     ui_keymap::render_keymap,
     ui_tasks::render_tasks,
     ui_term::render_term,
@@ -149,6 +152,8 @@ impl App {
         tasks: TaskTree::new(),
         hide_keymap_window: !config.tui.tips.show,
         quitting: false,
+        header: Default::default(),
+        hover: None,
       },
       config,
       keymap,
@@ -227,6 +232,18 @@ impl App {
     grid.cursor_pos = None;
     grid.cursor_style = CursorStyle::Default;
 
+    self.state.header = render_header(
+      layout.header,
+      grid,
+      &HeaderInfo {
+        runner: self.config.runner.as_ref(),
+        version: env!("CARGO_PKG_VERSION"),
+        client_versions: self.screen.client_versions().collect(),
+        hover: self.state.hover,
+        held: self.modal.as_ref().and_then(|modal| modal.unshaded()),
+      },
+      &self.theme,
+    );
     render_tasks(
       layout.sidebar,
       grid,
@@ -238,7 +255,7 @@ impl App {
     render_keymap(layout.keymap, grid, &self.state, &self.keymap, &self.theme);
     render_zoom_tip(layout.zoom_banner, grid, &self.keymap, &self.theme);
     if let Some(modal) = &mut self.modal {
-      shade(grid, &self.theme.block);
+      shade(grid, &self.theme.block, modal.unshaded());
       grid.cursor_pos = None;
       grid.cursor_style = CursorStyle::Default;
       modal.render(grid, &self.keymap, &self.theme);
@@ -257,10 +274,15 @@ impl App {
     self.apply_screen(attached);
   }
 
-  fn layout(&self) -> AppLayout {
+  /// The whole screen.
+  fn frame(&self) -> Rect {
     let size = self.vt.read().map(|vt| vt.size()).unwrap_or(DEFAULT_SIZE);
+    Rect::new(0, 0, size.width, size.height)
+  }
+
+  fn layout(&self) -> AppLayout {
     AppLayout::new(
-      Rect::new(0, 0, size.width, size.height),
+      self.frame(),
       self.state.scope.is_zoomed(),
       self.state.hide_keymap_window,
       &self.config,
@@ -305,6 +327,7 @@ impl App {
         observer: self.observer,
         size: winsize(self.layout().term_area().size()),
         sink: self.sink.clone(),
+        client_version: None,
       },
     );
   }
@@ -374,9 +397,9 @@ impl App {
         event: TermEvent::Key(key),
       } => return self.handle_key(observer, key),
       TaskScreenCmd::Input {
+        observer,
         event: TermEvent::Mouse(mouse),
-        ..
-      } => return self.handle_mouse(mouse),
+      } => return self.handle_mouse(observer, mouse),
       TaskScreenCmd::Input {
         event: TermEvent::Paste(text),
         ..
@@ -389,9 +412,12 @@ impl App {
         }
         return;
       }
-      cmd @ (TaskScreenCmd::Attach { .. }
-      | TaskScreenCmd::Detach { .. }
-      | TaskScreenCmd::Input { .. }) => cmd,
+      cmd @ TaskScreenCmd::Detach { .. } => {
+        // The pointer that left would otherwise stay lit for everyone.
+        self.state.hover = None;
+        cmd
+      }
+      cmd @ (TaskScreenCmd::Attach { .. } | TaskScreenCmd::Input { .. }) => cmd,
       // Copy mode and scrolling do not apply to a composed UI.
       TaskScreenCmd::CopyEnter
       | TaskScreenCmd::CopyLeave
@@ -417,12 +443,41 @@ impl App {
     }
   }
 
-  fn handle_mouse(&mut self, mouse: crate::term::mouse::MouseEvent) {
-    if self.modal.is_some() {
+  fn handle_mouse(
+    &mut self,
+    observer: ObserverId,
+    mouse: crate::term::mouse::MouseEvent,
+  ) {
+    let frame = self.frame();
+    self.state.hover = Some((mouse.x as u16, mouse.y as u16));
+    if let Some(modal) = &mut self.modal {
+      match modal.handle_mouse(&mouse, frame) {
+        ModalResult::Keep => (),
+        ModalResult::Close => self.modal = None,
+        ModalResult::Run(action) => {
+          self.modal = None;
+          self.handle_action(Some(observer), action);
+        }
+        ModalResult::Detach => {
+          self.modal = None;
+          self.handle_screen_cmd(TaskScreenCmd::Detach { observer });
+        }
+      }
       return;
     }
     let layout = self.layout();
     let (x, y) = (mouse.x as u16, mouse.y as u16);
+    if layout.header.contains(x, y) {
+      if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+        let hits = self.state.header;
+        if hits.logo.is_some_and(|hit| hit.contains(x, y)) {
+          self.handle_action(Some(observer), Action::ShowMainMenu);
+        } else if hits.runner.is_some_and(|hit| hit.contains(x, y)) {
+          self.handle_action(Some(observer), Action::ShowRunnerSelect);
+        }
+      }
+      return;
+    }
     let pressed = match mouse.kind {
       MouseEventKind::Down(_) => true,
       MouseEventKind::Up(_)
@@ -533,6 +588,26 @@ impl App {
       Action::ShowCommandsMenu => {
         self.modal = Some(Box::new(CommandsMenuModal::new()));
       }
+      Action::ShowMainMenu => {
+        let anchor = self.state.header.logo.unwrap_or_default();
+        self.modal = Some(Box::new(MainMenuModal::new(anchor)));
+      }
+      // Only a console inside a runner has somewhere to switch from.
+      Action::ShowRunnerSelect => {
+        if self.config.runner.is_some() {
+          self.modal = Some(Box::new(RunnerSelectModal::new(
+            self.config.runner.as_ref(),
+          )));
+        }
+      }
+      Action::SwitchRunner { kind, root } => match observer {
+        Some(observer) => {
+          self
+            .screen
+            .notify(observer, ScreenNotify::Switch { kind, root });
+        }
+        None => log::warn!("switch-runner needs an attached client"),
+      },
       Action::CloseCurrentModal => self.modal = None,
       Action::ToggleKeymapWindow => {
         self.state.hide_keymap_window = !self.state.hide_keymap_window;
@@ -739,7 +814,11 @@ impl App {
 
   fn handle_screen_notify(&mut self, notify: ScreenNotify) {
     match notify {
-      ScreenNotify::Attached | ScreenNotify::Render | ScreenNotify::Bell => (),
+      ScreenNotify::Attached
+      | ScreenNotify::Render
+      | ScreenNotify::Bell
+      // Addressed to attach sessions, never to a screen's observer.
+      | ScreenNotify::Switch { .. } => (),
       ScreenNotify::CopyPresent { screen, vt } => {
         if let Some(task) = self.state.tasks.task_mut(screen) {
           task.present = vt;
@@ -775,10 +854,14 @@ impl App {
   }
 }
 
-fn shade(grid: &mut Grid, theme: &BlockTheme) {
+/// Dims everything but `keep`.
+fn shade(grid: &mut Grid, theme: &BlockTheme, keep: Option<Rect>) {
   let area = grid.area();
   for row in area.y..area.bottom() {
     for col in area.x..area.right() {
+      if keep.is_some_and(|keep| keep.contains(col, row)) {
+        continue;
+      }
       if let Some(cell) = grid.drawing_cell_mut(Pos { col, row }) {
         let attrs = cell.attrs();
         cell.set_attrs(Attrs {

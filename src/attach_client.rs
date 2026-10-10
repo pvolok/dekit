@@ -1,10 +1,13 @@
-use anyhow::bail;
+use std::path::Path;
+
+use anyhow::{Context, bail};
 use tokio::io::AsyncWriteExt;
 
 use crate::protocol::{
-  ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request, RpcRequest,
+  ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request, RpcRequest,
   client_handshake, codes, ctl::EVENT_INPUT,
 };
+use crate::runner::{RunnerKind, RunnerSpec};
 use crate::target::Target;
 use crate::term::TermEvent;
 use crate::term::key::{Key, KeyEventKind};
@@ -17,6 +20,9 @@ pub enum AttachEnd {
   /// `until_exit`: the attached task's execution finished, with the
   /// final state the runner reported in the bye.
   TaskExited(Option<crate::protocol::RpcState>),
+  /// The console asked for a switch: attach to this runner's console
+  /// next.
+  Switch(RunnerSpec),
 }
 
 /// Attaches the local terminal to `target`'s screen until the session
@@ -38,6 +44,7 @@ pub async fn client_main(
   drop(term_driver);
   match result? {
     LoopEnd::Detached => Ok(AttachEnd::Detached),
+    LoopEnd::Switch(runner) => Ok(AttachEnd::Switch(runner)),
     LoopEnd::TaskExited { state, screen } => {
       if let Some(screen) = screen {
         use std::io::Write;
@@ -57,6 +64,19 @@ enum LoopEnd {
     state: Option<crate::protocol::RpcState>,
     screen: Option<String>,
   },
+  Switch(RunnerSpec),
+}
+
+/// The runner a `quit` bye sends the client on to, as a target.
+fn switch_target(switch: ByeSwitch) -> anyhow::Result<RunnerSpec> {
+  let Some(kind) = RunnerKind::from_name(&switch.kind) else {
+    bail!(
+      "runner asked for a switch to an unknown runner kind '{}'",
+      switch.kind
+    );
+  };
+  RunnerSpec::exact(kind, Path::new(&switch.root))
+    .with_context(|| format!("cannot switch to runner at {}", switch.root))
 }
 
 async fn client_loop(
@@ -109,6 +129,9 @@ async fn client_loop(
           }
           CtlMsg::Bye(bye) => {
             if bye.code == codes::QUIT {
+              if let Some(switch) = bye.switch {
+                return Ok(LoopEnd::Switch(switch_target(switch)?));
+              }
               break;
             }
             if bye.code == codes::TASK_EXITED {

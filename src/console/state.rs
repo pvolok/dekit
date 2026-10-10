@@ -1,5 +1,6 @@
 use crate::console::{
   keymap::KeymapGroup, task_tree::TaskTree, task_view::TaskView,
+  ui_header::HeaderHits,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +41,10 @@ pub struct State {
   pub tasks: TaskTree,
   pub hide_keymap_window: bool,
   pub quitting: bool,
+  /// The clickable parts of the header as last drawn.
+  pub header: HeaderHits,
+  /// Where the mouse was last seen, for hover highlights.
+  pub hover: Option<(u16, u16)>,
 }
 
 impl State {

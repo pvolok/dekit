@@ -18,6 +18,13 @@ pub struct Theme {
 pub struct BlockTheme {
   pub bg: Rgb,
   pub modal_bg: Rgb,
+  /// The header bar across the top: lighter than the blocks under it.
+  pub header_bg: Rgb,
+  /// The `dekit` badge at the bar's left end.
+  pub logo_bg: Rgb,
+  pub logo_fg: Rgb,
+  /// The runner's name in the bar.
+  pub header_project: Rgb,
   /// Everything under an open modal moves `shade_amount`/255 toward
   /// `shade`.
   pub shade: Rgb,
@@ -81,6 +88,10 @@ impl Theme {
       block: BlockTheme {
         bg,
         modal_bg: Rgb(0x21, 0x28, 0x30),
+        header_bg: Rgb(0x2b, 0x33, 0x3d),
+        logo_bg: Rgb(0x27, 0x51, 0x93),
+        logo_fg: Rgb(0xff, 0xff, 0xff),
+        header_project: Rgb(0x56, 0xd4, 0xdd),
         shade: Rgb(0x00, 0x00, 0x00),
         shade_amount: 128,
         selected_bg: Rgb(0x42, 0x4a, 0x57),
@@ -134,6 +145,10 @@ impl Theme {
       block: BlockTheme {
         bg,
         modal_bg: Rgb(0xff, 0xff, 0xff),
+        header_bg: Rgb(0xe1, 0xe7, 0xee),
+        logo_bg: Rgb(0x4a, 0x80, 0xc8),
+        logo_fg: Rgb(0xff, 0xff, 0xff),
+        header_project: Rgb(0x1b, 0x7c, 0x83),
         shade: Rgb(0x1f, 0x23, 0x28),
         shade_amount: 77,
         selected_bg: Rgb(0xdd, 0xe4, 0xec),

@@ -19,6 +19,11 @@ painted, with `bye` (`task_exited`) carrying the task's final `state` and
 final `screen` in optional fields. The runner removes the attached task at
 that point, which is what the foreground `run` verb relies on.
 
+The console's runner selector ends a session with `bye` (`quit`)
+carrying `switch: {kind, root}`: the client connects to that runner
+(`project` or `host`, at the absolute `root`) and attaches to its console,
+starting the runner when it is not up.
+
 ## Screen stream
 
 `Out` frames carry a terminal byte stream: the client owns a raw-mode

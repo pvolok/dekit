@@ -76,6 +76,30 @@ pub struct Bye {
   /// the alternate screen (which the terminal would otherwise restore).
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub screen: Option<String>,
+  /// A `quit` bye from the console's runner selector: the runner the
+  /// client attaches to next.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub switch: Option<ByeSwitch>,
+}
+
+impl Bye {
+  pub fn new(code: &str, message: impl Into<String>) -> Self {
+    Bye {
+      code: code.to_string(),
+      message: message.into(),
+      state: None,
+      screen: None,
+      switch: None,
+    }
+  }
+}
+
+/// A runner on the same machine, as its record names it: `kind` is
+/// `project` or `host`, `root` its absolute root directory.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ByeSwitch {
+  pub kind: String,
+  pub root: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -231,6 +255,7 @@ mod tests {
           message: String::new(),
           state: None,
           screen: None,
+          switch: None,
         }),
         r#"{"type":"bye","code":"quit"}"#,
       ),
@@ -240,6 +265,7 @@ mod tests {
           message: "speak 1".to_string(),
           state: None,
           screen: None,
+          switch: None,
         }),
         r#"{"type":"bye","code":"unsupported_protocol","message":"speak 1"}"#,
       ),
@@ -254,8 +280,19 @@ mod tests {
             reason: None,
           }),
           screen: Some("build ok".to_string()),
+          switch: None,
         }),
         r#"{"type":"bye","code":"task_exited","state":{"state":"exited","exit_code":3},"screen":"build ok"}"#,
+      ),
+      (
+        CtlMsg::Bye(Bye {
+          switch: Some(ByeSwitch {
+            kind: "project".to_string(),
+            root: "/home/me/app".to_string(),
+          }),
+          ..Bye::new(codes::QUIT, "")
+        }),
+        r#"{"type":"bye","code":"quit","switch":{"kind":"project","root":"/home/me/app"}}"#,
       ),
     ]
   }
@@ -288,6 +325,7 @@ mod tests {
         message: String::new(),
         state: None,
         screen: None,
+        switch: None,
       })
     );
   }

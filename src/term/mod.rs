@@ -9,6 +9,7 @@ pub mod key;
 pub mod line_symbols;
 pub mod mouse;
 pub mod palette;
+pub mod reveal;
 pub mod row;
 pub mod screen;
 pub mod screen_differ;

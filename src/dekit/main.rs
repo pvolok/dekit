@@ -538,6 +538,28 @@ fn run_exit_code(state: Option<&RpcState>) -> i32 {
   if state.state == "done" { 0 } else { 1 }
 }
 
+/// Attaches to `target` on `runner`, and follows the console from runner
+/// to runner for as long as it asks to switch. A switch always lands on
+/// the next runner's console, starting that runner when it is not up.
+async fn attach_loop(
+  mut runner: RunnerSpec,
+  mut target: Target,
+  mut start: bool,
+) -> anyhow::Result<()> {
+  loop {
+    let (sender, receiver) = connect_client_socket(&runner, start).await?;
+    match client_main(target, false, sender, receiver).await? {
+      AttachEnd::Detached | AttachEnd::TaskExited(_) => return Ok(()),
+      AttachEnd::Switch(next) => {
+        eprintln!("Switching to {}...", next.root.display());
+        runner = next;
+        target = "@dekit/console".parse().expect("valid target");
+        start = true;
+      }
+    }
+  }
+}
+
 fn arg_target(sub_m: &clap::ArgMatches) -> anyhow::Result<Option<Target>> {
   sub_m
     .get_one::<String>("target")
@@ -882,8 +904,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       let target = arg_target(sub_m)?.unwrap_or_else(console);
       let (runner, target) = resolve_target(&matches, target)?;
       let start = !sub_m.get_flag("no-start");
-      let (sender, receiver) = connect_client_socket(&runner, start).await?;
-      client_main(target, false, sender, receiver).await?;
+      attach_loop(runner, target, start).await?;
     }
     Some(("spawn", sub_m)) => {
       let target = arg_target(sub_m)?.expect("clap requires target");
@@ -910,7 +931,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         AttachEnd::TaskExited(state) => {
           std::process::exit(run_exit_code(state.as_ref()));
         }
-        AttachEnd::Detached => {
+        AttachEnd::Detached | AttachEnd::Switch(_) => {
           eprintln!(
             "Detached; {target} keeps running (remove with `dekit rm {target}`)."
           );
@@ -1318,8 +1339,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
               .await?;
           }
         }
-        let (sender, receiver) = connect_client_socket(&runner, true).await?;
-        client_main(console(), false, sender, receiver).await?;
+        attach_loop(runner, console(), true).await?;
       }
     }
   }

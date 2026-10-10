@@ -74,6 +74,7 @@ impl KeymapConfig {
     s.keymap_add_p(KeyCode::Char('q').into(), Action::ShowQuit);
     s.keymap_add_p(KeyCode::Char('Q').into(), Action::Down);
     s.keymap_add_p(KeyCode::Char('p').into(), Action::ShowCommandsMenu);
+    s.keymap_add_p(KeyCode::Char('P').into(), Action::ShowRunnerSelect);
     s.keymap_add_p(Key::new(KeyCode::Down, KeyMods::NONE), Action::NextTask);
     s.keymap_add_p(
       Key::new(KeyCode::Char('j'), KeyMods::NONE),

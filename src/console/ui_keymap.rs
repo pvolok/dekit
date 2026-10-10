@@ -34,6 +34,7 @@ pub fn render_keymap(
       Action::RestartTask,
       Action::Zoom,
       Action::ShowCommandsMenu,
+      Action::ShowRunnerSelect,
       Action::ToggleKeymapWindow,
     ],
     KeymapGroup::Term => &[Action::ToggleFocus],

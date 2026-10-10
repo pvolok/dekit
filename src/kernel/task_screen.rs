@@ -70,6 +70,9 @@ struct Observer {
   id: ObserverId,
   size: Winsize,
   sink: UnboundedSender<ScreenNotify>,
+  /// The dekit version of the client behind this observer, when it is
+  /// an attach session rather than another screen.
+  client_version: Option<String>,
 }
 
 pub enum TaskScreenCmd {
@@ -77,6 +80,9 @@ pub enum TaskScreenCmd {
     observer: ObserverId,
     size: Winsize,
     sink: UnboundedSender<ScreenNotify>,
+    /// The attaching client's dekit version; `None` for an in-process
+    /// observer like the console.
+    client_version: Option<String>,
   },
   Detach {
     observer: ObserverId,
@@ -125,6 +131,12 @@ pub enum ScreenNotify {
   Yank {
     text: String,
   },
+  /// Sent to one attach session: its client should leave this runner
+  /// and attach to the console of the named one.
+  Switch {
+    kind: String,
+    root: String,
+  },
 }
 
 pub enum TaskScreenEffect {
@@ -169,6 +181,24 @@ impl TaskScreen {
 
   pub fn has_observers(&self) -> bool {
     !self.observers.is_empty()
+  }
+
+  /// The dekit versions of the attached clients, one per attach session.
+  pub fn client_versions(&self) -> impl Iterator<Item = &str> {
+    self
+      .observers
+      .iter()
+      .filter_map(|o| o.client_version.as_deref())
+  }
+
+  /// Sends a notification to one observer. A closed sink is noticed the
+  /// way a failed broadcast is.
+  pub fn notify(&mut self, observer: ObserverId, notify: ScreenNotify) {
+    if let Some(obs) = self.observers.iter().find(|o| o.id == observer)
+      && obs.sink.send(notify).is_err()
+    {
+      self.lost_observers = true;
+    }
   }
 
   fn broadcast(&mut self, mut make: impl FnMut(TaskId) -> ScreenNotify) {
@@ -255,6 +285,7 @@ impl TaskScreen {
         observer,
         size,
         sink,
+        client_version,
       } => {
         // Re-attaching replaces the previous registration.
         self.observers.retain(|o| o.id != observer);
@@ -262,6 +293,7 @@ impl TaskScreen {
           id: observer,
           size,
           sink,
+          client_version,
         });
         // Size first so Attached/CopyPresent paint the applied geometry.
         let resized = self.sync_size(effects);
@@ -731,6 +763,7 @@ mod tests {
         observer,
         size,
         sink,
+        client_version: None,
       },
       &mut effects,
     );
@@ -748,6 +781,7 @@ mod tests {
         Ok(ScreenNotify::Bell) => out.push("bell"),
         Ok(ScreenNotify::CopyPresent { .. }) => out.push("copy"),
         Ok(ScreenNotify::Yank { .. }) => out.push("yank"),
+        Ok(ScreenNotify::Switch { .. }) => out.push("switch"),
         Err(_) => break,
       }
     }

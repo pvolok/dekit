@@ -7,6 +7,7 @@ pub mod state;
 pub mod task_tree;
 pub mod task_view;
 pub mod theme;
+pub mod ui_header;
 pub mod ui_keymap;
 pub mod ui_tasks;
 pub mod ui_term;

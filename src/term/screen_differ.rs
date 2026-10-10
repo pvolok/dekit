@@ -37,6 +37,12 @@ impl ScreenDiffer {
     }
   }
 
+  /// The cursor was hidden behind the differ's back (the reveal sweep
+  /// does): the next diff shows it again if the screen has one.
+  pub fn cursor_hidden(&mut self) {
+    self.cursor_pos = None;
+  }
+
   /// Puts a terminal in the state `new` assumes it is in.
   pub fn reset(out: &mut Vec<u8>) {
     out.extend_from_slice(emit::SGR_RESET.as_bytes());
@@ -190,7 +196,7 @@ impl BufferView for Screen {
 
 #[cfg(test)]
 mod tests {
-  use crate::term::Color;
+  use crate::term::{Color, Screen, Size};
 
   use super::*;
 
@@ -228,6 +234,27 @@ mod tests {
     out.clear();
     differ.diff(&mut out, &screen);
     assert_eq!(out, b"\x1b[1;2H_3");
+  }
+
+  #[test]
+  fn a_hidden_cursor_is_shown_again_on_the_next_paint() {
+    let mut differ = ScreenDiffer::new();
+    let mut out = Vec::new();
+    let mut screen = Screen::new(
+      Size {
+        width: 3,
+        height: 1,
+      },
+      0,
+    );
+    screen.process(b"abc", &mut Vec::new());
+    differ.diff(&mut out, &screen);
+    assert!(!out.contains(&b'?'), "the cursor is visible on both sides");
+
+    differ.cursor_hidden();
+    out.clear();
+    differ.diff(&mut out, &screen);
+    assert_eq!(out, b"\x1b[?25h");
   }
 
   #[test]

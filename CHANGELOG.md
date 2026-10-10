@@ -1,5 +1,8 @@
 ## Unreleased
 
+- Add TUI header with menu
+- Add screen sweep effect after upgrade
+
 ## 0.10.1 - 2026-10-08
 
 - Install from npm (`npm install -g @dekit/cli`) or PyPI

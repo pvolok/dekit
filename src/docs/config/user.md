@@ -73,6 +73,8 @@ Default bindings in `tasks`:
   desc: show-add-task, duplicate-task, show-remove-task, show-rename-task
 - cmd: <p>
   desc: show-commands-menu
+- cmd: <P>
+  desc: show-runner-select
 - cmd: <z>
   desc: zoom
 - cmd: <v>
@@ -92,7 +94,10 @@ Default bindings in `tasks`:
 In `term_copy`: `<Esc>` copy-mode-leave, `<v>` copy-mode-end, `<c>`
 copy-mode-copy, `<h>` `<j>` `<k>` `<l>` or the arrows copy-mode-move, and
 the same scroll keys. Other actions: focus-tasks, focus-term, restart-all,
-force-restart-all, veto-task, close-current-modal, detach, quit (stops
-the runner without saving, like |cli/runner/stop|), and
+force-restart-all, veto-task, close-current-modal, show-main-menu (the
+menu under the `dekit` badge, also by clicking it), detach, quit (stops
+the runner without saving, like |cli/runner/stop|),
+`{action: switch-runner, kind: project, root: /abs/path}` to move the
+attachment to another runner's console, and
 `{action: command, command: {...}}` to run any command from
 |config/hooks|.

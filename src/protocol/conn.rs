@@ -230,15 +230,13 @@ pub async fn client_handshake(
 /// they speak different protocols.
 pub fn server_hello(client: &Hello) -> Result<Hello, Bye> {
   if client.protocol != PROTOCOL_VERSION {
-    return Err(Bye {
-      code: codes::UNSUPPORTED_PROTOCOL.to_string(),
-      message: format!(
+    return Err(Bye::new(
+      codes::UNSUPPORTED_PROTOCOL,
+      format!(
         "runner speaks protocol {}, client ({}) speaks {}",
         PROTOCOL_VERSION, client.app, client.protocol,
       ),
-      state: None,
-      screen: None,
-    });
+    ));
   }
   Ok(local_hello())
 }

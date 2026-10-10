@@ -204,6 +204,8 @@ fn menu_items(search: &str) -> Vec<MenuItem> {
     Action::FocusTerm,
     Action::Zoom,
     Action::ShowCommandsMenu,
+    Action::ShowMainMenu,
+    Action::ShowRunnerSelect,
     Action::NextTask,
     Action::PrevTask,
     Action::Expand,

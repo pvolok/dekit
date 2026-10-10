@@ -33,6 +33,15 @@ pub enum Action {
   Zoom,
 
   ShowCommandsMenu,
+  /// The menu under the `dekit` badge in the header.
+  ShowMainMenu,
+  /// The list of runners on this machine, to attach to another one.
+  ShowRunnerSelect,
+  /// Send the attachment that asked to the console of another runner.
+  SwitchRunner {
+    kind: String,
+    root: String,
+  },
   NextTask,
   PrevTask,
   /// Open the selected group, or step into it when it is open.
@@ -119,6 +128,9 @@ impl Action {
       Action::FocusTerm => "Focus terminal".to_string(),
       Action::Zoom => "Zoom".to_string(),
       Action::ShowCommandsMenu => "All commands".to_string(),
+      Action::ShowMainMenu => "Main menu".to_string(),
+      Action::ShowRunnerSelect => "Switch runner".to_string(),
+      Action::SwitchRunner { root, .. } => format!("Switch to runner {root}"),
       Action::NextTask => "Next".to_string(),
       Action::PrevTask => "Prev".to_string(),
       Action::Expand => "Expand group".to_string(),
