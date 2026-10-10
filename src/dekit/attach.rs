@@ -19,9 +19,9 @@ use crate::{
     task_screen::{ObserverId, ScreenNotify, ScrollUnit, TaskScreenCmd},
   },
   protocol::{
-    Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Msg, ScreenCommand,
-    codes,
-    ctl::{EVENT_INPUT, EVENT_SCREEN, Hello},
+    Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Msg,
+    ScreenCommand, codes,
+    ctl::{CopyEvent, EVENT_COPY, EVENT_INPUT, EVENT_SCREEN, Hello},
     ok_result, screen,
   },
   target::Target,
@@ -362,10 +362,17 @@ async fn session(
               present = vt;
               paint = true;
             }
+            // The client owns the user's clipboard: it knows which
+            // terminal and machine the user is at, the runner does not.
             ScreenNotify::Yank { text } => {
-              emit::osc52_copy(&mut out, &text);
-              // For terminals without OSC 52, while the runner is local.
-              tokio::task::spawn_blocking(move || crate::clipboard::copy(&text));
+              let event = CtlMsg::Event(Event {
+                name: EVENT_COPY.to_string(),
+                params: serde_json::to_value(CopyEvent { text })
+                  .expect("a string serializes"),
+              });
+              if sender.queue_ctl(event).is_err() {
+                return SessionEnd::Closed;
+              }
             }
             ScreenNotify::Switch { kind, root } => {
               return SessionEnd::Switch { kind, root };
@@ -533,7 +540,8 @@ mod tests {
     },
     protocol::{
       Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request,
-      RpcRequest, client_handshake, codes, ctl::EVENT_INPUT,
+      RpcRequest, client_handshake, codes,
+      ctl::{CopyEvent, EVENT_COPY, EVENT_INPUT},
     },
     term::{
       TermEvent,
@@ -767,6 +775,27 @@ mod tests {
   }
 
   /// Reads control messages until the bye.
+  /// Reads frames until a `copy` event arrives, returning its text.
+  async fn wait_for_copy(receiver: &mut ConnReceiver) -> Option<String> {
+    timeout(Duration::from_secs(2), async {
+      loop {
+        match receiver.recv().await {
+          Some(Ok(Msg::Ctl(CtlMsg::Event(event))))
+            if event.name == EVENT_COPY =>
+          {
+            let copy: CopyEvent =
+              serde_json::from_value(event.params).expect("copy event params");
+            return Some(copy.text);
+          }
+          Some(Ok(_)) => (),
+          Some(Err(_)) | None => return None,
+        }
+      }
+    })
+    .await
+    .unwrap()
+  }
+
   async fn wait_for_bye(receiver: &mut ConnReceiver) -> Option<Bye> {
     timeout(Duration::from_secs(2), async {
       loop {
@@ -983,7 +1012,8 @@ mod tests {
       attach(&pc, &config, "echo", false).await;
     assert!(wait_for(&mut receiver, b"hello-copy").await);
 
-    // Select the first cell of the top row and yank it: OSC 52 comes back.
+    // Select the first cell of the top row and yank it: a `copy` event
+    // comes back for the client to put on the clipboard.
     for command in [
       ScreenCommand::CopyEnter,
       ScreenCommand::Scroll {
@@ -1004,7 +1034,7 @@ mod tests {
         .await
         .unwrap();
     }
-    assert!(wait_for(&mut receiver, b"\x1b]52;;").await);
+    assert!(wait_for_copy(&mut receiver).await.is_some());
 
     // No SIGCHLD waiter in unit tests: remove the task so quit can finish.
     pc.send(KernelCommand::Remove(

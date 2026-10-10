@@ -5,12 +5,14 @@ use tokio::io::AsyncWriteExt;
 
 use crate::protocol::{
   ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request, RpcRequest,
-  client_handshake, codes, ctl::EVENT_INPUT,
+  client_handshake, codes,
+  ctl::{CopyEvent, EVENT_COPY, EVENT_INPUT},
 };
 use crate::runner::{RunnerKind, RunnerSpec};
 use crate::target::Target;
 use crate::term::TermEvent;
 use crate::term::key::{Key, KeyEventKind};
+use crate::term::vt::emit;
 use crate::term_driver::TermDriver;
 
 /// How an attach session came to an end.
@@ -79,6 +81,32 @@ fn switch_target(switch: ByeSwitch) -> anyhow::Result<RunnerSpec> {
     .with_context(|| format!("cannot switch to runner at {}", switch.root))
 }
 
+async fn copy_to_clipboard(
+  stdout: &mut tokio::io::Stdout,
+  text: String,
+  remote: bool,
+) -> anyhow::Result<()> {
+  let mut out = Vec::new();
+  emit::osc52_copy(&mut out, &text);
+  stdout.write_all(&out).await?;
+  stdout.flush().await?;
+  if !remote {
+    tokio::task::spawn_blocking(move || crate::clipboard::copy(&text));
+  }
+  Ok(())
+}
+
+/// Whether this client's terminal is on another machine: the client
+/// runs in an SSH session, so this machine's clipboard is not the
+/// user's and only OSC 52 reaches them. sshd sets these; none is
+/// forwarded to a further hop by default, so they describe this very
+/// process.
+fn remote_terminal() -> bool {
+  ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"]
+    .iter()
+    .any(|var| std::env::var_os(var).is_some())
+}
+
 async fn client_loop(
   term_driver: &mut TermDriver,
   target: Target,
@@ -109,6 +137,7 @@ async fn client_loop(
   }
 
   let mut stdout = tokio::io::stdout();
+  let remote = remote_terminal();
 
   loop {
     let event = tokio::select! {
@@ -142,6 +171,14 @@ async fn client_loop(
               });
             }
             bail!("runner closed the session: {}", bye.code);
+          }
+          CtlMsg::Event(event) if event.name == EVENT_COPY => {
+            match serde_json::from_value::<CopyEvent>(event.params) {
+              Ok(copy) => {
+                copy_to_clipboard(&mut stdout, copy.text, remote).await?
+              }
+              Err(err) => log::debug!("dropping copy event: {err}"),
+            }
           }
           msg @ (CtlMsg::Hello(_) | CtlMsg::Request(_) | CtlMsg::Event(_)) => {
             log::debug!("ignoring runner message {msg:?}");

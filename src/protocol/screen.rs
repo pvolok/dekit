@@ -18,7 +18,8 @@ pub enum ScreenCommand {
   },
   /// Anchor the selection at the cursor and start extending it.
   CopySelect,
-  /// Copy the selection (delivered back as OSC 52) and leave copy mode.
+  /// Copy the selection (delivered back as a `copy` event) and leave
+  /// copy mode.
   CopyYank,
 }
 

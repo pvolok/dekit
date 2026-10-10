@@ -33,8 +33,9 @@ cursor visibility and style, and text: a delta per flush, a full repaint
 whenever it chooses. It addresses cells from the top-left corner and never
 scrolls the client terminal; the screen renders at the smallest attached
 size and cells outside it are left alone. Bell is `BEL`, a title change is
-OSC 2, copied text is OSC 52. A client that is not a terminal runs the
-stream through a terminal emulator; there is no cell-level encoding.
+OSC 2. Copied text is not in the stream: it arrives as a `copy` event.
+A client that is not a terminal runs the stream through a terminal
+emulator; there is no cell-level encoding.
 
 ## Client events
 
@@ -42,3 +43,7 @@ stream through a terminal emulator; there is no cell-level encoding.
 - `screen` with a screen command as params: `scroll {delta, unit}`, `copy-enter`, `copy-leave`, `copy-move {dir}`, `copy-select`, `copy-yank`. These act on the attached screen for every observer, as a tmux window would.
 
 Events that fail to decode are dropped, not fatal.
+
+## Server events
+
+- `copy` with `{text}`: text copied from the attached screen, for the client to put on the user's clipboard.

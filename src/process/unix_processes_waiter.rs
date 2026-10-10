@@ -68,6 +68,12 @@ fn call(f: &(dyn Fn(ExitInfo) + Send + Sync), info: ExitInfo) {
 }
 
 impl UnixProcessesWaiter {
+  /// Whether the reaper is running in this process: then it alone may
+  /// wait for a child.
+  pub fn installed() -> bool {
+    global().is_some()
+  }
+
   /// Where the reap order is now; taken before a fork. Only a child not
   /// spawned by `fork` (the clipboard helper) needs it directly.
   pub fn mark() -> u64 {

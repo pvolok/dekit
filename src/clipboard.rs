@@ -3,9 +3,6 @@ use std::process::Stdio;
 use anyhow::Result;
 use which::which;
 
-/// The system clipboard of the machine the runner is on. Attachments
-/// also receive copied text as OSC 52, so a terminal that supports it
-/// needs none of this.
 #[allow(dead_code)]
 enum Provider {
   Exec(&'static str, Vec<&'static str>),
@@ -72,6 +69,11 @@ fn check_prog(cmd: &'static str, args: &[&'static str]) -> Option<Provider> {
 fn copy_impl(s: &str, provider: &Provider) -> Result<()> {
   match provider {
     Provider::Exec(prog, args) => {
+      // With the reaper running (the mprocs binary serves and attaches
+      // in one process) only it may wait for a child.
+      #[cfg(unix)]
+      let reaper =
+        crate::process::unix_processes_waiter::UnixProcessesWaiter::installed();
       #[cfg(unix)]
       let mark =
         crate::process::unix_processes_waiter::UnixProcessesWaiter::mark();
@@ -86,14 +88,17 @@ fn copy_impl(s: &str, provider: &Provider) -> Result<()> {
       {
         log::warn!("Failed to write into copy process: {:?}", e);
       }
-      // Only the reaper waits for a child.
       #[cfg(unix)]
-      if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
-        crate::process::unix_processes_waiter::UnixProcessesWaiter::wait_for(
-          pid,
-          mark,
-          Box::new(|_| ()),
-        );
+      if reaper {
+        if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+          crate::process::unix_processes_waiter::UnixProcessesWaiter::wait_for(
+            pid,
+            mark,
+            Box::new(|_| ()),
+          );
+        }
+      } else {
+        child.wait()?;
       }
       #[cfg(not(unix))]
       child.wait()?;

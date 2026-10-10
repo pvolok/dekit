@@ -177,6 +177,15 @@ pub mod codes {
 pub const EVENT_INPUT: &str = "input";
 /// Client-to-server event carrying a `ScreenCommand`.
 pub const EVENT_SCREEN: &str = "screen";
+/// Server-to-client event in an attach session: text copied from the
+/// attached screen, for the client to put on the user's clipboard.
+pub const EVENT_COPY: &str = "copy";
+
+/// Params of a `copy` event.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CopyEvent {
+  pub text: String,
+}
 
 #[cfg(test)]
 mod tests {
@@ -293,6 +302,16 @@ mod tests {
           ..Bye::new(codes::QUIT, "")
         }),
         r#"{"type":"bye","code":"quit","switch":{"kind":"project","root":"/home/me/app"}}"#,
+      ),
+      (
+        CtlMsg::Event(Event {
+          name: EVENT_COPY.to_string(),
+          params: serde_json::to_value(CopyEvent {
+            text: "hi".to_string(),
+          })
+          .unwrap(),
+        }),
+        r#"{"type":"event","name":"copy","params":{"text":"hi"}}"#,
       ),
     ]
   }
