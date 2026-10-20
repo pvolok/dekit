@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::future::{Future, pending};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -25,6 +26,8 @@ use crate::process::NativeProcess;
 use crate::process::process::Process as _;
 use crate::process::process_spec::ProcessSpec;
 use crate::runner::RunnerSpec;
+#[cfg(unix)]
+use crate::runner::datagram::DatagramSocket;
 use crate::spec::TaskSpec;
 use crate::task::config_tasks::project_dir;
 #[cfg(unix)]
@@ -32,6 +35,8 @@ use crate::task::logger::LogSink;
 use crate::task::logger::{LogSpec, spawn_logger};
 #[cfg(windows)]
 use crate::task::ready::command;
+#[cfg(unix)]
+use crate::task::ready::wait_sd_notify;
 use crate::task::ready::{
   Probe, ReadyCheck, ReadyConfig, line_ready, wait_ready,
 };
@@ -39,6 +44,12 @@ use crate::term::key::Key;
 use crate::term::vt::emit::{self, KeyEncodeModes};
 use crate::term::{Screen, ScreenHandle, Winsize};
 use crate::upgrade::snapshot as snap;
+
+/// Windows has no Unix datagram sockets: the config refuses the check
+/// that would need one.
+#[cfg(windows)]
+#[allow(dead_code)]
+struct DatagramSocket;
 
 /// An OS signal a `Signal` stop can deliver. The name table and the libc
 /// mapping are generated from one list so they can't drift. On Windows only
@@ -263,13 +274,15 @@ pub fn process_task(
   let (cfg, spec) = cx.read(&path, &spec)?;
   let screen = Screen::new(DEFAULT_SIZE, cfg.scrollback_len());
   Ok(registration(
-    cx, task_id, key, &cfg, spec, None, screen, None,
+    cx, task_id, key, &cfg, spec, None, screen, None, None,
   ))
 }
 
-/// A process task around a saved screen and, if the child is still this
-/// runner's, its inherited PTY. `run_spec` is what the run under way
-/// started from, when the task was redefined since.
+/// A process task around a saved screen, its sd_notify socket if it has one,
+/// and, if the child is still this runner's, its inherited PTY.
+/// `run_spec` is what the run under way started from, when the task was
+/// redefined since.
+#[allow(clippy::too_many_arguments)]
 pub fn process_task_resumed(
   cx: &Arc<RunCx>,
   task_id: TaskId,
@@ -278,6 +291,7 @@ pub fn process_task_resumed(
   run_spec: Option<TaskSpec>,
   screen: &snap::Screen,
   instance: Option<snap::Instance>,
+  sd_notify: Option<snap::SdNotifySocket>,
 ) -> anyhow::Result<TaskRegistration> {
   let path = key
     .as_ref()
@@ -288,7 +302,7 @@ pub fn process_task_resumed(
     .transpose()?;
   let screen = Screen::from_snapshot(screen)?;
   Ok(registration(
-    cx, task_id, key, &cfg, spec, run, screen, instance,
+    cx, task_id, key, &cfg, spec, run, screen, instance, sd_notify,
   ))
 }
 
@@ -362,6 +376,7 @@ fn registration(
   run: Option<(TaskConfig, TaskSpec)>,
   screen: Screen,
   instance: Option<snap::Instance>,
+  sd_notify: Option<snap::SdNotifySocket>,
 ) -> TaskRegistration {
   let handle = ScreenHandle::new(screen.frame());
   let task_handle = handle.clone();
@@ -414,6 +429,7 @@ fn registration(
           cx,
           process_run,
           instance,
+          sd_notify,
         )
         .await;
       }
@@ -480,6 +496,80 @@ impl Instance {
   }
 }
 
+#[cfg(unix)]
+fn sd_notify_snapshot(
+  sd_notify: Option<&DatagramSocket>,
+) -> Option<snap::SdNotifySocket> {
+  sd_notify.map(|socket| snap::SdNotifySocket {
+    path: socket.path().to_string_lossy().into_owned(),
+    fd: socket.raw_fd(),
+  })
+}
+
+#[cfg(not(unix))]
+fn sd_notify_snapshot(
+  _sd_notify: Option<&DatagramSocket>,
+) -> Option<snap::SdNotifySocket> {
+  None
+}
+
+fn has_sd_notify_check(config: &ProcessRun) -> bool {
+  matches!(
+    config.ready,
+    Some(ReadyConfig {
+      check: ReadyCheck::SdNotify,
+      ..
+    })
+  )
+}
+
+/// The spec a run starts with: the task's, plus `NOTIFY_SOCKET` for an
+/// sd_notify check. Its socket is bound at the first such run and kept
+/// for the task's life; a run without the check lets it go.
+#[cfg(unix)]
+fn sd_notify_spec<'a>(
+  ctx: &TaskContext,
+  cx: &RunCx,
+  config: &'a ProcessRun,
+  sd_notify: &mut Option<DatagramSocket>,
+) -> Result<Cow<'a, ProcessSpec>, String> {
+  if !has_sd_notify_check(config) {
+    *sd_notify = None;
+    return Ok(Cow::Borrowed(&config.spec));
+  }
+  if sd_notify.is_none() {
+    let bound = crate::runner::lockfile::sd_notify_socket_path(
+      cx.runner.as_ref(),
+      ctx.task_id.0,
+    )
+    .and_then(|path| Ok(DatagramSocket::bind(path)?));
+    match bound {
+      Ok(socket) => *sd_notify = Some(socket),
+      Err(err) => {
+        return Err(format!(
+          "\x1b[31mCannot bind the sd_notify socket: {err:#}\x1b[0m\r\n"
+        ));
+      }
+    }
+  }
+  let socket = sd_notify.as_ref().expect("bound above");
+  // What the previous instance sent must not count for this one.
+  socket.drain();
+  let mut spec = config.spec.clone();
+  spec.env("NOTIFY_SOCKET", socket.path().to_string_lossy());
+  Ok(Cow::Owned(spec))
+}
+
+#[cfg(not(unix))]
+fn sd_notify_spec<'a>(
+  _ctx: &TaskContext,
+  _cx: &RunCx,
+  config: &'a ProcessRun,
+  _sd_notify: &mut Option<DatagramSocket>,
+) -> Result<Cow<'a, ProcessSpec>, String> {
+  Ok(Cow::Borrowed(&config.spec))
+}
+
 /// Whether the ready check reads the lines the screen finishes.
 fn watches_lines(config: &ProcessRun) -> bool {
   matches!(
@@ -496,6 +586,7 @@ fn snapshot(
   process: Option<&NativeProcess>,
   task_screen: &TaskScreen,
   instance: &Instance,
+  sd_notify: Option<&DatagramSocket>,
 ) -> snap::ProcessTask {
   let stop = match &config.stop {
     StopSignal::Signal { sig, group } => snap::StopSignal::Signal {
@@ -526,7 +617,7 @@ fn snapshot(
         interval_ms: interval.as_millis() as u64,
       }),
     ),
-    None => (None, None),
+    Some(ReadyCheck::SdNotify) | None => (None, None),
   };
   #[cfg(unix)]
   let instance = process.map(|p| snap::Instance {
@@ -535,10 +626,10 @@ fn snapshot(
     exit: instance.exit_info.map(Into::into),
     stdout_eof: instance.stdout_eof,
     ready_sent: instance.ready_sent,
-    // Only a polled check still waiting reads it; written only then, so
-    // an older binary can take back any other snapshot.
+    // Only a polled or sd_notify check still waiting reads it; written only
+    // then, so an older binary can take back any other snapshot.
     stop_sent: instance.stop_sent
-      && ready_probe.is_some()
+      && (ready_probe.is_some() || has_sd_notify_check(config))
       && !instance.ready_sent
       && instance.exit_info.is_none(),
     ready_line: String::new(),
@@ -582,6 +673,7 @@ fn snapshot(
     }),
     ready_log,
     ready_probe,
+    sd_notify: sd_notify_snapshot(sd_notify),
     scrollback_len: config.scrollback_len,
     mouse_scroll_speed: config.mouse_scroll_speed,
     instance,
@@ -589,6 +681,7 @@ fn snapshot(
   }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_main(
   ctx: TaskContext,
   mut receiver: UnboundedReceiver<TaskCmd>,
@@ -599,6 +692,7 @@ async fn process_main(
   // logs by.
   mut config: ProcessRun,
   saved: Option<snap::Instance>,
+  saved_sd_notify: Option<snap::SdNotifySocket>,
 ) {
   let mut task_screen =
     TaskScreen::new(ctx.task_id, screen, handle, config.mouse_scroll_speed);
@@ -630,6 +724,22 @@ async fn process_main(
   let mut frozen = false;
   // The ready check that polls, while the task is starting.
   let mut probe: Option<ProbeFuture> = None;
+  // The socket of an sd_notify check: bound at the first start of a run
+  // with the check, kept for the task's life, inherited across an upgrade.
+  #[cfg(unix)]
+  let mut sd_notify: Option<DatagramSocket> =
+    saved_sd_notify.and_then(|saved| {
+      DatagramSocket::adopt(saved.fd, PathBuf::from(&saved.path))
+        .map_err(|err| {
+          log::error!("Failed to adopt sd_notify socket {}: {err}", saved.path)
+        })
+        .ok()
+    });
+  #[cfg(not(unix))]
+  let mut sd_notify: Option<DatagramSocket> = {
+    let _ = saved_sd_notify;
+    None
+  };
 
   #[cfg(unix)]
   if let Some(saved) = saved {
@@ -653,7 +763,7 @@ async fn process_main(
         ) {
           ctx.send(KernelCommand::TaskReady);
         }
-        probe = start_probe(&config, &instance);
+        probe = start_probe(&config, &instance, sd_notify.as_ref());
         if let Some(path) = saved.log_path {
           let path = std::path::PathBuf::from(path);
           let id = task_screen.add_logger(spawn_logger(LogSink {
@@ -755,7 +865,18 @@ async fn process_main(
               }
             }
           }
-          match start_instance(&ctx, &config, &mut task_screen) {
+          let spec = match sd_notify_spec(&ctx, &cx, &config, &mut sd_notify) {
+            Ok(spec) => spec,
+            Err(message) => {
+              task_screen
+                .process(message.as_bytes(), &mut screen_effects)
+                .await;
+              screen_effects.clear();
+              ctx.send(KernelCommand::TaskStopped(ExitInfo::error()));
+              continue;
+            }
+          };
+          match start_instance(&ctx, &config, &spec, &mut task_screen) {
             Ok((p, receiver)) => {
               instance.exit_info = None;
               instance.stdout_eof = false;
@@ -763,7 +884,7 @@ async fn process_main(
               instance.stop_sent = false;
               // The ready check looks at the new instance's lines.
               task_screen.set_line_tap(watches_lines(&config));
-              probe = start_probe(&config, &instance);
+              probe = start_probe(&config, &instance, sd_notify.as_ref());
               update_log_observer(
                 &mut task_screen,
                 &config.log,
@@ -811,8 +932,13 @@ async fn process_main(
           task_screen.flush_loggers().await;
           frozen = true;
           probe = None;
-          let saved =
-            snapshot(&config, process.as_ref(), &task_screen, &instance);
+          let saved = snapshot(
+            &config,
+            process.as_ref(),
+            &task_screen,
+            &instance,
+            sd_notify.as_ref(),
+          );
           ctx.send(KernelCommand::TaskFrozen(
             number,
             snap::TaskKind::Process(saved),
@@ -821,7 +947,7 @@ async fn process_main(
         TaskCmd::Thaw => {
           frozen = false;
           if process.is_some() {
-            probe = start_probe(&config, &instance);
+            probe = start_probe(&config, &instance, sd_notify.as_ref());
           }
         }
         TaskCmd::Msg(msg) => match msg.downcast::<TaskScreenCmd>() {
@@ -888,11 +1014,12 @@ async fn process_main(
 
 type ProbeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// The ready check that polls, unless the instance is ready, is being
-/// stopped, or has exited.
+/// The ready check that waits, unless the instance is ready, is being
+/// stopped, or has exited: a polled check, or the sd_notify socket's read.
 fn start_probe(
   config: &ProcessRun,
   instance: &Instance,
+  sd_notify: Option<&DatagramSocket>,
 ) -> Option<ProbeFuture> {
   if instance.ready_sent || instance.stop_sent || instance.exit_info.is_some() {
     return None;
@@ -907,11 +1034,27 @@ fn start_probe(
       config.spec.clone(),
     ))),
     Some(ReadyConfig {
+      check: ReadyCheck::SdNotify,
+      ..
+    }) => sd_notify_wait(sd_notify),
+    Some(ReadyConfig {
       check: ReadyCheck::Log(_),
       ..
     })
     | None => None,
   }
+}
+
+/// The wait for `READY=1` on the task's sd_notify socket.
+#[cfg(unix)]
+fn sd_notify_wait(sd_notify: Option<&DatagramSocket>) -> Option<ProbeFuture> {
+  sd_notify
+    .map(|socket| Box::pin(wait_sd_notify(socket.reader())) as ProbeFuture)
+}
+
+#[cfg(not(unix))]
+fn sd_notify_wait(_sd_notify: Option<&DatagramSocket>) -> Option<ProbeFuture> {
+  None
 }
 
 fn update_log_observer(
@@ -943,9 +1086,9 @@ fn update_log_observer(
 fn start_instance(
   ctx: &TaskContext,
   run: &ProcessRun,
+  spec: &ProcessSpec,
   task_screen: &mut TaskScreen,
 ) -> Result<(NativeProcess, UnboundedReceiver<ExitInfo>), String> {
-  let spec = &run.spec;
   let size = task_screen.winsize();
   task_screen.reset_screen(run.scrollback_len, run.mouse_scroll_speed);
   match spawn_native(ctx, spec, size) {
@@ -1400,7 +1543,7 @@ mod tests {
   fn a_saved_task_comes_back_as_its_spec_says() {
     let run = ProcessRun::new(ProcessSpec::from_argv(vec!["true".into()]));
     let screen = test_screen(run.mouse_scroll_speed);
-    let process = snapshot(&run, None, &screen, &Instance::default());
+    let process = snapshot(&run, None, &screen, &Instance::default(), None);
     let mut saved = snap::Task {
       id: 1,
       space: String::new(),
@@ -1493,7 +1636,7 @@ mod tests {
       ..ProcessRun::new(ProcessSpec::from_argv(vec!["true".into()]))
     };
     let screen = test_screen(run.mouse_scroll_speed);
-    let process = snapshot(&run, None, &screen, &Instance::default());
+    let process = snapshot(&run, None, &screen, &Instance::default(), None);
     assert_eq!(process.ready_log, None);
     let saved = snap::Task {
       id: 1,
@@ -1575,7 +1718,7 @@ mod tests {
         stop,
         ..ProcessRun::new(ProcessSpec::from_argv(vec!["true".into()]))
       };
-      let process = snapshot(&run, None, &screen, &Instance::default());
+      let process = snapshot(&run, None, &screen, &Instance::default(), None);
       assert_eq!(said(&read(&process), "stop"), said_stop);
     }
 
@@ -1609,7 +1752,7 @@ mod tests {
       scrollback_len: 50,
       ..ProcessRun::new(ProcessSpec::from_argv(vec!["true".into()]))
     };
-    let def = read(&snapshot(&run, None, &screen, &Instance::default()));
+    let def = read(&snapshot(&run, None, &screen, &Instance::default(), None));
     assert_eq!(
       said(&def, "log"),
       "{enabled: true, dir: /var/log/forge, mode: append}"
@@ -1621,6 +1764,7 @@ mod tests {
       None,
       &screen,
       &Instance::default(),
+      None,
     ));
     for key in ["log", "scrollback_len", "mouse_scroll_speed"] {
       assert!(plain.spec.as_ref().unwrap().get(key).is_none(), "{key}");
@@ -1633,7 +1777,8 @@ mod tests {
     let config =
       ProcessRun::new(ProcessSpec::from_argv(vec!["true".to_string()]));
     let screen = test_screen(config.mouse_scroll_speed);
-    let mut process = snapshot(&config, None, &screen, &Instance::default());
+    let mut process =
+      snapshot(&config, None, &screen, &Instance::default(), None);
     // Pid 0 cannot be adopted.
     process.instance = Some(snap::Instance {
       pid: 0,
@@ -1730,6 +1875,73 @@ mod tests {
   /// A restored task runs its ready check only in `Running`, where the
   /// kernel waits for it; a `Ready` one stays ready without it. An older
   /// binary's saved line is checked when the task resumes.
+  /// A task that says it is ready the way a systemd service does.
+  #[tokio::test]
+  async fn an_sd_notify_task_is_ready_when_it_says_so() {
+    let python = std::process::Command::new("python3")
+      .args(["-c", "import socket"])
+      .output();
+    if !python.is_ok_and(|output| output.status.success()) {
+      eprintln!("no python3: skipped");
+      return;
+    }
+    let dir = std::env::temp_dir()
+      .join(format!("dekit_sd_notify_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("sd_notify.py");
+    std::fs::write(
+      &script,
+      r"import os, socket, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+to = os.environ['NOTIFY_SOCKET']
+s.sendto(b'STATUS=warming up\n', to)
+s.sendto(b'READY=1\n', to)
+time.sleep(60)
+",
+    )
+    .unwrap();
+
+    let kernel = Kernel::new();
+    let pc = kernel.context();
+    let id = spawn_process_task(
+      &pc,
+      "notified",
+      &format!(
+        "{{cmd: [python3, {}], ready: {{sd_notify: true}}}}",
+        yaml_path(&script)
+      ),
+    );
+    pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
+    let kernel_task = tokio::spawn(kernel.run());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state_of(&pc, id).await != TaskState::Ready {
+      assert!(Instant::now() < deadline, "the task never got ready");
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let socket =
+      crate::runner::lockfile::sd_notify_socket_path(None, id.0).unwrap();
+    assert!(socket.exists());
+
+    // No reaper runs in unit tests: the task is removed to let quit through.
+    pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
+    pc.send(KernelCommand::Quit);
+    tokio::time::timeout(Duration::from_secs(2), kernel_task)
+      .await
+      .expect("timed out waiting for kernel to quit")
+      .unwrap();
+    // The task took its socket with it.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while socket.exists() {
+      assert!(
+        Instant::now() < deadline,
+        "the sd_notify socket was left behind"
+      );
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
   #[tokio::test]
   async fn a_resumed_task_checks_ready_only_while_running() {
     let screen = test_screen(5);
@@ -1774,7 +1986,8 @@ mod tests {
         assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
         libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
       }
-      let mut process = snapshot(&config, None, &screen, &Instance::default());
+      let mut process =
+        snapshot(&config, None, &screen, &Instance::default(), None);
       process.instance = Some(snap::Instance {
         pid: child.id(),
         master_fd: fds[0],

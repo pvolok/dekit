@@ -194,6 +194,7 @@ pub fn saved_task_registration(
     saved.run_spec.clone(),
     &process.screen,
     instance,
+    process.sd_notify.clone(),
   )?;
   registration.def.deps = deps;
   registration.def.pinned = saved.pinned;

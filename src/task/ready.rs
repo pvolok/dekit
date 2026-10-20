@@ -23,6 +23,9 @@ pub enum ReadyCheck {
   Log(String),
   /// Tried every `interval` until it succeeds.
   Probe { probe: Probe, interval: Duration },
+  /// The program sends `READY=1` to the socket `NOTIFY_SOCKET` names, as
+  /// it would to systemd.
+  SdNotify,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +130,32 @@ pub fn parse_http_url(url: &str) -> Result<HttpUrl, String> {
 /// Whether a finished line, or the line so far, says the task is ready.
 pub fn line_ready(needle: &str, line: &str) -> bool {
   !needle.is_empty() && line.contains(needle)
+}
+
+/// Whether an sd_notify datagram says the program is ready: one of its
+/// newline-separated `KEY=VALUE` lines is `READY=1`.
+pub fn sd_notify_ready(datagram: &[u8]) -> bool {
+  datagram
+    .split(|b| *b == b'\n')
+    .any(|line| line == b"READY=1")
+}
+
+/// Reads sd_notify datagrams until one says the program is ready. A socket
+/// that cannot be read leaves the task starting, for its timeout to end.
+#[cfg(unix)]
+pub async fn wait_sd_notify(socket: std::sync::Arc<tokio::net::UnixDatagram>) {
+  // What systemd takes at most.
+  let mut buf = [0u8; 4096];
+  loop {
+    match socket.recv(&mut buf).await {
+      Ok(n) if sd_notify_ready(&buf[..n]) => return,
+      Ok(_) => (),
+      Err(err) => {
+        log::warn!("Cannot read the sd_notify socket: {err}");
+        std::future::pending::<()>().await;
+      }
+    }
+  }
 }
 
 /// Tries `probe` until it succeeds: the first attempt at once, then
@@ -323,6 +352,17 @@ pub fn command(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn sd_notify_datagrams() {
+    assert!(sd_notify_ready(b"READY=1"));
+    assert!(sd_notify_ready(b"READY=1\n"));
+    assert!(sd_notify_ready(b"STATUS=Listening\nREADY=1\nMAINPID=4"));
+    assert!(!sd_notify_ready(b"READY=10"));
+    assert!(!sd_notify_ready(b"STATUS=READY=1"));
+    assert!(!sd_notify_ready(b"RELOADING=1"));
+    assert!(!sd_notify_ready(b""));
+  }
 
   #[test]
   fn log_lines_match_plain_text() {

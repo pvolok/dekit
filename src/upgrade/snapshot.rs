@@ -173,9 +173,13 @@ pub mod v1 {
     /// The `log` ready check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_log: Option<String>,
-    /// Any other ready check; never together with `ready_log`.
+    /// A polled ready check; never together with `ready_log`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_probe: Option<ReadyProbe>,
+    /// The socket of an sd_notify check, once a run with the check
+    /// started; inherited with the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sd_notify: Option<SdNotifySocket>,
     pub scrollback_len: usize,
     pub mouse_scroll_speed: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,6 +252,13 @@ pub mod v1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     pub truncate: bool,
+  }
+
+  #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
+  pub struct SdNotifySocket {
+    pub path: String,
+    pub fd: i32,
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -689,10 +700,13 @@ pub fn encode(
 pub fn fds(snapshot: &Snapshot) -> Vec<i32> {
   let mut fds = vec![snapshot.lock_fd, snapshot.live_fd, snapshot.listener_fd];
   for task in &snapshot.tasks {
-    if let TaskKind::Process(process) = &task.kind
-      && let Some(instance) = &process.instance
-    {
-      fds.push(instance.master_fd);
+    if let TaskKind::Process(process) = &task.kind {
+      if let Some(instance) = &process.instance {
+        fds.push(instance.master_fd);
+      }
+      if let Some(sd_notify) = &process.sd_notify {
+        fds.push(sd_notify.fd);
+      }
     }
   }
   for conn in &snapshot.connections {
@@ -913,6 +927,37 @@ mod tests {
     let state: TaskState = serde_json::from_value(older.clone()).unwrap();
     assert_eq!(state, TaskState::Backoff(ExitInfo::default()));
     assert_eq!(serde_json::to_value(state).unwrap(), older);
+  }
+
+  #[test]
+  fn an_sd_notify_socket_is_inherited_with_its_task() {
+    let mut snapshot = decode(include_bytes!("fixtures/v1.json")).unwrap();
+    assert!(!fds(&snapshot).contains(&42));
+    let index = snapshot
+      .tasks
+      .iter()
+      .position(|task| matches!(task.kind, TaskKind::Process(_)))
+      .unwrap();
+    let TaskKind::Process(process) = &mut snapshot.tasks[index].kind else {
+      unreachable!()
+    };
+    assert_eq!(process.sd_notify, None);
+    let sd_notify = SdNotifySocket {
+      path: "/run/user/1/dekit/x.sd_notify/3.sock".to_string(),
+      fd: 42,
+    };
+    process.sd_notify = Some(sd_notify.clone());
+    assert!(fds(&snapshot).contains(&42));
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(
+      json["tasks"][index]["kind"]["sd_notify"],
+      serde_json::json!({"path": sd_notify.path, "fd": 42})
+    );
+    let back = decode(&serde_json::to_vec(&json).unwrap()).unwrap();
+    let TaskKind::Process(process) = &back.tasks[index].kind else {
+      unreachable!()
+    };
+    assert_eq!(process.sd_notify, Some(sd_notify));
   }
 
   #[test]

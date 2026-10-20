@@ -63,6 +63,9 @@ impl TaskSpec {
         ReadyCheck::Log(text) => {
           map.insert(s("log"), s(text));
         }
+        ReadyCheck::SdNotify => {
+          map.insert(s("sd_notify"), Value::Bool(true));
+        }
         ReadyCheck::Probe { probe, interval } => {
           let (key, value) = match probe {
             Probe::Tcp { host: None, port } => ("tcp", Value::from(*port)),
@@ -627,6 +630,8 @@ scrollback_len: 5000
       "cmd: x\nready: {http: 'http://localhost:3000/health'}",
       "cmd: x\nready: {cmd: [pg_isready]}",
       "cmd: x\nready: {file: /tmp/ok}",
+      #[cfg(unix)]
+      "cmd: x\nready: {sd_notify: true, timeout: 30s}",
       "cmd: x\nstop: SIGHUP",
       "cmd: x\nstop: {keys: ['<C-c>', '<Enter>']}",
       "cmd: x\nstop: {cmd: [podman, compose, down]}",

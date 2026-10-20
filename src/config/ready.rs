@@ -10,7 +10,8 @@ use crate::task::ready::{
 };
 
 /// A task's `ready` object takes one of these checks, and these settings.
-pub(crate) const READY_CHECKS: &[&str] = &["log", "tcp", "http", "cmd", "file"];
+pub(crate) const READY_CHECKS: &[&str] =
+  &["log", "tcp", "http", "cmd", "file", "sd_notify"];
 pub(crate) const READY_SETTINGS: &[&str] = &["interval", "timeout"];
 
 impl FromCfg for ReadyConfig {
@@ -30,7 +31,9 @@ impl FromCfg for ReadyConfig {
     let (name, check) = match checks.as_slice() {
       [one] => one.clone(),
       [] => {
-        bail!(obj.error("ready needs a check: log, tcp, http, cmd, or file"))
+        bail!(obj.error(
+          "ready needs a check: log, tcp, http, cmd, file, or sd_notify"
+        ))
       }
       [..] => bail!(obj.error(format!(
         "ready takes one check, found {}",
@@ -76,6 +79,22 @@ impl FromCfg for ReadyConfig {
       "file" => probe(Probe::File {
         path: PathBuf::from(check.as_str()?),
       }),
+      "sd_notify" => {
+        if let Some(interval) = obj.get("interval") {
+          bail!(
+            interval.error("'interval' does not apply to an sd_notify check")
+          );
+        }
+        if check.raw().as_bool() != Some(true) {
+          bail!(check.error("expected true"));
+        }
+        if cfg!(windows) {
+          bail!(check.error(
+            "sd_notify needs Unix sockets, which Windows does not have"
+          ));
+        }
+        ReadyCheck::SdNotify
+      }
       _ => unreachable!("every check is listed"),
     };
     Ok(ReadyConfig {

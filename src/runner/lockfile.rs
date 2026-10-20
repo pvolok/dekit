@@ -282,6 +282,25 @@ pub fn get_runtime_dir() -> anyhow::Result<PathBuf> {
   }
 }
 
+/// Where a task's sd_notify socket goes: a directory beside the runner's
+/// files, by the task's id. A process with no runner (`dekit mprocs`, a
+/// test) is told apart by its pid. The directories are made if need be.
+#[cfg(unix)]
+pub fn sd_notify_socket_path(
+  runner: Option<&RunnerSpec>,
+  task_id: usize,
+) -> anyhow::Result<PathBuf> {
+  let runtime_dir = get_runtime_dir()?;
+  prepare_runtime_dir(&runtime_dir)?;
+  let stem = match runner {
+    Some(runner) => runner_hash(runner),
+    None => format!("pid{}", std::process::id()),
+  };
+  let dir = runtime_dir.join(format!("{stem}.sd_notify"));
+  std::fs::create_dir_all(&dir)?;
+  Ok(dir.join(format!("{task_id}.sock")))
+}
+
 pub fn runner_paths(runner: &RunnerSpec) -> anyhow::Result<RunnerPaths> {
   Ok(RunnerPaths::from_stem(
     &get_runtime_dir()?,

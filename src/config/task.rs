@@ -555,9 +555,28 @@ cwd: /tmp
       other => panic!("{other:?}"),
     }
 
+    #[cfg(unix)]
+    {
+      let task =
+        parse("cmd: x\nready: {sd_notify: true, timeout: 5s}").unwrap();
+      let ready = task.ready.unwrap();
+      assert!(
+        matches!(ready.check, ReadyCheck::SdNotify),
+        "{:?}",
+        ready.check
+      );
+      assert_eq!(ready.timeout, Some(Duration::from_secs(5)));
+    }
+
     for (yaml, expected) in [
       ("ready: listening", "expected an object"),
       ("ready: {}", "ready needs a check"),
+      ("ready: {sd_notify: false}", "expected true"),
+      ("ready: {sd_notify: 1}", "expected true"),
+      (
+        "ready: {sd_notify: true, interval: 1s}",
+        "'interval' does not apply",
+      ),
       ("ready: {log: a, tcp: 1}", "ready takes one check"),
       ("ready: {log: a, interval: 1s}", "'interval' does not apply"),
       ("ready: {http: 'https://x'}", "https is not supported"),

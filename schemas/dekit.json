@@ -201,6 +201,15 @@
             "interval": { "$ref": "#/$defs/duration" },
             "timeout": { "$ref": "#/$defs/duration" }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sd_notify"],
+          "properties": {
+            "sd_notify": { "const": true },
+            "timeout": { "$ref": "#/$defs/duration" }
+          }
         }
       ]
     },

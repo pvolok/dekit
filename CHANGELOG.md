@@ -1,5 +1,7 @@
 ## Unreleased
 
+- `ready: {sd_notify: true}` counts a task ready when it sends `READY=1`
+  to the socket `NOTIFY_SOCKET` names, as it would to systemd
 - `dekit reload` brings what changed in `dekit.yaml` into a running
   project; the console's header says when the file changed and opens the
   reload dialog

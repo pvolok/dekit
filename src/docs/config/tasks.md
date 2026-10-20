@@ -178,6 +178,9 @@ tasks that depend on it wait.
 - key: tasks.*.ready.file
   type: path
   desc: This file exists. Relative to the task's directory.
+- key: tasks.*.ready.sd_notify
+  type: "true"
+  desc: The program reports it, as it would to systemd, by sending `READY=1` to the Unix datagram socket named by `NOTIFY_SOCKET` in its environment. The socket is dekit's and outlives restarts; the rest of the protocol is ignored. Not on Windows.
 - key: tasks.*.ready.interval
   type: duration
   default: 1s

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::config::{Config, KernelConfig};
 
+#[cfg(unix)]
+pub mod datagram;
 pub mod kill;
 pub mod lockfile;
 pub mod recent;
