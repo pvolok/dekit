@@ -1,6 +1,6 @@
 ---
 title: Tasks
-summary: Every key of a task in dekit.yaml, from cmd and deps to ready, autorestart, and stop.
+summary: Every key of a task in dekit.yaml, from cmd and deps to ready, autorestart, and stop, and folders.
 related: [config, start/targets, config/hooks]
 order: 10
 ---
@@ -108,6 +108,40 @@ Key names follow one rule. An action says how dekit does it: `stop` is how
 dekit stops the task. `auto` in front says when dekit does it by itself:
 `autostart` on `dekit up`, `autorestart` after a failure. A state says what
 counts as it: `ready`.
+
+## Folders {#folders}
+
+A key that ends in `/` is a folder. It holds the tasks under its path,
+and it stays when they are gone: it goes only when it is removed, by
+`dekit rm` (|cli/rm|), in the TUI, or by taking its entry out of the
+config and reloading.
+
+```yaml
+tasks:
+  apps/:
+    collapsed: true
+  apps/web:
+    cmd: npm run dev
+  apps/api:
+    cmd: cargo run -p api
+  tools/:
+```
+
+:::fields kind=config
+- key: tasks.*/.collapsed
+  type: boolean
+  default: "false"
+  desc: The TUI lists the folder collapsed the first time it shows it. After that the folder stays as you leave it, across restarts too.
+:::
+
+A folder is listed where its entry is, or where its first task is when
+that comes first. Its key is under its file's mount, as a task's is
+(|config/load|); the folder a file is mounted at is written in the file
+that loads it. A folder can't be at a task's path or under a task.
+
+Without an entry, the tasks under a path make a group. The TUI lists it
+the same way, but it is gone once its tasks are. Either way, `dekit rm
+apps` removes it with everything in it.
 
 ## Commands {#commands}
 

@@ -41,10 +41,12 @@ fn human_state(s: &RpcState) -> String {
 }
 
 /// Report a selector verb result.
+/// `nouns` name one of what the verb acts on, and several.
 fn print_acted(
   result: serde_json::Value,
   json: bool,
   verb: &str,
+  nouns: (&str, &str),
   zero: &str,
 ) -> anyhow::Result<()> {
   if json {
@@ -54,11 +56,13 @@ fn print_acted(
   let acted: ActResult = serde_json::from_value(result)?;
   match acted.matched {
     0 => println!("{}", zero),
-    1 => println!("{} 1 task.", verb),
-    n => println!("{} {} tasks.", verb, n),
+    1 => println!("{} 1 {}.", verb, nouns.0),
+    n => println!("{} {} {}.", verb, n, nouns.1),
   }
   Ok(())
 }
+
+const TASKS: (&str, &str) = ("task", "tasks");
 
 fn print_task_list(
   result: serde_json::Value,
@@ -1048,10 +1052,15 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         "restart" => (Command::Restart { target }, "Restarted"),
         _ => (Command::Remove { target }, "Removed"),
       };
+      // A removal counts the folders it takes too.
+      let (nouns, zero) = match verb {
+        "rm" => (("task or folder", "tasks and folders"), "Nothing matched."),
+        _ => (TASKS, "No tasks matched."),
+      };
       let spawn = command.starts_runner();
       let result =
         rpc_request(&runner, RpcRequest::Command(command), spawn).await?;
-      print_acted(result, json, done, "No tasks matched.")?;
+      print_acted(result, json, done, nouns, zero)?;
     }
     Some(("why", sub_m)) => {
       let target = arg_target(sub_m)?.expect("clap requires target");
@@ -1078,7 +1087,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       let runner = arg_runner(&matches, sub_m)?;
       let result =
         rpc_request(&runner, RpcRequest::Command(Command::Up), true).await?;
-      print_acted(result, json, "Started", "Nothing to start.")?;
+      print_acted(result, json, "Started", TASKS, "Nothing to start.")?;
     }
     Some(("reload", sub_m)) => {
       let runner = arg_runner(&matches, sub_m)?;

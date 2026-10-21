@@ -413,6 +413,11 @@ impl Base {
   pub fn remove(&mut self, source: &Source) {
     self.0.shift_remove(source);
   }
+
+  /// The entries with what they said, in order.
+  pub fn iter(&self) -> impl Iterator<Item = (&Source, &TaskSpec)> {
+    self.0.iter()
+  }
 }
 
 /// A `Base` entry as saved: where it is, and what it said.
@@ -449,8 +454,8 @@ impl FromIterator<(Source, TaskSpec)> for Base {
   }
 }
 
-/// A task's entry in the config: the file, relative to the project
-/// root, and its key under `tasks:` there. `mount` is the path the file's
+/// A task's or folder's entry in the config: the file, relative to the
+/// project root, and its key under `tasks:` there. `mount` is the path the file's
 /// tasks are under (`load: {at: ...}`).
 #[derive(
   Clone,
@@ -472,9 +477,15 @@ pub struct Source {
 }
 
 impl Source {
-  /// The task path the entry is at.
+  /// The path of the task or folder the entry is at.
   pub fn path(&self) -> String {
-    crate::kernel::task_path::join(&self.mount, &self.key)
+    let key = self.key.strip_suffix('/').unwrap_or(&self.key);
+    crate::kernel::task_path::join(&self.mount, key)
+  }
+
+  /// Whether it is a folder's entry: its key ends in `/`.
+  pub fn is_folder(&self) -> bool {
+    self.key.ends_with('/')
   }
 }
 

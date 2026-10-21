@@ -37,6 +37,9 @@
     },
     "tasks": {
       "type": "object",
+      "patternProperties": {
+        "/$": { "$ref": "#/$defs/folder" }
+      },
       "additionalProperties": { "$ref": "#/$defs/task" }
     },
     "defaults": {
@@ -212,6 +215,13 @@
           }
         }
       ]
+    },
+    "folder": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "collapsed": { "type": "boolean" }
+      }
     },
     "task": {
       "type": "object",

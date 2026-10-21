@@ -74,9 +74,9 @@ pub struct ConfigStatus {
   pub broken: bool,
   /// Changes a reload has to offer.
   pub changes: usize,
-  /// Config tasks changed here: marked in the list.
+  /// Config tasks and folders changed here: marked in the list.
   pub edited: HashSet<TaskId>,
-  /// Config tasks removed here, still in the config.
+  /// Config tasks and folders removed here, still in the config.
   pub removed: usize,
   /// The runner's own tasks, not in the config.
   pub own: HashSet<TaskId>,

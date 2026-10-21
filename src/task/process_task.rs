@@ -1819,7 +1819,9 @@ mod tests {
 
     let mut kernel = Kernel::new();
     let pc = kernel.context();
-    kernel.restore(2, vec![(&saved, registration)]).unwrap();
+    kernel
+      .restore(2, vec![(Some(&saved), registration.into())])
+      .unwrap();
     let kernel_task = tokio::spawn(kernel.run());
 
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -2025,7 +2027,10 @@ time.sleep(60)
         kind: snap::TaskKind::Process(process),
       });
     }
-    let restored = tasks.iter().map(|saved| (saved, resumed(saved))).collect();
+    let restored = tasks
+      .iter()
+      .map(|saved| (Some(saved), resumed(saved).into()))
+      .collect();
     let mut kernel = Kernel::new();
     let pc = kernel.context();
     kernel.restore(tasks.len() + 1, restored).unwrap();

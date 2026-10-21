@@ -45,6 +45,16 @@ pub fn task(
   }
 }
 
+/// The runner with these tasks and no folders.
+pub fn live_with(
+  tasks: impl IntoIterator<Item = TaskDescription>,
+) -> crate::reload::Live {
+  crate::reload::Live {
+    tasks: tasks.into_iter().collect(),
+    folders: Vec::new(),
+  }
+}
+
 /// A fresh dir under the system temp dir; removed when dropped.
 pub struct TempDir(pub PathBuf);
 

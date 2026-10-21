@@ -36,6 +36,8 @@ pub const CURRENT_VERSION: u32 = 1;
 pub use v1::*;
 
 pub mod v1 {
+  use std::collections::BTreeMap;
+
   use serde::{Deserialize, Serialize};
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -54,6 +56,9 @@ pub mod v1 {
     pub next_task_id: usize,
     /// In list order.
     pub tasks: Vec<Task>,
+    /// In list order; each is placed right after `after`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<Folder>,
     pub connections: Vec<Connection>,
     /// The config as the runner last took it in (`crate::spec::Base`);
     /// an older runner kept none.
@@ -119,6 +124,23 @@ pub mod v1 {
     pub kind: TaskKind,
   }
 
+  /// A folder (`crate::kernel::kernel_message::FolderDef`).
+  #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
+  pub struct Folder {
+    pub id: usize,
+    pub space: String,
+    pub path: String,
+    /// The id of the task or folder listed just before it in its space,
+    /// if any: where it goes back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<usize>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::spec::Source>,
+  }
+
   #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
   #[serde(deny_unknown_fields)]
   #[serde(rename_all = "snake_case")]
@@ -160,7 +182,12 @@ pub mod v1 {
   #[serde(tag = "kind", rename_all = "snake_case")]
   pub enum TaskKind {
     Process(ProcessTask),
-    Console {},
+    Console {
+      /// Each group the console listed, by path, and whether it was
+      /// collapsed.
+      #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+      groups: BTreeMap<String, bool>,
+    },
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -628,7 +655,64 @@ impl Task {
   }
 }
 
+impl Folder {
+  /// The folder as saved, at `id`: refused when its space or path does
+  /// not read.
+  pub fn def(
+    &self,
+    id: crate::kernel::task::TaskId,
+  ) -> anyhow::Result<crate::kernel::kernel_message::FolderDef> {
+    use crate::kernel::kernel_message::{FolderDef, FolderSettings, Place};
+    let space = if self.space.is_empty() {
+      TaskSpaceId::default_space()
+    } else {
+      TaskSpaceId::new(self.space.clone()).map_err(anyhow::Error::msg)?
+    };
+    Ok(FolderDef {
+      id,
+      space,
+      path: TaskPath::new(self.path.as_str())?,
+      // Its place is held as the list has it.
+      place: Place::Last,
+      settings: FolderSettings {
+        collapsed: self.collapsed,
+        origin: self.origin.clone(),
+      },
+    })
+  }
+}
+
+/// A task or folder of a snapshot.
+#[derive(Clone, Copy, Debug)]
+pub enum Listed<'a> {
+  Task(&'a Task),
+  Folder(&'a Folder),
+}
+
 impl Snapshot {
+  /// The tasks and folders in list order: each folder right after what
+  /// it was listed after, or first in its space.
+  pub fn listed(&self) -> Vec<Listed<'_>> {
+    let mut listed: Vec<Listed> = self.tasks.iter().map(Listed::Task).collect();
+    for folder in &self.folders {
+      let at = match folder.after {
+        Some(after) => listed
+          .iter()
+          .position(|node| match node {
+            Listed::Task(task) => task.id == after,
+            Listed::Folder(folder) => folder.id == after,
+          })
+          .map(|i| i + 1),
+        None => listed.iter().position(|node| match node {
+          Listed::Task(task) => task.space == folder.space,
+          Listed::Folder(other) => other.space == folder.space,
+        }),
+      };
+      listed.insert(at.unwrap_or(listed.len()), Listed::Folder(folder));
+    }
+    listed
+  }
+
   /// The tasks as the kernel saved them, by this binary, for `runner`:
   /// what a save writes. An upgrade adds what it hands over: the
   /// descriptors and the connections.
@@ -652,6 +736,7 @@ impl Snapshot {
       listener_fd: -1,
       next_task_id: kernel.next_task_id,
       tasks: kernel.tasks,
+      folders: kernel.folders,
       connections: Vec::new(),
       config_base: Some(config_base),
     }
@@ -900,7 +985,7 @@ mod tests {
     );
     let process = |task: &Task| match &task.kind {
       TaskKind::Process(process) => process.clone(),
-      TaskKind::Console {} => panic!("a process"),
+      TaskKind::Console { .. } => panic!("a process"),
     };
     let StopSignal::Program { .. } = process(db).stop else {
       panic!("db stops with a program");
@@ -1065,5 +1150,44 @@ mod tests {
       .unwrap_err()
       .to_string();
     assert!(err.contains("not a dekit snapshot"), "{err}");
+  }
+
+  /// Folders go back right after what they were listed after, or first
+  /// in their space; they and the console's groups read back as written.
+  #[test]
+  fn folders_go_back_where_they_were_listed() {
+    let mut snapshot = decode(include_bytes!("fixtures/v1.json")).unwrap();
+    // The console, in its own space, and `web`.
+    let ids: Vec<usize> = snapshot.tasks.iter().map(|task| task.id).collect();
+    assert_eq!(ids, [1, 2]);
+    let folder = |id, path: &str, after| Folder {
+      id,
+      space: String::new(),
+      path: path.to_string(),
+      after,
+      collapsed: false,
+      origin: None,
+    };
+    snapshot.folders = vec![
+      folder(100, "a", None),
+      folder(101, "b", Some(2)),
+      folder(102, "b/c", Some(101)),
+    ];
+    let listed: Vec<String> = snapshot
+      .listed()
+      .iter()
+      .map(|node| match node {
+        Listed::Task(task) => task.id.to_string(),
+        Listed::Folder(folder) => format!("{}/", folder.path),
+      })
+      .collect();
+    assert_eq!(listed, ["1", "a/", "2", "b/", "b/c/"]);
+    for task in &mut snapshot.tasks {
+      if let TaskKind::Console { groups } = &mut task.kind {
+        groups.insert("b".to_string(), true);
+      }
+    }
+    let json = serde_json::to_vec(&snapshot).unwrap();
+    assert_eq!(decode(&json).unwrap(), snapshot);
   }
 }

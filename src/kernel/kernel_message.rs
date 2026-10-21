@@ -30,6 +30,52 @@ pub struct TaskRegistration {
   pub factory: Box<dyn FnOnce(TaskContext) -> Box<dyn Task> + Send>,
 }
 
+/// What a batch registers: a task, or a folder.
+pub enum Registration {
+  Task(TaskRegistration),
+  Folder(FolderDef),
+}
+
+impl From<TaskRegistration> for Registration {
+  fn from(registration: TaskRegistration) -> Self {
+    Registration::Task(registration)
+  }
+}
+
+/// A folder: a node in the task tree that holds what is under it and
+/// stays while it is empty. It runs nothing, has no state, and is no
+/// task's dep; its id is from the tasks' ids.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FolderDef {
+  pub id: TaskId,
+  pub space: TaskSpaceId,
+  pub path: TaskPath,
+  /// Where it is listed beside the paths at its path's parent, as for a
+  /// task; a group there becomes it where it is.
+  pub place: Place,
+  pub settings: FolderSettings,
+}
+
+/// What a folder's entry says.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FolderSettings {
+  /// Collapsed when the console first lists it.
+  pub collapsed: bool,
+  /// The config entry it is written in; none for the runner's own.
+  pub origin: Option<Source>,
+}
+
+/// A folder as it is now.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FolderInfo {
+  pub id: TaskId,
+  pub space: TaskSpaceId,
+  pub path: TaskPath,
+  /// The task or folder listed just before it.
+  pub after: Option<TaskId>,
+  pub settings: FolderSettings,
+}
+
 impl TaskRegistration {
   pub fn async_task<F, Fut>(task_id: TaskId, def: TaskDef, f: F) -> Self
   where
@@ -91,12 +137,12 @@ pub enum KernelCommand {
     tokio::sync::oneshot::Sender<Result<(), RegisterError>>,
   ),
 
-  /// Registers each task as `RegisterTask` does, all in one dispatch.
-  /// They are listed in the order given, whatever order their
-  /// dependencies make the kernel register them in. Answers with one
-  /// result for each, in that order.
+  /// Registers each task as `RegisterTask` does, and each folder, all in
+  /// one dispatch. They are listed in the order given, whatever order
+  /// their dependencies make the kernel register them in. Answers with
+  /// one result for each, in that order.
   RegisterTasks(
-    Vec<TaskRegistration>,
+    Vec<Registration>,
     tokio::sync::oneshot::Sender<Vec<Result<(), RegisterError>>>,
   ),
 
@@ -115,7 +161,14 @@ pub enum KernelCommand {
   Unpin(TaskSelector, Ack),
   Veto(TaskSelector, Ack),
   /// Total: removes matching tasks in any state, killing running ones.
+  /// A glob that matches a group or folder, or a folder's id, removes it
+  /// with every task and folder under it. The ack counts both.
   Remove(TaskSelector, Ack),
+  /// Takes a folder away, leaving what is under it; the ack is 1, or 0
+  /// for no such folder.
+  DropFolder(TaskId, Ack),
+  /// Gives a folder what its entry says now.
+  SetFolder(TaskId, FolderSettings, Ack),
   SetLabel(TaskSelector, Option<String>, Ack),
   /// Registers a copy of each matching task made from a definition;
   /// replies with how many, or why one could not be.
@@ -270,6 +323,7 @@ impl std::error::Error for MoveError {}
 pub struct KernelSnapshot {
   pub next_task_id: usize,
   pub tasks: Vec<crate::upgrade::snapshot::Task>,
+  pub folders: Vec<crate::upgrade::snapshot::Folder>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -337,6 +391,8 @@ pub enum RegisterError {
   Changed,
   /// The task is not one made from a definition, to replace or copy.
   NoDefinition,
+  /// A folder is at the path.
+  FolderAt(TaskKey),
 }
 
 impl fmt::Display for RegisterError {
@@ -371,6 +427,7 @@ impl fmt::Display for RegisterError {
       RegisterError::NoDefinition => {
         f.write_str("the task is not one made from a definition")
       }
+      RegisterError::FolderAt(key) => write!(f, "'{}' is a folder", key),
     }
   }
 }
@@ -385,6 +442,8 @@ pub enum KernelQuery {
   Explain(TaskSelector, Reply<Vec<TaskExplain>>),
   /// Matching tasks with their definitions, in list order.
   Describe(TaskSelector, Reply<Vec<TaskDescription>>),
+  /// The folders in a space, in list order.
+  Folders(TaskSpaceId, Reply<Vec<FolderInfo>>),
 }
 
 pub type Reply<T> = tokio::sync::oneshot::Sender<T>;
@@ -545,7 +604,7 @@ impl TaskContext {
 
   pub fn register_tasks(
     &self,
-    registrations: Vec<TaskRegistration>,
+    registrations: Vec<Registration>,
   ) -> tokio::sync::oneshot::Receiver<Vec<Result<(), RegisterError>>> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     self.send(KernelCommand::RegisterTasks(registrations, ack_tx));
@@ -603,6 +662,14 @@ impl TaskContext {
   ) -> impl std::future::Future<Output = Vec<TaskDescription>> + Send + 'static
   {
     self.ask(|reply| KernelQuery::Describe(selector, reply))
+  }
+
+  /// The folders in a space, in list order.
+  pub fn folders(
+    &self,
+    space: TaskSpaceId,
+  ) -> impl std::future::Future<Output = Vec<FolderInfo>> + Send + 'static {
+    self.ask(|reply| KernelQuery::Folders(space, reply))
   }
 
   pub fn get_task_sender(&self, target_id: TaskId) -> TaskSender {

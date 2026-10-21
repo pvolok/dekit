@@ -81,6 +81,8 @@ Default bindings in `tasks`:
   desc: next-task, prev-task
 - cmd: <h> <Left>, <l> <Right>
   desc: collapse, expand, a group in the task list
+- cmd: <H>, <L>
+  desc: "fold {op: close, target: '**'}, fold {op: open, target: '**'}: every group"
 - cmd: <M-1> ... <M-8>
   desc: "select-task {index: 0} ... 7"
 - cmd: <s>, <x>, <X>
@@ -128,3 +130,9 @@ directory, `{action: switch-runner, kind: project, root: /abs/path}` to
 move the attachment to another runner's console, and
 `{action: command, command: {...}}` to run any command from
 |config/hooks|.
+
+`fold` opens, closes, or toggles groups: `{action: fold, op: close}`
+closes the selected group, or the one the selected task is in, and
+`{action: fold, op: toggle, target: 'apps/*'}` the groups a path or glob
+names, as a target does (|start/targets|). `op` is `open`, `close`, or
+`toggle`; toggling several closes them unless they are all closed.

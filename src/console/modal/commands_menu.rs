@@ -1,6 +1,6 @@
 use unicode_width::UnicodeWidthStr;
 
-use crate::console::action::{Action, RunnerTab, ScrollUnit};
+use crate::console::action::{Action, FoldOp, RunnerTab, ScrollUnit};
 use crate::console::{
   keymap::{Keymap, KeymapGroup},
   theme::Theme,
@@ -179,6 +179,14 @@ fn menu_items() -> Vec<MenuItem> {
     Action::PrevTask,
     Action::Expand,
     Action::Collapse,
+    Action::Fold {
+      op: FoldOp::Close,
+      target: Some("**".to_string()),
+    },
+    Action::Fold {
+      op: FoldOp::Open,
+      target: Some("**".to_string()),
+    },
     Action::StartTask,
     Action::StopTask,
     Action::KillTask,

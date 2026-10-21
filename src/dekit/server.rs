@@ -1,5 +1,6 @@
 use std::{
-  collections::HashMap,
+  collections::{BTreeMap, HashMap},
+  path::PathBuf,
   sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -250,6 +251,9 @@ async fn run_locked(
 
   log::info!("Lock file created for directory: {}", working_dir.display());
 
+  // Read before the console is made: it lists the saved groups as it had
+  // them.
+  let saved = Saved::read(runner)?;
   #[cfg(unix)]
   crate::process::unix_processes_waiter::UnixProcessesWaiter::init()?;
   let mut kernel = Kernel::new();
@@ -267,6 +271,10 @@ async fn run_locked(
     },
     project.clone(),
     keymap,
+    saved
+      .as_ref()
+      .map(Saved::console_groups)
+      .unwrap_or_default(),
   );
   if let Err(err) = kernel.register_task_registration(console) {
     #[cfg(unix)]
@@ -283,7 +291,7 @@ async fn run_locked(
 
   let bootstrap = async {
     let mut warnings = config.warnings.clone();
-    let (restored, base) = register_tasks(&config, &pc, runner).await?;
+    let (restored, base) = register_tasks(&config, &pc, saved).await?;
     warnings.extend(restored);
     if let Some(base) = base {
       project.set_base(base);
@@ -347,6 +355,43 @@ pub fn save_on_quit(runner: &RunnerSpec, project: Arc<Project>) -> SaveFn {
   })
 }
 
+/// What the last quit saved for the next start, read from its file.
+struct Saved {
+  path: PathBuf,
+  snapshot: anyhow::Result<snap::Snapshot>,
+}
+
+impl Saved {
+  /// The file the last quit wrote for `runner`, if there is one.
+  fn read(runner: &RunnerSpec) -> anyhow::Result<Option<Saved>> {
+    let path = lockfile::saved_path(runner)?;
+    match std::fs::read(&path) {
+      Ok(bytes) => Ok(Some(Saved {
+        snapshot: snap::decode(&bytes),
+        path,
+      })),
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+      Err(err) => anyhow::bail!("reading {}: {err}", path.display()),
+    }
+  }
+
+  /// The groups the saved console listed, and whether each was
+  /// collapsed.
+  fn console_groups(&self) -> BTreeMap<String, bool> {
+    let Ok(snapshot) = &self.snapshot else {
+      return BTreeMap::new();
+    };
+    snapshot
+      .tasks
+      .iter()
+      .find_map(|task| match &task.kind {
+        snap::TaskKind::Console { groups } => Some(groups.clone()),
+        snap::TaskKind::Process(_) => None,
+      })
+      .unwrap_or_default()
+  }
+}
+
 /// The config tasks, or the tasks the last quit saved, as it saved them,
 /// with the config entries that load had. A saved file that cannot be
 /// read is dropped with a warning rather than keep the runner from
@@ -354,20 +399,13 @@ pub fn save_on_quit(runner: &RunnerSpec, project: Arc<Project>) -> SaveFn {
 async fn register_tasks(
   config: &Config,
   pc: &TaskContext,
-  runner: &RunnerSpec,
+  saved: Option<Saved>,
 ) -> anyhow::Result<(Vec<String>, Option<crate::spec::Base>)> {
-  let path = lockfile::saved_path(runner)?;
-  let bytes = match std::fs::read(&path) {
-    Ok(bytes) => bytes,
-    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-      register_idle_config_tasks(config, pc).await?;
-      return Ok((Vec::new(), None));
-    }
-    Err(err) => {
-      anyhow::bail!("reading {}: {err}", path.display());
-    }
+  let Some(Saved { path, snapshot }) = saved else {
+    register_idle_config_tasks(config, pc).await?;
+    return Ok((Vec::new(), None));
   };
-  let (warnings, base) = match snap::decode(&bytes) {
+  let (warnings, base) = match snapshot {
     Ok(snapshot) => {
       log::info!("Restoring the saved tasks from {}", path.display());
       let (warnings, base) =
@@ -843,7 +881,9 @@ async fn handle_rpc(
             MoveError::IntoItself | MoveError::BadAfter(_),
           ) => codes::INVALID_PARAMS,
           CommandError::Register(
-            RegisterError::PathTaken(_) | RegisterError::PathNested(..),
+            RegisterError::PathTaken(_)
+            | RegisterError::PathNested(..)
+            | RegisterError::FolderAt(_),
           ) => codes::PATH_TAKEN,
           CommandError::Register(
             RegisterError::ReservedSpace(_) | RegisterError::NoDefinition,

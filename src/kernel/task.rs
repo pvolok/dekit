@@ -283,7 +283,14 @@ pub enum TaskNotify {
     state: TaskState,
     vt: Option<ScreenHandle>,
   },
+  /// A folder, listed right after `after`; `from` is its id.
+  FolderAdded {
+    path: TaskPath,
+    after: Option<TaskId>,
+    collapsed: bool,
+  },
   StateChanged(TaskState),
+  /// The task or folder is gone.
   Removed,
   /// The label or the kind changed: renamed, or redefined.
   Changed {
@@ -291,7 +298,7 @@ pub enum TaskNotify {
     kind: TaskKind,
   },
   /// Listed elsewhere, at this path, right after `after`. A move of
-  /// several tasks notifies them in their new list order.
+  /// several tasks and folders notifies them in their new list order.
   Moved {
     path: Option<TaskPath>,
     after: Option<TaskId>,
@@ -305,6 +312,9 @@ impl fmt::Debug for TaskNotify {
         path, label, state, ..
       } => {
         write!(f, "Added({:?}, {:?}, {:?})", path, label, state)
+      }
+      TaskNotify::FolderAdded { path, .. } => {
+        write!(f, "FolderAdded({:?})", path)
       }
       TaskNotify::StateChanged(state) => write!(f, "StateChanged({:?})", state),
       TaskNotify::Removed => write!(f, "Removed"),

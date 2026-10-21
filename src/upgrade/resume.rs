@@ -22,7 +22,9 @@ use crate::{
   },
   kernel::{
     kernel::Kernel,
-    kernel_message::{TaskContext, TaskRegistration, TaskSelector},
+    kernel_message::{
+      Registration, TaskContext, TaskRegistration, TaskSelector,
+    },
     task::{Effects, Task, TaskCmd, TaskDef, TaskId},
     task_key::TaskSpaceId,
   },
@@ -216,16 +218,17 @@ fn check_graph(
   let tasks = prepared
     .tasks
     .into_iter()
-    .map(|(saved, registration)| {
-      let factory =
-        Box::new(|_: TaskContext| -> Box<dyn Task> { Box::new(Unstarted) });
-      (
-        saved,
-        TaskRegistration {
+    .map(|(saved, registration)| match registration {
+      Registration::Task(registration) => {
+        let factory =
+          Box::new(|_: TaskContext| -> Box<dyn Task> { Box::new(Unstarted) });
+        let registration = TaskRegistration {
           factory,
           ..registration
-        },
-      )
+        };
+        (saved, Registration::Task(registration))
+      }
+      folder @ Registration::Folder(_) => (saved, folder),
     })
     .collect();
   Kernel::new().restore(prepared.next_task_id, tasks)
@@ -247,7 +250,8 @@ impl Task for Unstarted {
 /// saved without a definition is built from the config, once.
 struct Prepared<'a> {
   next_task_id: usize,
-  tasks: Vec<(&'a snap::Task, TaskRegistration)>,
+  /// The tasks and folders, in list order.
+  tasks: Vec<(Option<&'a snap::Task>, Registration)>,
   console: TaskId,
   connections: Vec<Connection>,
 }
@@ -275,9 +279,19 @@ fn prepare<'a>(
   let config = &project.config();
   let mut console = None;
   let mut tasks = Vec::with_capacity(snapshot.tasks.len());
-  // Every task as it was, in its order: the config is not read for them.
-  // A reload brings in what changed there.
-  for task in &snapshot.tasks {
+  // Every task and folder as it was, in its order: the config is not
+  // read for them. A reload brings in what changed there.
+  for node in snapshot.listed() {
+    let task = match node {
+      snap::Listed::Task(task) => task,
+      snap::Listed::Folder(folder) => {
+        let def = folder
+          .def(TaskId(folder.id))
+          .with_context(|| format!("saved folder {}/", folder.path))?;
+        tasks.push((None, Registration::Folder(def)));
+        continue;
+      }
+    };
     let task_id = TaskId(task.id);
     let registration = match &task.kind {
       snap::TaskKind::Process(process) => {
@@ -300,7 +314,7 @@ fn prepare<'a>(
           format!("saved task {name}")
         })?
       }
-      snap::TaskKind::Console {} => {
+      snap::TaskKind::Console { groups } => {
         console = Some(task_id);
         let (space, path) = match task.key()? {
           Some(key) => (key.space, Some(key.path)),
@@ -318,10 +332,11 @@ fn prepare<'a>(
           },
           project.clone(),
           config.keymap.build(),
+          groups.clone(),
         )
       }
     };
-    tasks.push((task, registration));
+    tasks.push((Some(task), Registration::Task(registration)));
   }
   let next_task_id = snapshot.next_task_id;
   let console =
@@ -388,7 +403,13 @@ fn take_over(
   let prepared = prepare(snapshot, project)?;
   project.set_base(saved_base(
     snapshot,
-    prepared.tasks.iter().map(|(_, registration)| registration),
+    prepared
+      .tasks
+      .iter()
+      .filter_map(|(_, registration)| match registration {
+        Registration::Task(registration) => Some(registration),
+        Registration::Folder(_) => None,
+      }),
   ));
   // Children spawned by this image must not inherit what it adopts.
   set_cloexec(&snap::fds(snapshot), true)

@@ -1,8 +1,12 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+  collections::{BTreeMap, HashMap},
+  sync::Arc,
+};
 
 use indexmap::IndexSet;
 
 use crate::console::{
+  action::FoldOp,
   task_view::TaskView,
   widgets::list::{ListRow, ListState},
 };
@@ -12,7 +16,7 @@ use crate::kernel::{
 };
 use crate::term::grid::Rect;
 
-/// The tasks under a path.
+/// The tasks under a path: a group, or a folder.
 pub struct Group {
   path: Arc<TaskPath>,
   /// The paths right under this one, in list order.
@@ -21,11 +25,30 @@ pub struct Group {
   pub up: usize,
   pub failed: usize,
   pub collapsed: bool,
+  /// The folder's id, when it is one: it stays while it is empty.
+  pub folder: Option<TaskId>,
 }
 
 impl Group {
+  fn new(path: &str, collapsed: bool) -> Self {
+    Group {
+      path: Arc::new(TaskPath::new(path).unwrap_or(TaskPath::root())),
+      children: IndexSet::new(),
+      tasks: 0,
+      up: 0,
+      failed: 0,
+      collapsed,
+      folder: None,
+    }
+  }
+
   pub fn len(&self) -> usize {
     self.tasks
+  }
+
+  /// Nothing is under it: an empty folder.
+  pub fn is_empty(&self) -> bool {
+    self.children.is_empty()
   }
 
   fn add(&mut self, task: &TaskView) {
@@ -41,23 +64,28 @@ impl Group {
   }
 }
 
-/// A path holds a task or has tasks under it, never both.
+/// A path holds a task, or is a group or folder, never both.
 pub enum Node {
   Task(TaskView),
   Group(Group),
 }
 
-/// Tasks and the groups above them, with a cursor over the visible rows.
+/// Tasks and folders, and the groups above them, with a cursor over the
+/// visible rows.
 ///
 /// The rows are in the kernel's list order: each `add` says which task
-/// the new one is listed after.
+/// or folder the new one is listed after.
 pub struct TaskTree {
   /// By path. The group at "" is the root, with every task under it.
   nodes: HashMap<String, Node>,
+  /// Where each task and folder is.
   paths: HashMap<TaskId, Arc<TaskPath>>,
   /// The visible paths, rebuilt on every change.
   rows: Vec<Arc<TaskPath>>,
   list: ListState,
+  /// Whether each group not listed yet starts collapsed, by path: as the
+  /// console had them when it was saved. Each is taken once.
+  seeds: HashMap<String, bool>,
 }
 
 impl TaskTree {
@@ -67,36 +95,105 @@ impl TaskTree {
       paths: HashMap::new(),
       rows: Vec::new(),
       list: ListState::new(1),
+      seeds: HashMap::new(),
     }
   }
 
-  /// `after` is the task listed just before the new one, if any.
+  /// A tree whose groups start as `groups` says, once listed.
+  pub fn with_groups(groups: BTreeMap<String, bool>) -> Self {
+    TaskTree {
+      seeds: groups.into_iter().collect(),
+      ..TaskTree::new()
+    }
+  }
+
+  /// How the groups are shown, by path, for `with_groups`: each folder,
+  /// whose entry may say otherwise by the next start, and each other
+  /// group that is collapsed. A tree with neither gives none, which a
+  /// save then leaves out.
+  pub fn groups(&self) -> BTreeMap<String, bool> {
+    self
+      .nodes
+      .iter()
+      .filter_map(|(path, node)| match node {
+        Node::Group(group)
+          if !path.is_empty()
+            && (group.collapsed || group.folder.is_some()) =>
+        {
+          Some((path.clone(), group.collapsed))
+        }
+        Node::Group(_) | Node::Task(_) => None,
+      })
+      .collect()
+  }
+
+  /// `after` is the task or folder listed just before the new one, if
+  /// any.
   pub fn add(&mut self, task: TaskView, after: Option<TaskId>) {
     if self.nodes.contains_key(task.path.as_str()) {
       log::error!("The task list already has '{}'", task.path);
       return;
     }
     let after = after.and_then(|id| self.paths.get(&id)).cloned();
-    for group in above(task.path.as_str()) {
+    let path = task.path.clone();
+    self.list(&path, after, Some(&task));
+    self.paths.insert(task.id, path.clone());
+    self.nodes.insert(path.to_string(), Node::Task(task));
+    self.rebuild();
+  }
+
+  /// A folder, `collapsed` unless its group is listed already or was
+  /// saved otherwise; `after` as for `add`.
+  pub fn add_folder(
+    &mut self,
+    id: TaskId,
+    path: TaskPath,
+    after: Option<TaskId>,
+    collapsed: bool,
+  ) {
+    if let Some(Node::Task(_)) = self.nodes.get(path.as_str()) {
+      log::error!("The task list has a task at folder '{}'", path);
+      return;
+    }
+    let after = after.and_then(|id| self.paths.get(&id)).cloned();
+    let path = Arc::new(path);
+    self.list(&path, after, None);
+    let seeds = &mut self.seeds;
+    let node = self.nodes.entry(path.to_string()).or_insert_with(|| {
+      let collapsed = seeds.remove(path.as_str()).unwrap_or(collapsed);
+      Node::Group(Group::new(path.as_str(), collapsed))
+    });
+    if let Node::Group(group) = node {
+      group.folder = Some(id);
+    }
+    self.paths.insert(id, path);
+    self.rebuild();
+  }
+
+  /// Lists `path` in each group above it, the groups not there made,
+  /// right after the path `after` is at or under, or first when that is
+  /// not under the group. A path already there moves there too: a moved
+  /// task brings its groups along. Each group counts `task`.
+  fn list(
+    &mut self,
+    path: &Arc<TaskPath>,
+    after: Option<Arc<TaskPath>>,
+    task: Option<&TaskView>,
+  ) {
+    for group in above(path.as_str()) {
+      let seeds = &mut self.seeds;
       let node = self.nodes.entry(group.to_string()).or_insert_with(|| {
-        Node::Group(Group {
-          path: Arc::new(TaskPath::new(group).unwrap_or(TaskPath::root())),
-          children: IndexSet::new(),
-          tasks: 0,
-          up: 0,
-          failed: 0,
-          collapsed: false,
-        })
+        let collapsed = seeds.remove(group).unwrap_or(false);
+        Node::Group(Group::new(group, collapsed))
       });
       let (Node::Group(group), Some(child)) =
-        (node, under(group, task.path.as_str()))
+        (node, under(group, path.as_str()))
       else {
         continue;
       };
-      group.add(&task);
-      // Right after the path the earlier task is at or under, or first
-      // when that task is not under this group. A path already here moves
-      // there too: a moved task brings its groups along.
+      if let Some(task) = task {
+        group.add(task);
+      }
       let beside = after
         .as_ref()
         .and_then(|after| under(group.path.as_str(), after.as_str()));
@@ -119,14 +216,60 @@ impl TaskTree {
       };
       group.children.move_index(index, place);
     }
-    self.paths.insert(task.id, task.path.clone());
-    let key = task.path.as_str().to_string();
-    self.nodes.insert(key, Node::Task(task));
+  }
+
+  /// A task or folder is gone.
+  pub fn remove(&mut self, id: TaskId) {
+    match self.is_folder(id) {
+      true => self.take_folder(id),
+      false => drop(self.take(id)),
+    }
+  }
+
+  fn is_folder(&self, id: TaskId) -> bool {
+    self.paths.get(&id).is_some_and(|path| {
+      matches!(
+        self.nodes.get(path.as_str()),
+        Some(Node::Group(group)) if group.folder == Some(id)
+      )
+    })
+  }
+
+  /// Takes a folder away; its group stays while something is under it.
+  fn take_folder(&mut self, id: TaskId) {
+    let Some(path) = self.paths.remove(&id) else {
+      return;
+    };
+    if let Some(Node::Group(group)) = self.nodes.get_mut(path.as_str()) {
+      group.folder = None;
+      if group.children.is_empty() {
+        self.nodes.remove(path.as_str());
+      }
+    }
+    self.prune(path.as_str());
     self.rebuild();
   }
 
-  pub fn remove(&mut self, id: TaskId) {
-    self.take(id);
+  /// Takes `path` off its group's list once nothing is at it, and each
+  /// group above that is left with nothing in it and is no folder.
+  fn prune(&mut self, path: &str) {
+    let mut child = path;
+    for parent in above(path).collect::<Vec<_>>().into_iter().rev() {
+      if self.nodes.contains_key(child) {
+        return;
+      }
+      let Some(Node::Group(group)) = self.nodes.get_mut(parent) else {
+        return;
+      };
+      group.children.shift_remove(child);
+      if !parent.is_empty()
+        && group.children.is_empty()
+        && group.folder.is_none()
+      {
+        self.nodes.remove(parent);
+      }
+      child = parent;
+    }
   }
 
   /// Lists a task at another path, or elsewhere at its own, right after
@@ -139,6 +282,9 @@ impl TaskTree {
     path: TaskPath,
     after: Option<TaskId>,
   ) {
+    if self.is_folder(id) {
+      return self.move_folder(id, path, after);
+    }
     let selected = self.current().map(|task| task.id) == Some(id);
     let was = self.selected_path();
     let collapsed: Vec<String> = self
@@ -170,6 +316,41 @@ impl TaskTree {
     }
   }
 
+  /// A folder listed elsewhere: its group is shown as it was, and the
+  /// selection stays on it when it was.
+  fn move_folder(&mut self, id: TaskId, path: TaskPath, after: Option<TaskId>) {
+    let Some(old) = self.paths.get(&id).cloned() else {
+      return;
+    };
+    let was = self.selected_path();
+    let selected = was.as_ref() == Some(&old);
+    let shown = |tree: &Self, path: &str| match tree.nodes.get(path) {
+      Some(Node::Group(group)) => group.collapsed,
+      Some(Node::Task(_)) | None => false,
+    };
+    let own = shown(self, old.as_str());
+    // The groups above it that it leaves empty are shown as they were
+    // when they come again.
+    let above_it: Vec<String> = above(old.as_str())
+      .filter(|group| shown(self, group))
+      .map(str::to_string)
+      .collect();
+    self.take_folder(id);
+    self.add_folder(id, path.clone(), after, own);
+    let fold = above_it.iter().map(|group| (group.as_str(), true));
+    for (group, collapsed) in fold.chain([(path.as_str(), own)]) {
+      if let Some(Node::Group(group)) = self.nodes.get_mut(group) {
+        group.collapsed = collapsed;
+      }
+    }
+    self.rebuild();
+    match was {
+      _ if selected => self.select(&path),
+      Some(was) => self.select(&was),
+      None => (),
+    }
+  }
+
   fn take(&mut self, id: TaskId) -> Option<TaskView> {
     let path = self.paths.remove(&id)?;
     let Some(Node::Task(task)) = self.nodes.remove(path.as_str()) else {
@@ -178,21 +359,9 @@ impl TaskTree {
     for above in above(path.as_str()) {
       if let Some(Node::Group(group)) = self.nodes.get_mut(above) {
         group.remove(&task);
-        if group.tasks == 0 {
-          self.nodes.remove(above);
-        }
       }
     }
-    for above in above(path.as_str()) {
-      let Some(child) = under(above, path.as_str()) else {
-        continue;
-      };
-      if !self.nodes.contains_key(child)
-        && let Some(Node::Group(group)) = self.nodes.get_mut(above)
-      {
-        group.children.shift_remove(child);
-      }
-    }
+    self.prune(path.as_str());
     self.rebuild();
     Some(task)
   }
@@ -315,6 +484,64 @@ impl TaskTree {
         if let Some(parent) = path.parent() {
           self.select(&parent);
         }
+      }
+    }
+  }
+
+  /// Opens, closes, or toggles the groups `target` matches, as a path or
+  /// glob, or else the selected group or the one the selected task is
+  /// in. Toggling several closes them all unless all are closed. A
+  /// selection that a group closes over moves up to it.
+  pub fn fold(&mut self, op: FoldOp, target: Option<&str>) {
+    let paths: Vec<String> = match target {
+      Some(pattern) => self
+        .nodes
+        .iter()
+        .filter(|(path, node)| {
+          matches!(node, Node::Group(_))
+            && !path.is_empty()
+            && glob_matches(pattern, path)
+        })
+        .map(|(path, _)| path.clone())
+        .collect(),
+      None => match self.selected() {
+        Some((path, Node::Group(_))) => vec![path.to_string()],
+        Some((path, Node::Task(_))) => path
+          .parent()
+          .filter(|parent| !parent.is_root())
+          .map(|parent| parent.to_string())
+          .into_iter()
+          .collect(),
+        None => Vec::new(),
+      },
+    };
+    let groups = || {
+      paths.iter().filter_map(|path| match self.nodes.get(path) {
+        Some(Node::Group(group)) => Some(group),
+        Some(Node::Task(_)) | None => None,
+      })
+    };
+    let collapsed = match op {
+      FoldOp::Open => false,
+      FoldOp::Close => true,
+      FoldOp::Toggle => !groups().all(|group| group.collapsed),
+    };
+    let selected = self.selected_path();
+    for path in &paths {
+      if let Some(Node::Group(group)) = self.nodes.get_mut(path) {
+        group.collapsed = collapsed;
+      }
+    }
+    self.rebuild();
+    // Up to the nearest group still shown.
+    if let Some(selected) = selected
+      && self.row_of(&selected).is_none()
+    {
+      let shown = std::iter::successors(selected.parent(), TaskPath::parent)
+        .take_while(|path| !path.is_root())
+        .find(|path| self.row_of(path).is_some());
+      if let Some(shown) = shown {
+        self.select(&shown);
       }
     }
   }
@@ -466,6 +693,28 @@ impl TaskTree {
   }
 }
 
+/// Whether `path` matches a glob as a target writes one: `*` is one
+/// part, and `**` any number of them.
+fn glob_matches(pattern: &str, path: &str) -> bool {
+  fn matches(pattern: &[&str], path: &[&str]) -> bool {
+    match (pattern.split_first(), path.split_first()) {
+      (None, None) => true,
+      (Some((&"**", rest)), _) => {
+        matches(rest, path)
+          || (!path.is_empty() && matches(pattern, &path[1..]))
+      }
+      (Some((part, rest)), Some((name, names))) => {
+        (*part == "*" || part == name) && matches(rest, names)
+      }
+      (Some(_), None) | (None, Some(_)) => false,
+    }
+  }
+  fn parts(text: &str) -> Vec<&str> {
+    text.split('/').filter(|part| !part.is_empty()).collect()
+  }
+  matches(&parts(pattern), &parts(path))
+}
+
 /// The groups a path is under, from the root: `a/b/c` gives "", `a` and
 /// `a/b`.
 fn above(path: &str) -> impl Iterator<Item = &str> {
@@ -488,6 +737,7 @@ fn under<'a>(group: &str, path: &'a str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::console::action::FoldOp;
   use crate::kernel::kernel_message::{Place, ScreenHandle};
   use crate::kernel::path_trie::PathTrie;
   use crate::kernel::task::ExitInfo;
@@ -601,7 +851,7 @@ mod tests {
     let mut trie = PathTrie::new();
     let mut tree = TaskTree::new();
     for path in paths {
-      trie.place(&TaskPath::new(path).unwrap());
+      trie.place(&TaskPath::new(path).unwrap(), &Place::Last);
     }
     for i in [6, 2, 0, 4, 5, 3, 1] {
       add(&mut trie, &mut tree, i + 1, paths[i], None);
@@ -725,5 +975,152 @@ mod tests {
       Some(TaskId(2)),
       "past the end selects the last task"
     );
+  }
+
+  /// A folder is a group row of its own: listed where the kernel says,
+  /// kept while empty, and starting collapsed if it says so.
+  #[test]
+  fn folders_are_group_rows() {
+    let mut tree = tree(&["db"]);
+    tree.add_folder(
+      TaskId(10),
+      TaskPath::new("apps").unwrap(),
+      Some(TaskId(1)),
+      true,
+    );
+    tree.add_folder(
+      TaskId(11),
+      TaskPath::new("tmp").unwrap(),
+      Some(TaskId(10)),
+      false,
+    );
+    assert_eq!(shown(&mut tree), ["db*", "apps/", "tmp/"]);
+    tree.add(task(2, "apps/web"), Some(TaskId(10)));
+    assert_eq!(shown(&mut tree), ["db*", "apps/", "tmp/"], "collapsed");
+    tree.select_task(1);
+    assert_eq!(shown(&mut tree), ["db", "apps/", "  apps/web*", "tmp/"]);
+
+    // Emptied, it stays; taken away, its group goes once it is empty.
+    tree.remove(TaskId(2));
+    assert_eq!(shown(&mut tree), ["db", "apps/", "tmp/*"]);
+    tree.remove(TaskId(10));
+    tree.remove(TaskId(11));
+    assert_eq!(shown(&mut tree), ["db*"]);
+  }
+
+  /// Groups listed again start as they were saved; the others as their
+  /// folder says, or open.
+  #[test]
+  fn groups_start_as_saved() {
+    let saved =
+      BTreeMap::from([("web".to_string(), true), ("apps".to_string(), false)]);
+    let mut tree = TaskTree::with_groups(saved);
+    tree.add_folder(TaskId(10), TaskPath::new("apps").unwrap(), None, true);
+    tree.add(task(1, "apps/api"), Some(TaskId(10)));
+    tree.add(task(2, "web/ui"), Some(TaskId(1)));
+    tree.add(task(3, "db/pg"), Some(TaskId(2)));
+    assert_eq!(
+      shown(&mut tree),
+      ["apps/*", "  apps/api", "web/", "db/", "  db/pg"]
+    );
+    // Each folder, and the other groups closed.
+    assert_eq!(
+      tree.groups(),
+      BTreeMap::from([("apps".to_string(), false), ("web".to_string(), true)])
+    );
+  }
+
+  #[test]
+  fn folds_the_groups_a_target_matches() {
+    let mut tree = tree(&["a/x/1", "a/y", "b/z", "c"]);
+    tree.fold(FoldOp::Close, Some("**"));
+    assert_eq!(shown(&mut tree), ["a/*", "b/", "c"]);
+    tree.fold(FoldOp::Open, Some("a"));
+    assert_eq!(shown(&mut tree), ["a/*", "  a/x/", "  a/y", "b/", "c"]);
+    tree.fold(FoldOp::Open, Some("**"));
+    assert_eq!(
+      shown(&mut tree),
+      ["a/*", "  a/x/", "    a/x/1", "  a/y", "b/", "  b/z", "c"]
+    );
+    // Toggling several closes them unless all are closed.
+    tree.fold(FoldOp::Close, Some("b"));
+    tree.fold(FoldOp::Toggle, Some("*"));
+    assert_eq!(shown(&mut tree), ["a/*", "b/", "c"]);
+    tree.fold(FoldOp::Toggle, Some("*"));
+    assert_eq!(
+      shown(&mut tree),
+      ["a/*", "  a/x/", "    a/x/1", "  a/y", "b/", "  b/z", "c"]
+    );
+
+    // The selected group, or the one the selected task is in; a
+    // selection closed over moves up to it.
+    tree.select_task(0);
+    tree.fold(FoldOp::Close, None);
+    assert_eq!(
+      shown(&mut tree),
+      ["a/", "  a/x/*", "  a/y", "b/", "  b/z", "c"]
+    );
+    tree.fold(FoldOp::Toggle, None);
+    tree.select_task(0);
+    tree.fold(FoldOp::Close, Some("a"));
+    assert_eq!(shown(&mut tree), ["a/*", "b/", "  b/z", "c"]);
+  }
+
+  #[test]
+  fn a_glob_matches_as_a_target_does() {
+    for (pattern, path, matches) in [
+      ("a", "a", true),
+      ("a", "a/b", false),
+      ("*", "a", true),
+      ("*", "a/b", false),
+      ("a/*", "a/b", true),
+      ("**", "a/b/c", true),
+      ("a/**", "a", true),
+      ("a/**", "a/b/c", true),
+      ("a/**", "b/a", false),
+      ("**/c", "a/b/c", true),
+      ("**/c", "c", true),
+      ("**/c", "a/c/d", false),
+    ] {
+      assert_eq!(glob_matches(pattern, path), matches, "{pattern} {path}");
+    }
+  }
+
+  /// A folder moved elsewhere keeps how its group was shown, and the
+  /// selection stays on it.
+  #[test]
+  fn a_moved_folder_keeps_its_fold() {
+    let mut tree = tree(&["db"]);
+    tree.add_folder(
+      TaskId(10),
+      TaskPath::new("g/apps").unwrap(),
+      Some(TaskId(1)),
+      false,
+    );
+    tree.add(task(2, "g/apps/web"), Some(TaskId(10)));
+    tree.select_task(1);
+    tree.fold(FoldOp::Close, Some("g/apps"));
+    assert_eq!(shown(&mut tree), ["db", "g/", "  g/apps/*"]);
+    tree.move_task(TaskId(10), TaskPath::new("h/apps").unwrap(), None);
+    tree.move_task(
+      TaskId(2),
+      TaskPath::new("h/apps/web").unwrap(),
+      Some(TaskId(10)),
+    );
+    assert_eq!(shown(&mut tree), ["h/", "  h/apps/*", "db"]);
+  }
+
+  /// A plain group that a folder's move empties for a moment comes back
+  /// as it was shown.
+  #[test]
+  fn a_folder_move_keeps_the_fold_above_it() {
+    let mut tree = tree(&["db"]);
+    let f = TaskPath::new("g/f").unwrap();
+    tree.add_folder(TaskId(10), f.clone(), Some(TaskId(1)), false);
+    assert_eq!(shown(&mut tree), ["db*", "g/", "  g/f/"]);
+    tree.fold(FoldOp::Close, Some("g"));
+    assert_eq!(shown(&mut tree), ["db*", "g/"]);
+    tree.move_task(TaskId(10), f, Some(TaskId(1)));
+    assert_eq!(shown(&mut tree), ["db*", "g/"]);
   }
 }

@@ -1,5 +1,6 @@
 pub mod config;
 pub mod duration;
+pub mod folder;
 pub mod hook;
 pub mod keymap;
 pub mod legacy;

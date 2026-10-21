@@ -22,7 +22,7 @@ use crate::console::{
     write_back::{WriteBack, WriteBackModal},
   },
   state::{ConfigStatus, Drag, Drop, Scope, Toast},
-  task_tree::Node,
+  task_tree::{Group, Node},
 };
 use crate::kernel::{
   kernel_message::{Place, TaskContext, TaskDescription, TaskSelector},
@@ -355,8 +355,11 @@ impl App {
         running: task.is_up(),
       },
       Some((path, Node::Group(group))) => RemoveTaskModal {
-        target: Target::glob(&format!("{path}/**")),
-        what: format!("group {path} and its {} tasks", group.len()),
+        target: Target::glob(path.as_str()),
+        what: match group.len() {
+          0 => format!("{} {path}/", group_noun(group)),
+          n => format!("{} {path}/ and its {n} tasks", group_noun(group)),
+        },
         running: group.up > 0,
       },
       None => return,
@@ -421,7 +424,11 @@ impl App {
           },
           item("Move up", Action::MoveTaskUp),
           item("Move down", Action::MoveTaskDown),
-          item("Remove group…", Action::ShowRemoveTask).separated(),
+          item(
+            &format!("Remove {}…", group_noun(group)),
+            Action::ShowRemoveTask,
+          )
+          .separated(),
         ];
         (format!("{path}/"), items)
       }
@@ -854,7 +861,7 @@ async fn status(
     .items
     .iter()
     .filter(|item| item.kind == WriteKind::Changed)
-    .filter_map(|item| item.task)
+    .filter_map(|item| item.here())
     .collect();
   let removed = written
     .items
@@ -862,6 +869,7 @@ async fn status(
     .filter(|item| item.kind == WriteKind::Removed)
     .count();
   let own = live
+    .tasks
     .iter()
     .filter(|t| t.origin.is_none() && t.spec.is_some())
     .map(|t| t.info.id)
@@ -874,4 +882,13 @@ async fn status(
     own,
   };
   Ok((config, status))
+}
+
+/// What a group row is called: a folder, or a group made by the paths
+/// under it.
+fn group_noun(group: &Group) -> &'static str {
+  match group.folder {
+    Some(_) => "folder",
+    None => "group",
+  }
 }

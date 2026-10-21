@@ -13,16 +13,19 @@ use serde_yaml::Value;
 
 use crate::command::{Command, CommandError, execute};
 use crate::config::config::Config;
+use crate::config::folder::collapsed;
 use crate::kernel::kernel_message::{
-  Place, TaskContext, TaskDescription, TaskSelector,
+  FolderDef, FolderInfo, FolderSettings, KernelCommand, Place, RegisterError,
+  Registration, TaskContext, TaskDescription, TaskSelector,
 };
 use crate::kernel::path_trie::PathTrie;
 use crate::kernel::task::TaskId;
-use crate::kernel::task_path::{TaskPath, overlaps};
+use crate::kernel::task_key::TaskSpaceId;
+use crate::kernel::task_path::{TaskPath, is_at_or_under, overlaps};
 use crate::project::Project;
 use crate::spec::{Base, Source, TaskSpec};
 use crate::target::Target;
-use crate::task::config_tasks::config_specs;
+use crate::task::config_tasks::{config_base, config_specs};
 
 /// Result of `reload`: what the config on disk would change, whether it
 /// was carried out, and what failed then.
@@ -32,6 +35,23 @@ pub struct ReloadResult {
   pub applied: bool,
   #[serde(default)]
   pub errors: Vec<String>,
+}
+
+/// The runner's tasks and folders in the default space, in list order,
+/// the tasks with their definitions: what a reload and a write-back
+/// compare the config with.
+#[derive(Clone, Debug, Default)]
+pub struct Live {
+  pub tasks: Vec<TaskDescription>,
+  pub folders: Vec<FolderInfo>,
+}
+
+impl Live {
+  pub async fn read(pc: &TaskContext) -> Live {
+    let folders = pc.folders(TaskSpaceId::default_space());
+    let (tasks, folders) = tokio::join!(describe(pc), folders);
+    Live { tasks, folders }
+  }
 }
 
 /// What a reload would change. Sent as `reload` replies with it; what
@@ -54,6 +74,9 @@ pub struct Plan {
   /// Each task here and its path, for what is in the way of a new one.
   #[serde(skip)]
   paths: Vec<(TaskId, String)>,
+  /// Each folder here and its path, the same way.
+  #[serde(skip)]
+  folders: Vec<(TaskId, String)>,
 }
 
 fn no_config() -> Arc<Config> {
@@ -63,7 +86,7 @@ fn no_config() -> Arc<Config> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Change {
   pub kind: ChangeKind,
-  /// Where the task is listed here, or will be.
+  /// Where the task is listed here, or will be; a folder's ends in `/`.
   pub path: String,
   /// For a changed task: what changed in the config.
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -171,6 +194,11 @@ pub struct OrderChange {
 }
 
 impl Change {
+  /// Whether it is a folder's entry that changed.
+  pub fn is_folder(&self) -> bool {
+    self.path.ends_with('/')
+  }
+
   /// Takes or leaves the whole change.
   pub fn set_apply(&mut self, apply: bool) {
     self.apply = apply;
@@ -230,19 +258,33 @@ impl Plan {
       .filter(|change| change.kind == ChangeKind::Removed && change.apply)
       .filter_map(|change| change.task)
       .collect();
-    let paths: Vec<&String> = self
-      .paths
-      .iter()
-      .filter(|(id, _)| !gone.contains(id))
-      .map(|(_, path)| path)
-      .collect();
+    let here = |list: &[(TaskId, String)]| -> Vec<String> {
+      list
+        .iter()
+        .filter(|(id, _)| !gone.contains(id))
+        .map(|(_, path)| path.clone())
+        .collect()
+    };
+    let (paths, folders) = (here(&self.paths), here(&self.folders));
     for change in &mut self.changes {
       if !matches!(change.kind, ChangeKind::Added | ChangeKind::RemovedHere) {
         continue;
       }
-      let in_the_way =
-        paths.iter().copied().find(|p| overlaps(p, &change.path));
-      if in_the_way == change.in_the_way.as_ref().map(|(path, _)| path) {
+      // A folder holds tasks: a task at it or above it is in its way, as
+      // is a folder at it; a folder is in a task's way at it or under it.
+      let task = |p: &String| p.clone();
+      let folder = |p: &String| format!("{p}/");
+      let in_the_way = match change.path.strip_suffix('/') {
+        Some(at) => (paths.iter().find(|p| is_at_or_under(at, p)).map(task))
+          .or_else(|| folders.iter().find(|p| *p == at).map(folder)),
+        None => (paths.iter().find(|p| overlaps(p, &change.path)).map(task))
+          .or_else(|| {
+            let under = |p: &&String| is_at_or_under(p, &change.path);
+            folders.iter().find(under).map(folder)
+          }),
+      };
+      if in_the_way.as_ref() == change.in_the_way.as_ref().map(|(path, _)| path)
+      {
         continue;
       }
       let was = change.in_the_way.take();
@@ -250,7 +292,7 @@ impl Plan {
         Some(path) => {
           change.reason = Some(Reason::InTheWay(path.clone()));
           let taken = was.map_or(change.apply, |(_, taken)| taken);
-          change.in_the_way = Some((path.clone(), taken));
+          change.in_the_way = Some((path, taken));
           change.apply = false;
         }
         None => {
@@ -269,11 +311,8 @@ pub async fn describe(pc: &TaskContext) -> Vec<TaskDescription> {
 }
 
 /// What a reload to `config` would change, with the default choices.
-pub fn plan(
-  config: Arc<Config>,
-  base: &Base,
-  live: &[TaskDescription],
-) -> Plan {
+pub fn plan(config: Arc<Config>, base: &Base, here: &Live) -> Plan {
+  let live = here.tasks.as_slice();
   let specs = config_specs(&config);
   let in_config: HashSet<&Source> = specs
     .iter()
@@ -430,9 +469,21 @@ pub fn plan(
       failed: false,
     });
   }
+  plan_folders(&config, base, &here.folders, &mut changes, &mut adopt);
+  for folder in &here.folders {
+    let moved = folder.settings.origin.as_ref().is_some_and(|origin| {
+      config.folders.iter().any(|entry| {
+        entry.source.as_ref() == Some(origin)
+          && entry.path != folder.path.as_str()
+      })
+    });
+    if moved {
+      edited_here.push(format!("{}/", folder.path));
+    }
+  }
   let base_sources: Vec<Source> = base.sources().cloned().collect();
   let mut plan = Plan {
-    order: order_change(&config.sources(), &base_sources, live),
+    order: order_change(&config.sources(), &base_sources, &listed_here(here)),
     config,
     changes,
     edited_here,
@@ -443,9 +494,148 @@ pub fn plan(
         Some((task.info.id, task.info.path.as_ref()?.to_string()))
       })
       .collect(),
+    folders: here
+      .folders
+      .iter()
+      .map(|folder| (folder.id, folder.path.to_string()))
+      .collect(),
   };
   plan.check_the_way();
   plan
+}
+
+/// The changes to the folders, as `plan` makes the tasks' with the same
+/// kinds: a folder is known by its entry, or else by its path. Taking
+/// one away leaves what is under it.
+fn plan_folders(
+  config: &Config,
+  base: &Base,
+  folders: &[FolderInfo],
+  changes: &mut Vec<Change>,
+  adopt: &mut Vec<(TaskId, Source)>,
+) {
+  let in_config: HashSet<&Source> = config
+    .folders
+    .iter()
+    .filter_map(|entry| entry.source.as_ref())
+    .collect();
+  let by_source: HashMap<&Source, &FolderInfo> = folders
+    .iter()
+    .filter_map(|folder| Some((folder.settings.origin.as_ref()?, folder)))
+    .collect();
+  let mut moved: HashMap<&str, &FolderInfo> = folders
+    .iter()
+    .filter(|folder| {
+      let origin = folder.settings.origin.as_ref();
+      origin.is_some_and(|origin| !in_config.contains(origin))
+    })
+    .map(|folder| (folder.path.as_str(), folder))
+    .collect();
+  let own: HashMap<&str, &FolderInfo> = folders
+    .iter()
+    .filter(|folder| folder.settings.origin.is_none())
+    .map(|folder| (folder.path.as_str(), folder))
+    .collect();
+  let spec_of = |folder: &FolderInfo| {
+    let mut spec = TaskSpec::default();
+    if folder.settings.collapsed {
+      spec.set("collapsed", Some(Value::Bool(true)));
+    }
+    spec
+  };
+  let change =
+    |kind, path: &str, folder: Option<&FolderInfo>, source: &Source| Change {
+      kind,
+      path: format!("{path}/"),
+      fields: Vec::new(),
+      apply: true,
+      reason: None,
+      failed: false,
+      task: folder.map(|folder| folder.id),
+      source: source.clone(),
+      config: None,
+      base: None,
+      in_the_way: None,
+    };
+  let mut adopted = HashSet::new();
+  for entry in &config.folders {
+    let Some(source) = &entry.source else {
+      continue;
+    };
+    let config_spec = entry.spec();
+    let folder = by_source.get(source).copied().or_else(|| {
+      let folder = moved.remove(entry.path.as_str())?;
+      adopted.insert(folder.id);
+      Some(folder)
+    });
+    let Some(folder) = folder else {
+      // The runner's own at its path: what it says is what folds it at
+      // first, which the entry says from now on.
+      if let Some(own) = own.get(entry.path.as_str()) {
+        changes.push(Change {
+          config: Some(config_spec),
+          ..change(ChangeKind::Written, &entry.path, Some(own), source)
+        });
+        continue;
+      }
+      let was = base.get(source).cloned();
+      let removed_here = was.is_some();
+      let kind = match removed_here {
+        true => ChangeKind::RemovedHere,
+        false => ChangeKind::Added,
+      };
+      changes.push(Change {
+        apply: !removed_here,
+        reason: removed_here.then_some(Reason::RemovedHere),
+        config: Some(config_spec),
+        base: was,
+        ..change(kind, &entry.path, None, source)
+      });
+      continue;
+    };
+    let origin = folder.settings.origin.as_ref().expect("found by origin");
+    if origin != source {
+      adopt.push((folder.id, source.clone()));
+    }
+    let was = base.get(origin).unwrap_or(&config_spec);
+    let (fields, _) = merge(was, &spec_of(folder), &config_spec);
+    if fields.is_empty() {
+      continue;
+    }
+    changes.push(Change {
+      apply: fields.iter().any(|f| f.take),
+      reason: fields
+        .iter()
+        .any(|f| f.conflict)
+        .then_some(Reason::Conflict),
+      fields,
+      config: Some(config_spec.clone()),
+      base: Some(was.clone()),
+      ..change(
+        ChangeKind::Changed,
+        folder.path.as_str(),
+        Some(folder),
+        source,
+      )
+    });
+  }
+  for folder in folders {
+    let Some(origin) = &folder.settings.origin else {
+      continue;
+    };
+    if in_config.contains(origin) || adopted.contains(&folder.id) {
+      continue;
+    }
+    changes.push(Change {
+      base: base.get(origin).cloned(),
+      ..change(
+        ChangeKind::Removed,
+        folder.path.as_str(),
+        Some(folder),
+        origin,
+      )
+    });
+  }
 }
 
 /// The three-way merge of one task's definition. Returns the fields the
@@ -492,30 +682,52 @@ fn merge(
   (fields, changed_here)
 }
 
-/// The config tasks' order, if the config changed it.
+/// The entries of the tasks and folders here, in list order.
+fn listed_here(live: &Live) -> Vec<Source> {
+  let mut listed: Vec<(TaskId, Option<&Source>)> = live
+    .tasks
+    .iter()
+    .map(|task| (task.info.id, task.origin.as_ref()))
+    .collect();
+  // In list order, so what each is after is in already.
+  for folder in &live.folders {
+    let at = folder.after.map_or(0, |after| {
+      let at = listed.iter().position(|(id, _)| *id == after);
+      at.map_or(listed.len(), |at| at + 1)
+    });
+    listed.insert(at, (folder.id, folder.settings.origin.as_ref()));
+  }
+  listed
+    .into_iter()
+    .filter_map(|(_, source)| source.cloned())
+    .collect()
+}
+
+/// The config's order of its tasks and folders, if it changed it.
 fn order_change(
   order: &[Source],
   base: &[Source],
-  live: &[TaskDescription],
+  here: &[Source],
 ) -> Option<OrderChange> {
-  // As a list shows them: each group where its first task is.
+  // As a list shows them: each group where its first entry is.
   let listed = |sources: &[Source]| -> Vec<Source> {
     let mut trie = PathTrie::new();
     for (i, source) in sources.iter().enumerate() {
       if let Ok(path) = TaskPath::new(source.path()) {
-        let _ = trie.insert(&path, TaskId(i), &Place::Last);
+        let _ = match source.is_folder() {
+          true => trie.insert_folder(&path, TaskId(i), &Place::Last),
+          false => trie.insert(&path, TaskId(i), &Place::Last),
+        };
       }
     }
     trie
-      .descendants(&TaskPath::root())
+      .nodes(&TaskPath::root())
       .into_iter()
       .map(|(_, TaskId(i))| sources[i].clone())
       .collect()
   };
   let in_config_list = listed(order);
   let in_base_list = listed(base);
-  let here: Vec<Source> =
-    live.iter().filter_map(|task| task.origin.clone()).collect();
   let (in_order, in_base, is_here): (
     HashSet<&Source>,
     HashSet<&Source>,
@@ -534,11 +746,8 @@ fn order_change(
       .cloned()
       .collect()
   };
-  let (in_config, in_base, in_here) = (
-    common(&in_config_list),
-    common(&in_base_list),
-    common(&here),
-  );
+  let (in_config, in_base, in_here) =
+    (common(&in_config_list), common(&in_base_list), common(here));
   if in_config == in_base || in_here == in_config {
     return None;
   }
@@ -549,82 +758,125 @@ fn order_change(
   })
 }
 
-/// A command that carries a plan out, and the config entry it is for.
+/// A step that carries a plan out, and the config entry it is for.
 struct Step {
   source: Option<Source>,
-  command: Command,
+  act: Act,
 }
 
-/// The commands that carry the plan's choices out, in an order each can
-/// run in: the entries tasks take as theirs; removals, so the new tasks'
-/// places are free; new tasks, each after the ones it needs; the changes
-/// to the others; and the config's order last.
-fn steps(plan: &Plan, live: &[TaskDescription]) -> Vec<Step> {
+/// What a step does: a command, or what no command does to a folder.
+enum Act {
+  Command(Command),
+  AddFolder(TaskPath, Place, FolderSettings),
+  /// Takes the folder away, leaving what is under it.
+  DropFolder(TaskId),
+  SetFolder(TaskId, FolderSettings),
+}
+
+/// The steps that carry the plan's choices out, in an order each can run
+/// in: the entries tasks and folders take as theirs; removals, so the new
+/// tasks' places are free; new tasks and folders, each task after the
+/// ones it needs; the changes to the others; and the config's order last.
+fn steps(plan: &Plan, live: &Live) -> Vec<Step> {
   let mut steps = Vec::new();
-  let mut push = |source: Option<&Source>, command| {
+  let mut push = |source: Option<&Source>, act| {
     steps.push(Step {
       source: source.cloned(),
-      command,
+      act,
     });
   };
   let id = |id: TaskId| Target::Id(id);
   let path_of = |path: &str| Target::glob(path);
+  let folder = |id: TaskId| live.folders.iter().find(|f| f.id == id);
+  // A folder as it is, but for its entry.
+  let with_origin = |id: TaskId, origin: Option<Source>| FolderSettings {
+    origin,
+    ..folder(id).map(|f| f.settings.clone()).unwrap_or_default()
+  };
   // Taken whatever else fails: what a task is is not a change to it.
   for (task, source) in &plan.adopt {
+    let origin = Some(source.clone());
     push(
       None,
-      Command::SetOrigin {
-        target: id(*task),
-        origin: Some(source.clone()),
+      match folder(*task) {
+        Some(_) => Act::SetFolder(*task, with_origin(*task, origin)),
+        None => Act::Command(Command::SetOrigin {
+          target: id(*task),
+          origin,
+        }),
       },
     );
   }
-  // Where each config task is once the plan is carried out, by source.
-  let mut at: HashMap<Source, String> = live
-    .iter()
-    .filter_map(|task| {
-      let source = plan
-        .adopt
-        .iter()
-        .find(|(id, _)| *id == task.info.id)
-        .map(|(_, source)| source)
-        .or(task.origin.as_ref())?;
-      Some((source.clone(), task.info.path.as_ref()?.to_string()))
-    })
-    .collect();
+  // Where each config task and folder is once the plan is carried out,
+  // by source.
+  let adopted = |id: TaskId| {
+    plan
+      .adopt
+      .iter()
+      .find(|(adopted, _)| *adopted == id)
+      .map(|(_, source)| source)
+  };
+  let tasks = live.tasks.iter().filter_map(|task| {
+    let source = adopted(task.info.id).or(task.origin.as_ref())?;
+    Some((source.clone(), task.info.path.as_ref()?.to_string()))
+  });
+  let folders = live.folders.iter().filter_map(|folder| {
+    let source = adopted(folder.id).or(folder.settings.origin.as_ref())?;
+    Some((source.clone(), folder.path.to_string()))
+  });
+  let mut at: HashMap<Source, String> = tasks.chain(folders).collect();
+  // Where a change's task or folder is, or will be.
+  let path_at = |change: &Change| change.path.trim_end_matches('/').to_string();
   let mut removed = HashSet::new();
   let changed = |kind| plan.changes.iter().filter(move |c| c.kind == kind);
 
   for change in changed(ChangeKind::Removed) {
     let Some(task) = change.task else { continue };
     let source = Some(&change.source);
-    if change.apply {
-      push(source, Command::Remove { target: id(task) });
-      at.remove(&change.source);
-      removed.insert(change.path.clone());
-    } else {
+    match (change.apply, change.is_folder()) {
+      (true, true) => {
+        push(source, Act::DropFolder(task));
+        at.remove(&change.source);
+      }
+      (true, false) => {
+        push(source, Act::Command(Command::Remove { target: id(task) }));
+        at.remove(&change.source);
+        removed.insert(change.path.clone());
+      }
       // Kept: it is the runner's own from now on.
-      let target = id(task);
-      push(
+      (false, true) => {
+        push(source, Act::SetFolder(task, with_origin(task, None)))
+      }
+      (false, false) => push(
         source,
-        Command::SetOrigin {
-          target,
+        Act::Command(Command::SetOrigin {
+          target: id(task),
           origin: None,
-        },
-      );
+        }),
+      ),
     }
   }
 
   for change in changed(ChangeKind::Written).filter(|c| c.apply) {
     let Some(task) = change.task else { continue };
+    let origin = Some(change.source.clone());
     push(
       Some(&change.source),
-      Command::SetOrigin {
-        target: id(task),
-        origin: Some(change.source.clone()),
+      match change.is_folder() {
+        true => Act::SetFolder(
+          task,
+          FolderSettings {
+            collapsed: change.config.as_ref().is_some_and(collapsed),
+            origin,
+          },
+        ),
+        false => Act::Command(Command::SetOrigin {
+          target: id(task),
+          origin,
+        }),
       },
     );
-    at.insert(change.source.clone(), change.path.clone());
+    at.insert(change.source.clone(), path_at(change));
   }
 
   // A dep the config names on a task listed elsewhere here is on where
@@ -655,6 +907,9 @@ fn steps(plan: &Plan, live: &[TaskDescription]) -> Vec<Step> {
     // One a task has by now, as another reload added it meanwhile, is in.
     .filter(|c| !at.contains_key(&c.source))
     .collect();
+  // The folders first: a new task under one is listed in it, and it
+  // shows as its entry says.
+  adds.sort_by_key(|change| !change.is_folder());
   while !adds.is_empty() {
     let pending: HashSet<&str> = adds.iter().map(|c| c.path.as_str()).collect();
     let (mut ready, mut waiting): (Vec<&Change>, Vec<&Change>) =
@@ -672,25 +927,35 @@ fn steps(plan: &Plan, live: &[TaskDescription]) -> Vec<Step> {
     }
     for change in ready {
       let Some(spec) = &change.config else { continue };
-      let mut spec = spec.clone();
-      listed_here(&mut spec);
       // With nothing before it in the config listed beside it, all
       // that is comes after it.
       let place = after_in(plan, &at, change)
         .and_then(|after| TaskPath::new(after).ok())
         .map_or(Place::First, Place::After);
-      push(
-        Some(&change.source),
-        Command::Add {
-          target: path_of(&change.path),
-          spec,
-          place,
-          start: false,
-          defaults: false,
-          origin: Some(change.source.clone()),
-        },
-      );
-      at.insert(change.source.clone(), change.path.clone());
+      let origin = Some(change.source.clone());
+      let act = match TaskPath::new(path_at(change)) {
+        Ok(path) if change.is_folder() => {
+          let settings = FolderSettings {
+            collapsed: collapsed(spec),
+            origin,
+          };
+          Act::AddFolder(path, place, settings)
+        }
+        Ok(_) | Err(_) => {
+          let mut spec = spec.clone();
+          listed_here(&mut spec);
+          Act::Command(Command::Add {
+            target: path_of(&change.path),
+            spec,
+            place,
+            start: false,
+            defaults: false,
+            origin,
+          })
+        }
+      };
+      push(Some(&change.source), act);
+      at.insert(change.source.clone(), path_at(change));
     }
     adds = waiting;
   }
@@ -699,7 +964,21 @@ fn steps(plan: &Plan, live: &[TaskDescription]) -> Vec<Step> {
   // has now, as the removals above leave it: a change made since the plan
   // stays, and one made after `live` was read refuses the update.
   for change in changed(ChangeKind::Changed) {
-    let task = live.iter().find(|task| Some(task.info.id) == change.task);
+    if change.is_folder() {
+      let (Some(id), Some(config)) = (change.task, &change.config) else {
+        continue;
+      };
+      let mut settings = with_origin(id, Some(change.source.clone()));
+      if change.fields.iter().any(|f| f.take && f.key == "collapsed") {
+        settings.collapsed = collapsed(config);
+      }
+      push(Some(&change.source), Act::SetFolder(id, settings));
+      continue;
+    }
+    let task = live
+      .tasks
+      .iter()
+      .find(|task| Some(task.info.id) == change.task);
     let (Some(task), Some(config)) = (task, &change.config) else {
       continue;
     };
@@ -724,12 +1003,12 @@ fn steps(plan: &Plan, live: &[TaskDescription]) -> Vec<Step> {
     }
     push(
       Some(&change.source),
-      Command::Update {
+      Act::Command(Command::Update {
         target: path_of(path.as_str()),
         spec,
         was: Some(here),
         restart: false,
-      },
+      }),
     );
   }
   if plan.order.as_ref().is_some_and(|order| order.apply) {
@@ -759,11 +1038,11 @@ fn steps(plan: &Plan, live: &[TaskDescription]) -> Vec<Step> {
         let target = path_of(path.as_str());
         push(
           None,
-          Command::Move {
+          Act::Command(Command::Move {
             target,
             to: None,
             place,
-          },
+          }),
         );
         last.insert(parent, path);
       }
@@ -779,7 +1058,10 @@ fn after_in<'a>(
   at: &'a HashMap<Source, String>,
   change: &Change,
 ) -> Option<&'a str> {
-  let parent = |path: &str| TaskPath::new(path).ok().and_then(|p| p.parent());
+  let parent = |path: &str| {
+    let path = path.trim_end_matches('/');
+    TaskPath::new(path).ok().and_then(|p| p.parent())
+  };
   let sources = plan.config.sources();
   let index = sources.iter().position(|s| *s == change.source)?;
   sources[..index].iter().rev().find_map(|source| {
@@ -796,11 +1078,11 @@ pub async fn apply(
   plan: &mut Plan,
 ) -> Vec<String> {
   let _syncing = project.syncing().await;
-  let live = describe(pc).await;
+  let live = Live::read(pc).await;
   let config = plan.config.clone();
   let mut errors = Vec::new();
   let mut failed = HashSet::new();
-  for Step { source, command } in steps(plan, &live) {
+  for Step { source, act } in steps(plan, &live) {
     // What follows a failed step for an entry would act on what is not.
     if source
       .as_ref()
@@ -808,12 +1090,23 @@ pub async fn apply(
     {
       continue;
     }
-    match (execute(pc, &config, &command).await, &command) {
-      (Ok(_), _) => (),
-      // An order that no longer fits what is here is left as it is.
-      (Err(CommandError::Move(_)), Command::Move { to: None, .. }) => (),
-      (Err(err), _) => {
-        errors.push(describe_failure(&command, &err));
+    let done = match &act {
+      Act::Command(command) => match execute(pc, &config, command).await {
+        Ok(_) => Ok(()),
+        // An order that no longer fits what is here is left as it is.
+        Err(CommandError::Move(_))
+          if matches!(command, Command::Move { to: None, .. }) =>
+        {
+          Ok(())
+        }
+        Err(err) => Err(describe_failure(command, &err)),
+      },
+      folder => carry_out(pc, folder).await,
+    };
+    match done {
+      Ok(()) => (),
+      Err(err) => {
+        errors.push(err);
         if let Some(source) = source {
           for change in &mut plan.changes {
             change.failed |= change.source == source;
@@ -834,24 +1127,20 @@ pub async fn apply(
 fn carried_out(plan: &Plan) -> Base {
   let change =
     |source: &Source| plan.changes.iter().find(|c| c.source == *source);
-  let in_config =
-    config_specs(&plan.config)
-      .into_iter()
-      .filter_map(|(cfg, spec)| {
-        let source = cfg.source.clone()?;
-        match change(&source) {
-          Some(change) if change.failed => Some((source, change.base.clone()?)),
-          Some(change)
-            if matches!(
-              change.kind,
-              ChangeKind::Added | ChangeKind::Written
-            ) && !change.apply =>
-          {
-            None
-          }
-          Some(_) | None => Some((source, spec)),
-        }
-      });
+  let config = config_base(&plan.config);
+  let in_config = config.iter().filter_map(|(source, spec)| {
+    let source = source.clone();
+    match change(&source) {
+      Some(change) if change.failed => Some((source, change.base.clone()?)),
+      Some(change)
+        if matches!(change.kind, ChangeKind::Added | ChangeKind::Written)
+          && !change.apply =>
+      {
+        None
+      }
+      Some(_) | None => Some((source, spec.clone())),
+    }
+  });
   // Gone from the config, and its task still here.
   let gone = plan.changes.iter().filter_map(|change| {
     let failed = change.kind == ChangeKind::Removed && change.failed;
@@ -861,6 +1150,43 @@ fn carried_out(plan: &Plan) -> Base {
     ))
   });
   in_config.chain(gone).collect()
+}
+
+/// Carries a folder's step out; `Err` says why it could not be.
+async fn carry_out(pc: &TaskContext, act: &Act) -> Result<(), String> {
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  let id = match act {
+    Act::Command(_) => return Ok(()),
+    Act::AddFolder(path, place, settings) => {
+      let folder = Registration::Folder(FolderDef {
+        id: pc.alloc_id(),
+        space: TaskSpaceId::default_space(),
+        path: path.clone(),
+        place: place.clone(),
+        settings: settings.clone(),
+      });
+      let results = pc.register_tasks(vec![folder]).await;
+      return match results.map(|mut results| results.pop()) {
+        Ok(Some(Ok(()))) => Ok(()),
+        Ok(Some(Err(err))) => Err(format!("{path}/: {err}")),
+        Ok(None) | Err(_) => {
+          Err(format!("{path}/: {}", RegisterError::Changed))
+        }
+      };
+    }
+    Act::DropFolder(id) => {
+      pc.send(KernelCommand::DropFolder(*id, Some(tx)));
+      id
+    }
+    Act::SetFolder(id, settings) => {
+      pc.send(KernelCommand::SetFolder(*id, settings.clone(), Some(tx)));
+      id
+    }
+  };
+  match rx.await.unwrap_or(0) {
+    0 => Err(format!("folder {}: it is gone", id.0)),
+    _ => Ok(()),
+  }
 }
 
 fn describe_failure(command: &Command, err: &CommandError) -> String {
@@ -880,20 +1206,17 @@ fn describe_failure(command: &Command, err: &CommandError) -> String {
 pub async fn load(
   pc: &TaskContext,
   project: &Arc<Project>,
-) -> anyhow::Result<(Arc<Config>, Vec<TaskDescription>, Base)> {
+) -> anyhow::Result<(Arc<Config>, Live, Base)> {
   let _syncing = project.syncing().await;
-  let (config, live) = tokio::join!(project.load_blocking(), describe(pc));
+  let (config, live) = tokio::join!(project.load_blocking(), Live::read(pc));
   Ok((Arc::new(config?), live, project.base()))
 }
 
 /// The tasks and the base, as they stand together: for a comparison with
 /// a config read before, while what it is read from is unchanged.
-pub async fn tasks(
-  pc: &TaskContext,
-  project: &Project,
-) -> (Vec<TaskDescription>, Base) {
+pub async fn tasks(pc: &TaskContext, project: &Project) -> (Live, Base) {
   let _syncing = project.syncing().await;
-  (describe(pc).await, project.base())
+  (Live::read(pc).await, project.base())
 }
 
 /// Loads the config and plans a reload against the runner's tasks.
@@ -909,17 +1232,20 @@ pub async fn plan_reload(
 mod tests {
   use super::*;
   use crate::config::task::TaskConfig;
-  use crate::test_util::{source, spec};
+  use crate::test_util::{live_with, source, spec};
 
-  fn commands(plan: &Plan, live: &[TaskDescription]) -> Vec<Command> {
+  fn commands(plan: &Plan, live: &Live) -> Vec<Command> {
     steps(plan, live)
       .into_iter()
-      .map(|step| step.command)
+      .filter_map(|step| match step.act {
+        Act::Command(command) => Some(command),
+        _ => None,
+      })
       .collect()
   }
 
   /// Each command as `verb target`, in order.
-  fn verbs(plan: &Plan, live: &[TaskDescription]) -> Vec<String> {
+  fn verbs(plan: &Plan, live: &Live) -> Vec<String> {
     commands(plan, live)
       .iter()
       .filter_map(|command| {
@@ -993,12 +1319,12 @@ mod tests {
       ("old", "{cmd: [old]}"),
       ("gone", "{cmd: [gone]}"),
     ]);
-    let live = [
+    let live = live_with([
       task(1, "api", "{cmd: [api], cwd: /here}", Some("api")),
       task(2, "db", "{cmd: [pg], env: {A: '1'}}", Some("db")),
       task(3, "old", "{cmd: [old]}", Some("old")),
       task(4, "mine", "{cmd: [mine]}", None),
-    ];
+    ]);
     let config = config(&[
       ("api", "{cmd: [api, --v2]}"),
       ("db", "{cmd: [pg], env: {A: '2'}}"),
@@ -1063,12 +1389,12 @@ mod tests {
   #[test]
   fn what_the_config_says_as_here_is_no_change() {
     let base = base(&[("api", "{cmd: [api]}"), ("web", "{cmd: [old]}")]);
-    let live = [
+    let live = live_with([
       task(1, "api", "{cmd: [api, --v2]}", Some("api")),
       task(2, "web", "{cmd: [web]}", Some("web")),
       task(3, "build", "{cmd: [make]}", None),
       task(4, "mine", "{cmd: [mine]}", None),
-    ];
+    ]);
     let mut config = config(&[
       ("api", "{cmd: [api, --v2]}"),
       ("site", "{cmd: [web]}"),
@@ -1104,7 +1430,7 @@ mod tests {
     );
   }
 
-  fn verbs_and_origins(plan: &Plan, live: &[TaskDescription]) -> Vec<String> {
+  fn verbs_and_origins(plan: &Plan, live: &Live) -> Vec<String> {
     commands(plan, live)
       .iter()
       .filter_map(|command| match command {
@@ -1122,10 +1448,10 @@ mod tests {
   #[test]
   fn new_deps_are_there_first() {
     let base = base(&[("api", "{cmd: [api]}"), ("old", "{cmd: [old]}")]);
-    let live = [
+    let live = live_with([
       task(1, "api", "{cmd: [api]}", Some("api")),
       task(2, "old", "{cmd: [old]}", Some("old")),
-    ];
+    ]);
     let config = config(&[
       ("web", "{cmd: [web], deps: [worker]}"),
       ("api", "{cmd: [api], deps: [cache]}"),
@@ -1150,10 +1476,10 @@ mod tests {
   #[test]
   fn deps_on_a_task_moved_here_follow_it() {
     let base = base(&[("db", "{cmd: [db]}"), ("web", "{cmd: [web]}")]);
-    let live = [
+    let live = live_with([
       task(1, "infra/db", "{cmd: [db]}", Some("db")),
       task(2, "web", "{cmd: [web]}", Some("web")),
-    ];
+    ]);
     let config = config(&[
       ("db", "{cmd: [db]}"),
       ("web", "{cmd: [web], deps: [db]}"),
@@ -1181,11 +1507,11 @@ mod tests {
       ("cache", "{cmd: [cache]}"),
       ("db", "{cmd: [db]}"),
     ]);
-    let live = [
+    let live = live_with([
       task(1, "api", "{cmd: [api], deps: [cache, db, x]}", Some("api")),
       task(2, "cache", "{cmd: [cache]}", Some("cache")),
       task(3, "db", "{cmd: [db]}", Some("db")),
-    ];
+    ]);
     let config = config(&[
       ("api", "{cmd: [api], deps: [db], env: {A: '1'}}"),
       ("db", "{cmd: [db]}"),
@@ -1212,10 +1538,11 @@ mod tests {
   #[test]
   fn a_change_made_here_after_the_plan_stays() {
     let base = base(&[("api", "{cmd: [api]}")]);
-    let at_plan = [task(1, "api", "{cmd: [api]}", Some("api"))];
+    let at_plan = live_with([task(1, "api", "{cmd: [api]}", Some("api"))]);
     let config = config(&[("api", "{cmd: [api, --v2]}")]);
     let plan = plan(config, &base, &at_plan);
-    let now = [task(1, "api/v1", "{cmd: [api], cwd: /now}", Some("api"))];
+    let now =
+      live_with([task(1, "api/v1", "{cmd: [api], cwd: /now}", Some("api"))]);
     let commands = commands(&plan, &now);
     let Some(Command::Update {
       target,
@@ -1230,7 +1557,7 @@ mod tests {
     };
     assert_eq!(target.to_string(), "api/v1");
     assert_eq!(*updated, spec("{cmd: [api, --v2], cwd: /now}"));
-    assert_eq!(was.as_ref(), Some(&now[0].spec.clone().unwrap()));
+    assert_eq!(was.as_ref(), Some(&now.tasks[0].spec.clone().unwrap()));
   }
 
   /// A new entry where a task gone from the config is, here a group by
@@ -1238,7 +1565,7 @@ mod tests {
   #[test]
   fn a_task_gone_from_the_config_is_not_in_the_way() {
     let base = base(&[("web", "{cmd: [web]}")]);
-    let live = [task(1, "web", "{cmd: [web]}", Some("web"))];
+    let live = live_with([task(1, "web", "{cmd: [web]}", Some("web"))]);
     let config = config(&[("web/api", "{cmd: [api]}")]);
     let plan = plan(config, &base, &live);
     assert!(
@@ -1287,10 +1614,10 @@ mod tests {
   /// Taking all leaves a new task that a task here stays in the way of.
   #[test]
   fn taking_all_leaves_what_is_in_the_way() {
-    let live = [
+    let live = live_with([
       task(1, "api", "{cmd: [api]}", Some("api")),
       task(2, "new", "{cmd: [mine]}", None),
-    ];
+    ]);
     let config =
       config(&[("api", "{cmd: [api, --v2]}"), ("new", "{cmd: [new]}")]);
     let mut plan = plan(config, &base(&[("api", "{cmd: [api]}")]), &live);
@@ -1310,7 +1637,7 @@ mod tests {
   #[test]
   fn an_entry_under_a_new_key_is_the_same_task() {
     let base = base(&[("old", "{cmd: [web]}")]);
-    let live = [task(1, "web", "{cmd: [web]}", Some("old"))];
+    let live = live_with([task(1, "web", "{cmd: [web]}", Some("old"))]);
     let mut config = config(&[("web", "{cmd: [web, --v2]}")]);
     let entry = &mut Arc::get_mut(&mut config).unwrap().tasks[0];
     entry.source = Some(Source {
@@ -1340,7 +1667,7 @@ mod tests {
       ("web", "{cmd: [web], deps: [worker]}"),
       ("worker", "{cmd: [worker]}"),
     ]);
-    let mut plan = plan(config, &project.base(), &describe(&pc).await);
+    let mut plan = plan(config, &project.base(), &Live::read(&pc).await);
     assert!(apply(&pc, &project, &mut plan).await.is_empty());
     let listed: Vec<String> = describe(&pc)
       .await
@@ -1371,7 +1698,7 @@ mod tests {
     execute(&pc, &none, &in_the_way).await.unwrap();
     let project = Project::new(Arc::new(none));
     let config = config(&[("new", "{cmd: [new]}")]);
-    let mut plan = plan(config, &project.base(), &describe(&pc).await);
+    let mut plan = plan(config, &project.base(), &Live::read(&pc).await);
     assert_eq!(plan.changes[0].reason, Some(Reason::InTheWay("new".into())));
     assert!(apply(&pc, &project, &mut plan).await.is_empty());
     assert_eq!(project.base(), Base::default());
@@ -1395,7 +1722,7 @@ mod tests {
     let handle = tokio::spawn(kernel.run());
     let project = Project::new(Arc::new(Config::make_default()));
     let v1 = config(&[("api", "{cmd: [api]}")]);
-    let mut first = plan(v1, &project.base(), &describe(&pc).await);
+    let mut first = plan(v1, &project.base(), &Live::read(&pc).await);
     let mut again = first.clone();
     assert!(apply(&pc, &project, &mut first).await.is_empty());
     assert!(apply(&pc, &project, &mut again).await.is_empty());
@@ -1403,7 +1730,7 @@ mod tests {
 
     // A dep on what is not there: the update is refused.
     let v2 = config(&[("api", "{cmd: [api], deps: [ghost]}")]);
-    let mut second = plan(v2, &project.base(), &describe(&pc).await);
+    let mut second = plan(v2, &project.base(), &Live::read(&pc).await);
     let errors = apply(&pc, &project, &mut second).await;
     assert_eq!(errors.len(), 1, "{errors:?}");
     // What it said before: the change is offered again.
@@ -1422,10 +1749,10 @@ mod tests {
       ("gone", "{cmd: [gone]}"),
       ("old", "{cmd: [old]}"),
     ]);
-    let live = [
+    let live = live_with([
       task(1, "api", "{cmd: [api]}", Some("api")),
       task(2, "old", "{cmd: [old]}", Some("old")),
-    ];
+    ]);
     let config = config(&[
       ("api", "{cmd: [api, --v2]}"),
       ("gone", "{cmd: [gone]}"),
@@ -1464,10 +1791,10 @@ mod tests {
   #[test]
   fn order_follows_the_config_when_only_it_changed() {
     let base = base(&[("a", "{cmd: [a]}"), ("b", "{cmd: [b]}")]);
-    let live = [
+    let live = live_with([
       task(1, "a", "{cmd: [a]}", Some("a")),
       task(2, "b", "{cmd: [b]}", Some("b")),
-    ];
+    ]);
     let config = config(&[("b", "{cmd: [b]}"), ("a", "{cmd: [a]}")]);
     let mut plan = plan(config, &base, &live);
     assert!(plan.order.as_ref().is_some_and(|o| o.apply));
@@ -1486,5 +1813,283 @@ mod tests {
       })
       .collect();
     assert_eq!(moves, ["b First", "a After(TaskPath(\"b\"))"]);
+  }
+
+  /// A config with these folder entries, `(key, collapsed, at)`, beside
+  /// its tasks.
+  fn with_folders(
+    mut config: Arc<Config>,
+    folders: &[(&str, bool, usize)],
+  ) -> Arc<Config> {
+    Arc::get_mut(&mut config).unwrap().folders = folders
+      .iter()
+      .map(|(key, collapsed, at)| crate::config::folder::FolderConfig {
+        path: key.trim_end_matches('/').to_string(),
+        collapsed: *collapsed,
+        source: Some(source(key)),
+        at: *at,
+      })
+      .collect();
+    config
+  }
+
+  fn folder_here(
+    id: usize,
+    path: &str,
+    collapsed: bool,
+    from: Option<&str>,
+  ) -> FolderInfo {
+    FolderInfo {
+      id: TaskId(id),
+      space: TaskSpaceId::default_space(),
+      path: TaskPath::new(path).unwrap(),
+      after: None,
+      settings: FolderSettings {
+        collapsed,
+        origin: from.map(source),
+      },
+    }
+  }
+
+  /// What the steps do to the folders, in order.
+  fn folder_steps(plan: &Plan, live: &Live) -> Vec<String> {
+    let origin = |s: &FolderSettings| {
+      s.origin
+        .as_ref()
+        .map_or("own".to_string(), |o| o.key.clone())
+    };
+    steps(plan, live)
+      .into_iter()
+      .filter_map(|step| match step.act {
+        Act::Command(_) => None,
+        Act::AddFolder(path, place, s) => Some(format!(
+          "add {path}/ {place:?} {} {}",
+          s.collapsed,
+          origin(&s)
+        )),
+        Act::DropFolder(id) => Some(format!("drop {}", id.0)),
+        Act::SetFolder(id, s) => {
+          Some(format!("set {} {} {}", id.0, s.collapsed, origin(&s)))
+        }
+      })
+      .collect()
+  }
+
+  /// A folder entry comes, goes, and changes as a task's does; one that
+  /// goes takes only the folder away.
+  #[test]
+  fn folders_follow_their_entries() {
+    let base = base(&[
+      ("tools/", "{}"),
+      ("old/", "{}"),
+      ("gone/", "{}"),
+      ("db", "{cmd: [db]}"),
+    ]);
+    let mut live = live_with([task(1, "db", "{cmd: [db]}", Some("db"))]);
+    live.folders = vec![
+      folder_here(2, "tools", false, Some("tools/")),
+      folder_here(3, "old", true, Some("old/")),
+      folder_here(4, "svc", false, Some("svc/")),
+      folder_here(5, "mine", false, None),
+    ];
+    let config = with_folders(
+      config(&[("db", "{cmd: [db]}")]),
+      &[
+        ("apps/", true, 0),
+        ("tools/", true, 1),
+        ("gone/", false, 1),
+        ("services/", false, 1),
+        ("mine/", false, 1),
+      ],
+    );
+    // `svc/` written back under another key: the folder takes it.
+    let config = {
+      let mut config = config;
+      let services = &mut Arc::get_mut(&mut config).unwrap().folders[3];
+      services.path = "svc".into();
+      config
+    };
+    let plan = plan(config, &base, &live);
+    let changes: Vec<(ChangeKind, &str, bool)> = plan
+      .changes
+      .iter()
+      .map(|c| (c.kind, c.path.as_str(), c.apply))
+      .collect();
+    assert_eq!(
+      changes,
+      [
+        (ChangeKind::Added, "apps/", true),
+        (ChangeKind::Changed, "tools/", true),
+        (ChangeKind::RemovedHere, "gone/", false),
+        (ChangeKind::Written, "mine/", true),
+        (ChangeKind::Removed, "old/", true),
+      ]
+    );
+    assert_eq!(
+      folder_steps(&plan, &live),
+      [
+        "set 4 false services/",
+        "drop 3",
+        "set 5 false mine/",
+        "add apps/ First true apps/",
+        "set 2 true tools/",
+      ]
+    );
+
+    // Kept: the runner's own from now on.
+    let mut plan = plan;
+    let old = plan.changes.iter().position(|c| c.path == "old/").unwrap();
+    plan.set_apply(old, false);
+    assert!(folder_steps(&plan, &live).contains(&"set 3 true own".to_string()));
+    let left = carried_out(&plan);
+    let keys: Vec<&str> = left.sources().map(|s| s.key.as_str()).collect();
+    assert_eq!(
+      keys,
+      ["apps/", "db", "tools/", "gone/", "services/", "mine/"]
+    );
+    assert!(crate::config::folder::collapsed(
+      left.get(&source("tools/")).unwrap()
+    ));
+  }
+
+  /// A new folder is listed where the config has it, and a reload that
+  /// drops its entry leaves its tasks where they are.
+  #[tokio::test]
+  async fn a_reload_brings_folders_in_and_out() {
+    let kernel = crate::kernel::kernel::Kernel::new();
+    let pc = kernel.context();
+    let handle = tokio::spawn(kernel.run());
+    let project = Project::new(Arc::new(Config::make_default()));
+    let v1 = with_folders(
+      config(&[("db", "{cmd: [db]}"), ("apps/web", "{cmd: [web]}")]),
+      &[("empty/", false, 1), ("apps/", true, 1)],
+    );
+    let mut first = plan(v1, &project.base(), &Live::read(&pc).await);
+    assert!(apply(&pc, &project, &mut first).await.is_empty());
+    let live = Live::read(&pc).await;
+    let folders: Vec<(String, bool)> = live
+      .folders
+      .iter()
+      .map(|f| (f.path.to_string(), f.settings.collapsed))
+      .collect();
+    assert_eq!(
+      folders,
+      [("empty".to_string(), false), ("apps".to_string(), true)]
+    );
+    let nodes = pc.folders(TaskSpaceId::default_space()).await;
+    assert!(nodes.iter().all(|f| f.settings.origin.is_some()));
+
+    let v2 = config(&[("db", "{cmd: [db]}"), ("apps/web", "{cmd: [web]}")]);
+    let mut second = plan(v2, &project.base(), &Live::read(&pc).await);
+    assert_eq!(second.len(), 2, "{:?}", second.changes);
+    assert!(apply(&pc, &project, &mut second).await.is_empty());
+    let live = Live::read(&pc).await;
+    assert!(live.folders.is_empty());
+    let listed: Vec<String> = live
+      .tasks
+      .iter()
+      .filter_map(|task| Some(task.info.path.as_ref()?.to_string()))
+      .collect();
+    assert_eq!(listed, ["db", "apps/web"]);
+    assert!(!project.base().sources().any(Source::is_folder));
+    pc.send(crate::kernel::kernel_message::KernelCommand::Quit);
+    handle.await.unwrap();
+  }
+
+  /// A new folder comes before the new tasks under it, so they are
+  /// listed in it where the config has it.
+  #[tokio::test]
+  async fn a_new_folder_comes_before_its_tasks() {
+    let kernel = crate::kernel::kernel::Kernel::new();
+    let pc = kernel.context();
+    let handle = tokio::spawn(kernel.run());
+    let project = Project::new(Arc::new(Config::make_default()));
+    let v1 = config(&[("a", "{cmd: [a]}"), ("b", "{cmd: [b]}")]);
+    let mut first = plan(v1, &project.base(), &Live::read(&pc).await);
+    assert!(apply(&pc, &project, &mut first).await.is_empty());
+    let v2 = with_folders(
+      config(&[
+        ("a", "{cmd: [a]}"),
+        ("f/x", "{cmd: [x]}"),
+        ("b", "{cmd: [b]}"),
+      ]),
+      &[("f/", true, 1)],
+    );
+    let mut second = plan(v2, &project.base(), &Live::read(&pc).await);
+    assert!(apply(&pc, &project, &mut second).await.is_empty());
+    let live = Live::read(&pc).await;
+    let listed: Vec<String> = live
+      .tasks
+      .iter()
+      .filter_map(|task| Some(task.info.path.as_ref()?.to_string()))
+      .collect();
+    assert_eq!(listed, ["a", "f/x", "b"]);
+    let a = live.tasks[0].info.id;
+    assert_eq!(live.folders[0].after, Some(a));
+    pc.send(crate::kernel::kernel_message::KernelCommand::Quit);
+    handle.await.unwrap();
+  }
+
+  /// A folder kept here takes its entry back at its path, and one from
+  /// an entry gone takes the entry at its path; either is in the way of
+  /// a new task at it.
+  #[test]
+  fn folders_here_take_entries_or_are_in_the_way() {
+    let mut live = live_with([]);
+    live.folders = vec![
+      folder_here(1, "apps", true, None),
+      folder_here(2, "tools", false, Some("old/")),
+    ];
+    let config = with_folders(
+      config(&[("tools", "{cmd: [t]}")]),
+      &[("apps/", false, 0), ("tools/", false, 1)],
+    );
+    let plan = plan(config, &Base::default(), &live);
+    let changes: Vec<(ChangeKind, &str, Option<String>)> = plan
+      .changes
+      .iter()
+      .map(|c| (c.kind, c.path.as_str(), c.reason.as_ref().map(Reason::text)))
+      .collect();
+    assert_eq!(
+      changes,
+      [
+        (
+          ChangeKind::Added,
+          "tools",
+          Some("tools/ is in the way".into())
+        ),
+        (ChangeKind::Written, "apps/", None),
+      ]
+    );
+    assert_eq!(
+      folder_steps(&plan, &live),
+      ["set 2 false tools/", "set 1 false apps/"]
+    );
+  }
+
+  /// A config that only moves a folder among its tasks is a new order.
+  #[test]
+  fn a_folder_moved_in_the_config_is_a_new_order() {
+    let base = base(&[("db", "{cmd: [db]}"), ("tools/", "{}")]);
+    let mut live = live_with([task(1, "db", "{cmd: [db]}", Some("db"))]);
+    let mut tools = folder_here(2, "tools", false, Some("tools/"));
+    tools.after = Some(TaskId(1));
+    live.folders = vec![tools];
+    let config =
+      with_folders(config(&[("db", "{cmd: [db]}")]), &[("tools/", false, 0)]);
+    let plan = plan(config, &base, &live);
+    assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+    let order = plan.order.as_ref().expect("a new order");
+    assert!(order.apply && !order.conflict);
+    let moves: Vec<String> = commands(&plan, &live)
+      .iter()
+      .filter_map(|command| match command {
+        Command::Move { target, place, .. } => {
+          Some(format!("{target} {place:?}"))
+        }
+        _ => None,
+      })
+      .collect();
+    assert_eq!(moves, ["tools First", "db After(TaskPath(\"tools\"))"]);
   }
 }

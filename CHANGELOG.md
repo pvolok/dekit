@@ -1,5 +1,12 @@
 ## Unreleased
 
+- A `tasks:` key that ends in `/` is a folder: `apps/: {collapsed: true}`
+  lists the `apps` folder collapsed at first, and a folder stays while it
+  is empty
+- `dekit rm apps` removes a folder or a group with everything in it
+- The console keeps which groups are collapsed across restarts; `H` and
+  `L` collapse and expand every group, and the `fold` action opens,
+  closes, or toggles the groups a path or glob names
 - `ready: {sd_notify: true}` counts a task ready when it sends `READY=1`
   to the socket `NOTIFY_SOCKET` names, as it would to systemd
 - `dekit reload` brings what changed in `dekit.yaml` into a running

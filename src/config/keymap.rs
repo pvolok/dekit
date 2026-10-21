@@ -2,7 +2,7 @@ use anyhow::Result;
 use indexmap::IndexMap;
 
 use crate::cfg::{CfgNode, CfgObj};
-use crate::console::action::{Action, CopyMove, RunnerTab, ScrollUnit};
+use crate::console::action::{Action, CopyMove, FoldOp, RunnerTab, ScrollUnit};
 use crate::console::keymap::{Keymap, KeymapGroup};
 use crate::term::key::{Key, KeyCode, KeyMods, KeySpec};
 
@@ -95,6 +95,15 @@ impl KeymapConfig {
     }
     for code in [KeyCode::Right, KeyCode::Char('l')] {
       s.keymap_add_p(code.into(), Action::Expand);
+    }
+    for (code, op) in [('H', FoldOp::Close), ('L', FoldOp::Open)] {
+      s.keymap_add_p(
+        KeyCode::Char(code).into(),
+        Action::Fold {
+          op,
+          target: Some("**".to_string()),
+        },
+      );
     }
     s.keymap_add_p(
       Key::new(KeyCode::Char('s'), KeyMods::NONE),

@@ -41,7 +41,7 @@ std.log(`started ${started} workers`);
   desc: Restart the matching tasks.
 - key: std.dekit.remove
   signature: "(target: string) => Promise<number>"
-  desc: Remove the matching tasks, killing running ones.
+  desc: Remove the matching tasks, killing running ones, and a folder or group a path or glob names with everything in it. Resolves to how many tasks and folders went.
 - key: std.dekit.add
   signature: "(path: string, cmd: string[]) => Promise<number>"
   desc: Add a task at an exact path that runs `cmd`, tag it `dynamic`, and start it.

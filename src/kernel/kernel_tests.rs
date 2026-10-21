@@ -5,7 +5,9 @@ use tokio::sync::mpsc::{
 };
 
 use super::*;
-use crate::kernel::kernel_message::{KernelSnapshot, Place};
+use crate::kernel::kernel_message::{
+  Ack, FolderDef, FolderSettings, KernelSnapshot, Place, Registration,
+};
 use crate::kernel::task::RestartMode;
 use crate::upgrade::snapshot::TaskKind as TaskKindSnapshot;
 
@@ -47,7 +49,9 @@ impl Task for RecordingTask {
       TaskCmd::Thaw => (),
       TaskCmd::Freeze(number) => self.ctx.send(KernelCommand::TaskFrozen(
         number,
-        TaskKindSnapshot::Console {},
+        TaskKindSnapshot::Console {
+          groups: Default::default(),
+        },
       )),
       TaskCmd::Msg(m) => match m.downcast::<Report>() {
         Ok(report) => match *report {
@@ -149,7 +153,9 @@ impl Task for StubbornTask {
       TaskCmd::Thaw => (),
       TaskCmd::Freeze(number) => self.ctx.send(KernelCommand::TaskFrozen(
         number,
-        TaskKindSnapshot::Console {},
+        TaskKindSnapshot::Console {
+          groups: Default::default(),
+        },
       )),
       TaskCmd::Msg(_) => (),
     }
@@ -661,7 +667,9 @@ fn restored_running_task_follows_the_new_ready_check() {
     spec: None,
     run_spec: None,
     origin: None,
-    kind: TaskKindSnapshot::Console {},
+    kind: TaskKindSnapshot::Console {
+      groups: Default::default(),
+    },
   };
   let secs = Duration::from_secs;
   for (ready, state, timer) in [
@@ -1015,7 +1023,9 @@ async fn lists_a_batch_in_the_order_given() {
         match cmd {
           TaskCmd::Freeze(number) => pc.send(KernelCommand::TaskFrozen(
             number,
-            TaskKindSnapshot::Console {},
+            TaskKindSnapshot::Console {
+              groups: Default::default(),
+            },
           )),
           TaskCmd::Msg(msg) => {
             if let Ok(n) = msg.downcast::<TaskNotification>()
@@ -1057,11 +1067,11 @@ async fn lists_a_batch_in_the_order_given() {
   };
   let results = pc
     .register_tasks(vec![
-      registration(refused, needs("gone/x", TaskId(usize::MAX))),
-      registration(web, needs("web", db)),
-      registration(api_a, needs("api/a", db)),
-      registration(db, path_def("db")),
-      registration(api_b, path_def("api/b")),
+      registration(refused, needs("gone/x", TaskId(usize::MAX))).into(),
+      registration(web, needs("web", db)).into(),
+      registration(api_a, needs("api/a", db)).into(),
+      registration(db, path_def("db")).into(),
+      registration(api_b, path_def("api/b")).into(),
     ])
     .await
     .unwrap();
@@ -2391,14 +2401,24 @@ async fn a_late_answer_to_an_earlier_freeze_is_ignored() {
 
   let (tx, mut second) = tokio::sync::oneshot::channel();
   fx.pc.send(KernelCommand::Freeze(tx));
-  task_ctx.send(KernelCommand::TaskFrozen(1, TaskKindSnapshot::Console {}));
+  task_ctx.send(KernelCommand::TaskFrozen(
+    1,
+    TaskKindSnapshot::Console {
+      groups: Default::default(),
+    },
+  ));
   fx.flush().await;
   assert!(
     second.try_recv().is_err(),
     "a stale answer completed freeze 2"
   );
 
-  task_ctx.send(KernelCommand::TaskFrozen(2, TaskKindSnapshot::Console {}));
+  task_ctx.send(KernelCommand::TaskFrozen(
+    2,
+    TaskKindSnapshot::Console {
+      groups: Default::default(),
+    },
+  ));
   let snapshot = tokio::time::timeout(Duration::from_secs(1), second)
     .await
     .expect("timed out waiting for the freeze")
@@ -2499,14 +2519,14 @@ async fn restore_rebuilds_graph_and_drives_only_what_changed() {
         ..Default::default()
       };
       (
-        saved,
-        TaskRegistration {
+        Some(saved),
+        Registration::Task(TaskRegistration {
           task_id: TaskId(saved.id),
           def,
           factory: Box::new(move |ctx| {
             Box::new(RecordingTask { name, tx, ctx })
           }),
-        },
+        }),
       )
     })
     .collect();
@@ -2788,7 +2808,9 @@ fn saved_task(state: snap::TaskState) -> snap::Task {
     spec: None,
     run_spec: None,
     origin: None,
-    kind: TaskKindSnapshot::Console {},
+    kind: TaskKindSnapshot::Console {
+      groups: Default::default(),
+    },
   }
 }
 
@@ -2937,14 +2959,14 @@ async fn restored_done_job_that_is_now_a_service_is_started() {
         ..Default::default()
       };
       (
-        saved,
-        TaskRegistration {
+        Some(saved),
+        Registration::Task(TaskRegistration {
           task_id: TaskId(saved.id),
           def,
           factory: Box::new(move |ctx| {
             Box::new(RecordingTask { name, tx, ctx })
           }),
-        },
+        }),
       )
     })
     .collect();
@@ -3297,9 +3319,12 @@ fn saved_pin_is_carried_through_a_snapshot() {
     )
     .unwrap();
   assert!(kernel.graph.tasks[&TaskId(1)].saved_pin);
-  let snapshot = kernel
-    .graph
-    .snapshot(HashMap::from([(TaskId(1), TaskKindSnapshot::Console {})]));
+  let snapshot = kernel.graph.snapshot(HashMap::from([(
+    TaskId(1),
+    TaskKindSnapshot::Console {
+      groups: Default::default(),
+    },
+  )]));
   assert!(snapshot.tasks[0].saved_pin);
 }
 
@@ -3887,5 +3912,338 @@ async fn a_new_origin_is_told() {
   assert_eq!(seen, ["changed", "changed", "removed"]);
 
   pc.send(KernelCommand::Remove(TaskSelector::all(), None));
+  fx.quit(handle).await;
+}
+
+// ---- Folders ----
+
+/// What a subscriber hears of the tasks and folders.
+#[derive(Debug, Eq, PartialEq)]
+enum Heard {
+  Task(TaskId, Option<TaskId>),
+  Folder(TaskId, String, Option<TaskId>, bool),
+  Removed(TaskId),
+  Moved(TaskId, String, Option<TaskId>),
+}
+
+/// A task subscribed to the default space, and what it hears.
+async fn listen(pc: &TaskContext) -> UnboundedReceiver<Heard> {
+  let (tx, rx) = unbounded_channel();
+  let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
+  let ack = pc.spawn_async_with_id(
+    pc.alloc_id(),
+    TaskDef::default(),
+    move |pc, mut cmds| async move {
+      pc.subscribe_path(
+        TaskKey::default_space(TaskPath::root()),
+        SubMode::Subtree,
+      );
+      subscribed_tx.send(()).unwrap();
+      while let Some(cmd) = cmds.recv().await {
+        let msg = match cmd {
+          TaskCmd::Msg(msg) => msg,
+          TaskCmd::Freeze(number) => {
+            let kind = TaskKindSnapshot::Console {
+              groups: Default::default(),
+            };
+            pc.send(KernelCommand::TaskFrozen(number, kind));
+            continue;
+          }
+          TaskCmd::Start(_) | TaskCmd::Stop | TaskCmd::Kill | TaskCmd::Thaw => {
+            continue;
+          }
+        };
+        let Ok(n) = msg.downcast::<TaskNotification>() else {
+          continue;
+        };
+        let heard = match n.notify {
+          TaskNotify::Added { after, .. } => Heard::Task(n.from, after),
+          TaskNotify::FolderAdded {
+            path,
+            after,
+            collapsed,
+          } => Heard::Folder(n.from, path.to_string(), after, collapsed),
+          TaskNotify::Removed => Heard::Removed(n.from),
+          TaskNotify::Moved { path, after } => {
+            let path = path.map_or(String::new(), |p| p.to_string());
+            Heard::Moved(n.from, path, after)
+          }
+          TaskNotify::StateChanged(_) | TaskNotify::Changed { .. } => continue,
+        };
+        tx.send(heard).unwrap();
+      }
+    },
+  );
+  assert!(ack.await.unwrap().is_ok());
+  subscribed_rx.await.unwrap();
+  rx
+}
+
+fn folder(id: TaskId, path: &str, collapsed: bool) -> Registration {
+  Registration::Folder(FolderDef {
+    id,
+    space: TaskSpaceId::default_space(),
+    path: TaskPath::new(path).unwrap(),
+    place: Place::Last,
+    settings: FolderSettings {
+      collapsed,
+      origin: None,
+    },
+  })
+}
+
+impl Fixture {
+  fn task(&self, id: TaskId, path: &str) -> Registration {
+    let tx = self.tx.clone();
+    Registration::Task(TaskRegistration {
+      task_id: id,
+      def: path_def(path),
+      factory: Box::new(move |ctx| {
+        Box::new(RecordingTask {
+          name: "task",
+          tx,
+          ctx,
+        })
+      }),
+    })
+  }
+
+  async fn folder_paths(&self) -> Vec<String> {
+    let folders = self.pc.folders(TaskSpaceId::default_space()).await;
+    folders.iter().map(|f| f.path.to_string()).collect()
+  }
+
+  async fn task_paths(&self) -> Vec<String> {
+    let tasks = self.pc.list_tasks(TaskSelector::all()).await;
+    tasks.iter().map(|task| task.name()).collect()
+  }
+}
+
+async fn heard(rx: &mut UnboundedReceiver<Heard>, n: usize) -> Vec<Heard> {
+  let mut heard = Vec::new();
+  for _ in 0..n {
+    let next = tokio::time::timeout(Duration::from_secs(1), rx.recv());
+    heard.push(next.await.unwrap().unwrap());
+  }
+  heard
+}
+
+/// A batch lists its folders among its tasks in the order given, and
+/// registers them first; a subscriber that comes later hears them all
+/// in list order, each after the one before it.
+#[tokio::test]
+async fn folders_are_listed_in_place() {
+  let mut fx = Fixture::new();
+  let handle = fx.run();
+  let pc = fx.pc.clone();
+  let mut early = listen(&pc).await;
+  let [db, apps, zz, tools, web] = [(); 5].map(|_| pc.alloc_id());
+  let results = pc
+    .register_tasks(vec![
+      fx.task(db, "db"),
+      folder(apps, "apps", true),
+      fx.task(zz, "zz"),
+      folder(tools, "tools", false),
+      fx.task(web, "apps/web"),
+    ])
+    .await
+    .unwrap();
+  assert!(results.iter().all(Result::is_ok), "{results:?}");
+  // The folders first, so a task under one is listed in it; each after
+  // what is there before it.
+  assert_eq!(
+    heard(&mut early, 5).await,
+    [
+      Heard::Folder(apps, "apps".into(), None, true),
+      Heard::Folder(tools, "tools".into(), Some(apps), false),
+      Heard::Task(db, None),
+      Heard::Task(zz, Some(apps)),
+      Heard::Task(web, Some(apps)),
+    ]
+  );
+  assert_eq!(fx.folder_paths().await, ["apps", "tools"]);
+  assert_eq!(fx.task_paths().await, ["db", "apps/web", "zz"]);
+
+  let mut late = listen(&pc).await;
+  assert_eq!(
+    heard(&mut late, 5).await,
+    [
+      Heard::Task(db, None),
+      Heard::Folder(apps, "apps".into(), Some(db), true),
+      Heard::Task(web, Some(apps)),
+      Heard::Task(zz, Some(web)),
+      Heard::Folder(tools, "tools".into(), Some(zz), false),
+    ]
+  );
+
+  // Saved in list order, each with what it goes back after.
+  let snapshot = freeze(&fx).await;
+  let saved: Vec<(&str, Option<usize>, bool)> = snapshot
+    .folders
+    .iter()
+    .map(|f| (f.path.as_str(), f.after, f.collapsed))
+    .collect();
+  assert_eq!(
+    saved,
+    [("apps", Some(db.0), true), ("tools", Some(zz.0), false)]
+  );
+  pc.send(KernelCommand::Thaw);
+  fx.quit(handle).await;
+}
+
+/// `rm` takes a group or folder with every task and folder under it,
+/// whether a path, a glob, or a folder's id names it.
+#[tokio::test]
+async fn rm_takes_a_group_or_folder_whole() {
+  let mut fx = Fixture::new();
+  let handle = fx.run();
+  let pc = fx.pc.clone();
+  let ids: Vec<TaskId> = (0..8).map(|_| pc.alloc_id()).collect();
+  let [apps, web, x, empty, db, lint, svc, api] = ids[..] else {
+    unreachable!()
+  };
+  let results = pc
+    .register_tasks(vec![
+      folder(apps, "apps", false),
+      fx.task(web, "apps/web"),
+      fx.task(x, "apps/api/x"),
+      folder(empty, "apps/empty", false),
+      fx.task(db, "db"),
+      fx.task(lint, "tools/lint"),
+      folder(svc, "svc", false),
+      fx.task(api, "svc/api"),
+    ])
+    .await
+    .unwrap();
+  assert!(results.iter().all(Result::is_ok), "{results:?}");
+  let mut rx = listen(&pc).await;
+  heard(&mut rx, 8).await;
+
+  let remove = |selector| {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pc.send(KernelCommand::Remove(selector, Some(tx)));
+    async move { rx.await.unwrap() }
+  };
+  let glob = |pattern: &str| {
+    TaskSelector::Glob(SpaceSelector::default_space(), pattern.to_string())
+  };
+  assert_eq!(remove(glob("apps")).await, 4);
+  let mut gone = heard(&mut rx, 4).await;
+  gone.sort_by_key(|heard| format!("{heard:?}"));
+  let mut expected = [web, x, empty, apps].map(Heard::Removed);
+  expected.sort_by_key(|heard| format!("{heard:?}"));
+  assert_eq!(gone, expected);
+  // A group made by the paths under it.
+  assert_eq!(remove(glob("tools")).await, 1);
+  assert_eq!(remove(TaskSelector::Id(svc)).await, 2);
+  assert_eq!(fx.folder_paths().await, Vec::<String>::new());
+  assert_eq!(fx.task_paths().await, ["db"]);
+  assert_eq!(remove(glob("nope")).await, 0);
+  assert_eq!(remove(glob("**")).await, 1);
+  fx.quit(handle).await;
+}
+
+/// A dropped folder leaves what is under it; nothing goes where a folder
+/// is; a folder's entry changes what it is, not what is listed.
+#[tokio::test]
+async fn a_folder_is_dropped_or_set_on_its_own() {
+  let mut fx = Fixture::new();
+  let handle = fx.run();
+  let pc = fx.pc.clone();
+  let [apps, web, empty] = [(); 3].map(|_| pc.alloc_id());
+  pc.register_tasks(vec![
+    folder(apps, "apps", true),
+    fx.task(web, "apps/web"),
+    folder(empty, "empty", false),
+  ])
+  .await
+  .unwrap();
+
+  let refused = pc
+    .register_tasks(vec![
+      fx.task(pc.alloc_id(), "apps"),
+      folder(pc.alloc_id(), "apps/web", false),
+      folder(pc.alloc_id(), "apps/web/x", false),
+    ])
+    .await
+    .unwrap();
+  let refused: Vec<String> = refused
+    .into_iter()
+    .map(|result| result.unwrap_err().to_string())
+    .collect();
+  assert_eq!(
+    refused,
+    [
+      "'apps' is a folder",
+      "a task already exists at 'apps/web'",
+      "a task can't have tasks under it: 'apps/web/x' is under 'apps/web'",
+    ]
+  );
+
+  let ack = |command: fn(TaskId, Ack) -> KernelCommand, id| {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pc.send(command(id, Some(tx)));
+    async move { rx.await.unwrap() }
+  };
+  let settings = FolderSettings {
+    collapsed: false,
+    origin: Some(crate::spec::Source {
+      file: "dekit.yaml".into(),
+      key: "apps/".into(),
+      mount: String::new(),
+    }),
+  };
+  let set = settings.clone();
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  pc.send(KernelCommand::SetFolder(apps, set, Some(tx)));
+  assert_eq!(rx.await.unwrap(), 1);
+  let folders = pc.folders(TaskSpaceId::default_space()).await;
+  assert_eq!(folders[0].settings, settings);
+
+  assert_eq!(ack(KernelCommand::DropFolder, apps).await, 1);
+  assert_eq!(ack(KernelCommand::DropFolder, apps).await, 0);
+  assert_eq!(ack(KernelCommand::DropFolder, web).await, 0, "a task");
+  assert_eq!(ack(KernelCommand::DropFolder, empty).await, 1);
+  assert_eq!(fx.folder_paths().await, Vec::<String>::new());
+  assert_eq!(fx.task_paths().await, ["apps/web"]);
+  fx.quit(handle).await;
+}
+
+/// A folder moves with the group it is in, and its subscribers hear it
+/// first, in the new list order.
+#[tokio::test]
+async fn a_folder_moves_with_its_group() {
+  let mut fx = Fixture::new();
+  let handle = fx.run();
+  let pc = fx.pc.clone();
+  let [db, apps, web] = [(); 3].map(|_| pc.alloc_id());
+  pc.register_tasks(vec![
+    fx.task(db, "db"),
+    folder(apps, "g/apps", false),
+    fx.task(web, "g/apps/web"),
+  ])
+  .await
+  .unwrap();
+  let mut rx = listen(&pc).await;
+  heard(&mut rx, 3).await;
+  let (tx, reply) = tokio::sync::oneshot::channel();
+  pc.send(KernelCommand::Move(
+    MoveTask {
+      space: TaskSpaceId::default_space(),
+      from: TaskPath::new("g").unwrap(),
+      to: TaskPath::new("h").unwrap(),
+      place: Place::First,
+    },
+    tx,
+  ));
+  assert_eq!(reply.await.unwrap(), Ok(2));
+  assert_eq!(
+    heard(&mut rx, 2).await,
+    [
+      Heard::Moved(apps, "h/apps".into(), None),
+      Heard::Moved(web, "h/apps/web".into(), Some(apps)),
+    ]
+  );
+  assert_eq!(fx.folder_paths().await, ["h/apps"]);
   fx.quit(handle).await;
 }

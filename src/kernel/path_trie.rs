@@ -7,6 +7,9 @@ use super::task_path::{TaskPath, is_at_or_under, join};
 #[derive(Debug)]
 struct TrieNode {
   task: Option<TaskId>,
+  /// A folder: listed before what is under it, and kept while it is
+  /// empty. Never at a task's node.
+  folder: Option<TaskId>,
   /// In list order.
   children: IndexMap<String, TrieNode>,
 }
@@ -15,23 +18,28 @@ impl TrieNode {
   fn new() -> Self {
     Self {
       task: None,
+      folder: None,
       children: IndexMap::new(),
     }
   }
 
   fn is_empty(&self) -> bool {
-    self.task.is_none() && self.children.is_empty()
+    self.id().is_none() && self.children.is_empty()
   }
 
-  /// Collect all (path, task_id) pairs under this node via DFS.
-  fn collect_all(&self, prefix: &str, result: &mut Vec<(TaskPath, TaskId)>) {
-    if let Some(id) = self.task {
-      if let Ok(path) = TaskPath::new(prefix) {
-        result.push((path, id));
-      }
+  /// The task or folder here.
+  fn id(&self) -> Option<TaskId> {
+    self.task.or(self.folder)
+  }
+
+  /// Every task and folder at or under this node, each folder before
+  /// what is under it: in list order.
+  fn collect_nodes(&self, prefix: &str, result: &mut Vec<(TaskPath, TaskId)>) {
+    if let (Some(id), Ok(path)) = (self.id(), TaskPath::new(prefix)) {
+      result.push((path, id));
     }
     for (component, child) in &self.children {
-      child.collect_all(&join(prefix, component), result);
+      child.collect_nodes(&join(prefix, component), result);
     }
   }
 
@@ -43,37 +51,39 @@ impl TrieNode {
     }
   }
 
-  /// A task at or under this node.
-  fn any_task(&self, prefix: &str) -> Option<TaskPath> {
-    if self.task.is_some() {
+  /// A task or folder at or under this node.
+  fn any_node(&self, prefix: &str) -> Option<TaskPath> {
+    if self.id().is_some() {
       return TaskPath::new(prefix).ok();
     }
     self
       .children
       .iter()
-      .find_map(|(component, child)| child.any_task(&join(prefix, component)))
+      .find_map(|(component, child)| child.any_node(&join(prefix, component)))
   }
 
-  /// The last task listed at or under this node.
-  fn last_task(&self) -> Option<TaskId> {
+  /// The last task or folder listed at or under this node.
+  fn last_node(&self) -> Option<TaskId> {
     self
       .task
-      .or_else(|| self.children.values().rev().find_map(TrieNode::last_task))
+      .or_else(|| self.children.values().rev().find_map(TrieNode::last_node))
+      .or(self.folder)
   }
 
-  /// Walk the trie matching glob pattern components.
+  /// Walk the trie matching glob pattern components: the tasks, or with
+  /// `groups` every node, as the pattern's paths.
   fn glob_walk(
     &self,
     prefix: &str,
     pattern: &[&str],
-    result: &mut Vec<(TaskPath, TaskId)>,
+    groups: bool,
+    result: &mut Vec<(TaskPath, Option<TaskId>)>,
   ) {
     if pattern.is_empty() {
-      // Pattern exhausted: collect this node if it's a task
-      if let Some(id) = self.task {
-        if let Ok(path) = TaskPath::new(prefix) {
-          result.push((path, id));
-        }
+      if (groups || self.task.is_some())
+        && let Ok(path) = TaskPath::new(prefix)
+      {
+        result.push((path, self.task));
       }
       return;
     }
@@ -83,21 +93,21 @@ impl TrieNode {
 
     if pat == "**" {
       // Match zero components (skip **)
-      self.glob_walk(prefix, rest, result);
+      self.glob_walk(prefix, rest, groups, result);
       // Match one or more components
       for (component, child) in &self.children {
         // Continue with ** (match more) and with rest (done matching **)
-        child.glob_walk(&join(prefix, component), pattern, result);
+        child.glob_walk(&join(prefix, component), pattern, groups, result);
       }
     } else if pat == "*" {
       // Match exactly one component
       for (component, child) in &self.children {
-        child.glob_walk(&join(prefix, component), rest, result);
+        child.glob_walk(&join(prefix, component), rest, groups, result);
       }
     } else {
       // Literal match
       if let Some(child) = self.children.get(pat) {
-        child.glob_walk(&join(prefix, pat), rest, result);
+        child.glob_walk(&join(prefix, pat), rest, groups, result);
       }
     }
   }
@@ -112,7 +122,7 @@ pub enum PathConflict {
   Nested(TaskPath),
 }
 
-/// A task a move took elsewhere.
+/// A task or folder a move took elsewhere.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Moved {
   pub id: TaskId,
@@ -134,28 +144,64 @@ impl PathTrie {
     }
   }
 
-  /// Refused, with no change, if a task is at, above, or under `path`.
-  /// A new path is listed last among those beside it, or right after
-  /// `after` when that is one of them.
+  /// Refused, with no change, if a task is above `path`, or a task or
+  /// folder is at or under it. A new path is listed last among those
+  /// beside it, or right after `after` when that is one of them.
   pub fn insert(
     &mut self,
     path: &TaskPath,
     id: TaskId,
     place: &Place,
   ) -> Result<(), PathConflict> {
-    if let Some(above) = std::iter::successors(path.parent(), TaskPath::parent)
-      .find(|parent| self.resolve(parent).is_some())
-    {
-      return Err(PathConflict::Nested(above));
-    }
+    self.task_above(path)?;
     if let Some(node) = self.walk_to(path) {
-      if let Some(existing) = node.task {
+      if let Some(existing) = node.id() {
         return Err(PathConflict::Taken(existing));
       }
-      if let Some(below) = node.any_task(path.as_str()) {
+      if let Some(below) = node.any_node(path.as_str()) {
         return Err(PathConflict::Nested(below));
       }
     }
+    self.make(path, place).task = Some(id);
+    Ok(())
+  }
+
+  /// A folder at `path`: a group there becomes one where it is, and a
+  /// new path is listed as `insert` lists one. Refused, with no change,
+  /// if a task is at or above it, or a folder is at it.
+  pub fn insert_folder(
+    &mut self,
+    path: &TaskPath,
+    id: TaskId,
+    place: &Place,
+  ) -> Result<(), PathConflict> {
+    self.task_above(path)?;
+    if let Some(existing) = self.walk_to(path).and_then(TrieNode::id) {
+      return Err(PathConflict::Taken(existing));
+    }
+    self.make(path, place).folder = Some(id);
+    Ok(())
+  }
+
+  /// Takes the folder away from `path`, leaving what is under it.
+  pub fn remove_folder(&mut self, path: &TaskPath) -> Option<TaskId> {
+    let id = self.walk_to_mut(path)?.folder.take();
+    self.prune(path);
+    id
+  }
+
+  fn task_above(&self, path: &TaskPath) -> Result<(), PathConflict> {
+    match std::iter::successors(path.parent(), TaskPath::parent)
+      .find(|parent| self.resolve(parent).is_some())
+    {
+      Some(above) => Err(PathConflict::Nested(above)),
+      None => Ok(()),
+    }
+  }
+
+  /// The node at `path`, made with the groups on the way if it is not
+  /// there: listed as `insert` lists a new path.
+  fn make(&mut self, path: &TaskPath, place: &Place) -> &mut TrieNode {
     let mut node = &mut self.root;
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
@@ -180,23 +226,16 @@ impl PathTrie {
       };
       node = &mut node.children[index];
     }
-    node.task = Some(id);
-    Ok(())
+    node
   }
 
-  /// Holds the path's place in the lists until a task is inserted there
-  /// or `prune` drops it. Nothing is held where an insert would be
-  /// refused for a task above.
-  pub fn place(&mut self, path: &TaskPath) {
-    let mut node = &mut self.root;
-    for component in path.components() {
-      if node.task.is_some() {
-        return;
-      }
-      node = node
-        .children
-        .entry(component.to_string())
-        .or_insert_with(TrieNode::new);
+  /// Holds the path's place in the lists, at `place` as `insert` lists
+  /// a new path, until a task or folder is inserted there or `prune`
+  /// drops it. Nothing is held where an insert would be refused for a
+  /// task above.
+  pub fn place(&mut self, path: &TaskPath, place: &Place) {
+    if self.task_above(path).is_ok() {
+      self.make(path, place);
     }
   }
 
@@ -235,8 +274,9 @@ impl PathTrie {
   /// Moves the task or group at `from`, with everything under it, to
   /// `to`, placed among the names beside it there. A group at `to` that
   /// holds nothing but it is not in the way: the move empties it, and it
-  /// takes the group's place. Nothing changes when it is refused. Returns
-  /// every task under the new place in list order, with its old path.
+  /// takes the group's place; a folder is in the way. Nothing changes
+  /// when it is refused. Returns every task and folder under the new
+  /// place in list order, with its old path.
   pub fn move_node(
     &mut self,
     from: &TaskPath,
@@ -261,11 +301,12 @@ impl PathTrie {
       {
         return Err(MoveError::UnderTask(above));
       }
+      // A folder stays when the move empties it, so it is in the way.
       let emptied = std::iter::successors(from.parent(), TaskPath::parent)
         .take_while(|group| {
-          self
-            .walk_to(group)
-            .is_some_and(|node| node.children.len() == 1)
+          self.walk_to(group).is_some_and(|node| {
+            node.children.len() == 1 && node.folder.is_none()
+          })
         })
         .any(|group| group == *to);
       if self.walk_to(to).is_some() && !emptied {
@@ -285,11 +326,11 @@ impl PathTrie {
     }
 
     let mut old: std::collections::HashMap<TaskId, TaskPath> = {
-      let mut tasks = Vec::new();
+      let mut nodes = Vec::new();
       if let Some(node) = self.walk_to(from) {
-        node.collect_all(from.as_str(), &mut tasks);
+        node.collect_nodes(from.as_str(), &mut nodes);
       }
-      tasks.into_iter().map(|(path, id)| (id, path)).collect()
+      nodes.into_iter().map(|(path, id)| (id, path)).collect()
     };
     let from_parent = from.parent().unwrap_or_else(TaskPath::root);
     let parent = self
@@ -312,7 +353,7 @@ impl PathTrie {
       .filter(|group| group.parent() == from.parent());
     // In first, and only then the groups it left empty pruned: one of them
     // can be the place to go after, or on the way to the destination.
-    self.place(&to_parent);
+    self.place(&to_parent, &Place::Last);
     if let (Place::Keep, Some(_)) = (place, made) {
       let parent = self
         .walk_to_mut(&from_parent)
@@ -338,7 +379,7 @@ impl PathTrie {
     };
     parent.children.move_index(last, at);
     let mut moved = Vec::new();
-    parent.children[at].collect_all(to.as_str(), &mut moved);
+    parent.children[at].collect_nodes(to.as_str(), &mut moved);
     if from.parent() != to.parent() {
       self.prune(from);
     }
@@ -363,23 +404,39 @@ impl PathTrie {
     node.task
   }
 
-  /// The task listed just before `path`.
+  /// The folder at `path`.
+  #[cfg(test)]
+  pub fn folder(&self, path: &TaskPath) -> Option<TaskId> {
+    self.walk_to(path)?.folder
+  }
+
+  /// The task or folder listed just before `path`.
   pub fn before(&self, path: &TaskPath) -> Option<TaskId> {
     let mut node = &self.root;
     let mut before = None;
     for component in path.components() {
       let index = node.children.get_index_of(component)?;
       let earlier = node.children.get_range(..index)?;
-      // A task under a later path part is listed after one beside an
-      // earlier part.
+      // A node under a later path part is listed after one beside an
+      // earlier part, and a folder before what is under it.
       before = earlier
         .values()
         .rev()
-        .find_map(TrieNode::last_task)
+        .find_map(TrieNode::last_node)
+        .or(node.folder)
         .or(before);
       node = &node.children[index];
     }
     before
+  }
+
+  /// The task or folder at `path` and every one under it, in list order.
+  pub fn nodes(&self, path: &TaskPath) -> Vec<(TaskPath, TaskId)> {
+    let mut result = Vec::new();
+    if let Some(node) = self.walk_to(path) {
+      node.collect_nodes(path.as_str(), &mut result);
+    }
+    result
   }
 
   /// Where a path is listed: its index among the names beside it, at each
@@ -403,27 +460,35 @@ impl PathTrie {
     result
   }
 
-  /// Recursively collect all tasks under a prefix path.
-  pub fn descendants(&self, path: &TaskPath) -> Vec<(TaskPath, TaskId)> {
-    let node = self.walk_to(path);
-    let Some(node) = node else {
-      return Vec::new();
-    };
-    let mut result = Vec::new();
-    // Collect from children, not the node itself
-    for (component, child) in &node.children {
-      child.collect_all(&join(path.as_str(), component), &mut result);
-    }
-    result
-  }
-
   /// Find all tasks whose paths match a glob pattern, sorted by path.
   /// Supports `*` (single component) and `**` (recursive).
   pub fn glob(&self, pattern: &str) -> Vec<(TaskPath, TaskId)> {
+    self
+      .glob_walk(pattern, false)
+      .into_iter()
+      .filter_map(|(path, id)| Some((path, id?)))
+      .collect()
+  }
+
+  /// Every task, folder, and group whose path matches a glob pattern,
+  /// sorted by path.
+  pub fn glob_nodes(&self, pattern: &str) -> Vec<TaskPath> {
+    self
+      .glob_walk(pattern, true)
+      .into_iter()
+      .map(|(path, _)| path)
+      .collect()
+  }
+
+  fn glob_walk(
+    &self,
+    pattern: &str,
+    groups: bool,
+  ) -> Vec<(TaskPath, Option<TaskId>)> {
     let parts: Vec<&str> =
       pattern.split('/').filter(|c| !c.is_empty()).collect();
     let mut result = Vec::new();
-    self.root.glob_walk("", &parts, &mut result);
+    self.root.glob_walk("", &parts, groups, &mut result);
     // A path can match through several `**` derivations.
     result.sort();
     result.dedup();
@@ -451,10 +516,13 @@ impl PathTrie {
 mod tests {
   use super::*;
 
+  /// The tasks' paths, in list order.
   fn listed_paths(trie: &PathTrie) -> Vec<String> {
-    let mut all = Vec::new();
-    trie.root.collect_all("", &mut all);
-    all.into_iter().map(|(path, _)| path.to_string()).collect()
+    let nodes = trie.nodes(&TaskPath::root());
+    let tasks = nodes
+      .iter()
+      .filter(|(path, _)| trie.resolve(path).is_some());
+    tasks.map(|(path, _)| path.to_string()).collect()
   }
 
   #[test]
@@ -693,7 +761,11 @@ mod tests {
       trie.insert(&p("api/v1"), TaskId(3), &Place::Last),
       Err(PathConflict::Nested(p("api/v1/http")))
     );
-    assert!(trie.descendants(&p("web")).is_empty(), "nothing was made");
+    assert_eq!(
+      trie.nodes(&p("web")),
+      [(p("web"), TaskId(1))],
+      "nothing was made under it"
+    );
 
     trie.remove(&p("web"));
     trie
@@ -724,8 +796,9 @@ mod tests {
     assert_eq!(trie.remove(&p("nope")), None);
   }
 
+  /// `nodes` lists what is at and under a path, in list order.
   #[test]
-  fn test_descendants() {
+  fn lists_the_nodes_under_a_path() {
     let mut trie = PathTrie::new();
     trie
       .insert(&p("services/api"), TaskId(1), &Place::Last)
@@ -740,11 +813,15 @@ mod tests {
       .insert(&p("tools/lint"), TaskId(4), &Place::Last)
       .unwrap();
 
-    let desc = trie.descendants(&p("services"));
-    assert_eq!(desc.len(), 3);
-    assert_eq!(desc[0], (p("services/api"), TaskId(1)));
-    assert_eq!(desc[1], (p("services/web/v1"), TaskId(2)));
-    assert_eq!(desc[2], (p("services/web/v2"), TaskId(3)));
+    assert_eq!(
+      trie.nodes(&p("services")),
+      [
+        (p("services/api"), TaskId(1)),
+        (p("services/web/v1"), TaskId(2)),
+        (p("services/web/v2"), TaskId(3)),
+      ]
+    );
+    assert_eq!(trie.nodes(&p("tools/lint")), [(p("tools/lint"), TaskId(4))]);
   }
 
   #[test]
@@ -820,6 +897,143 @@ mod tests {
     trie.tasks().iter().map(|id| id.0).collect()
   }
 
+  /// The tasks and folders, in list order.
+  fn nodes(trie: &PathTrie) -> Vec<usize> {
+    let nodes = trie.nodes(&TaskPath::root());
+    nodes.iter().map(|(_, id)| id.0).collect()
+  }
+
+  /// A folder is listed before what is under it, stays while it is
+  /// empty, and is in the way of a task at or above it.
+  #[test]
+  fn a_folder_is_a_node_of_its_own() {
+    let mut trie = PathTrie::new();
+    trie.insert(&p("db"), TaskId(1), &Place::Last).unwrap();
+    trie
+      .insert_folder(&p("apps"), TaskId(2), &Place::Last)
+      .unwrap();
+    trie.insert(&p("zz"), TaskId(3), &Place::Last).unwrap();
+    assert_eq!(trie.before(&p("zz")), Some(TaskId(2)), "the empty folder");
+    trie
+      .insert(&p("apps/web"), TaskId(4), &Place::Last)
+      .unwrap();
+    assert_eq!(trie.before(&p("apps/web")), Some(TaskId(2)));
+    assert_eq!(trie.before(&p("zz")), Some(TaskId(4)));
+    assert_eq!(listed(&trie), [1, 4, 3]);
+    assert_eq!(nodes(&trie), [1, 2, 4, 3]);
+
+    let refused = |trie: &mut PathTrie, path, folder| {
+      let id = TaskId(9);
+      match folder {
+        true => trie.insert_folder(&p(path), id, &Place::Last),
+        false => trie.insert(&p(path), id, &Place::Last),
+      }
+      .unwrap_err()
+    };
+    assert_eq!(
+      refused(&mut trie, "apps", false),
+      PathConflict::Taken(TaskId(2))
+    );
+    assert_eq!(
+      refused(&mut trie, "apps", true),
+      PathConflict::Taken(TaskId(2))
+    );
+    assert_eq!(
+      refused(&mut trie, "db", true),
+      PathConflict::Taken(TaskId(1))
+    );
+    assert_eq!(
+      refused(&mut trie, "db/x", true),
+      PathConflict::Nested(p("db"))
+    );
+    trie
+      .insert_folder(&p("tools/lint"), TaskId(5), &Place::Last)
+      .unwrap();
+    assert_eq!(
+      refused(&mut trie, "tools", false),
+      PathConflict::Nested(p("tools/lint"))
+    );
+
+    // Emptied, a folder stays; taken away, its groups go with it.
+    trie.remove(&p("apps/web"));
+    assert_eq!(trie.folder(&p("apps")), Some(TaskId(2)));
+    assert_eq!(trie.remove_folder(&p("tools/lint")), Some(TaskId(5)));
+    assert!(trie.walk_to(&p("tools")).is_none());
+
+    // A group becomes a folder where it is, and stays one without it.
+    trie.insert(&p("web/ui"), TaskId(6), &Place::Last).unwrap();
+    trie
+      .insert_folder(&p("web"), TaskId(7), &Place::First)
+      .unwrap();
+    assert_eq!(nodes(&trie), [1, 2, 3, 7, 6]);
+    assert_eq!(trie.remove_folder(&p("web")), Some(TaskId(7)));
+    assert_eq!(nodes(&trie), [1, 2, 3, 6]);
+  }
+
+  #[test]
+  fn a_folder_moves_with_its_group_and_stays_in_the_way() {
+    let mut trie = PathTrie::new();
+    trie
+      .insert_folder(&p("g/f"), TaskId(1), &Place::Last)
+      .unwrap();
+    trie.insert(&p("g/t"), TaskId(2), &Place::Last).unwrap();
+    trie.insert(&p("x"), TaskId(3), &Place::Last).unwrap();
+    let moved = trie.move_node(&p("g"), &p("h"), &Place::Last).unwrap();
+    assert_eq!(
+      moved,
+      [
+        Moved {
+          id: TaskId(1),
+          from: p("g/f"),
+          to: p("h/f")
+        },
+        Moved {
+          id: TaskId(2),
+          from: p("g/t"),
+          to: p("h/t")
+        }
+      ]
+    );
+    assert_eq!(trie.folder(&p("h/f")), Some(TaskId(1)));
+    assert_eq!(nodes(&trie), [3, 1, 2]);
+
+    // Moved out of a folder, a task leaves it there; onto it, it is in
+    // the way.
+    trie
+      .insert_folder(&p("w"), TaskId(4), &Place::Last)
+      .unwrap();
+    trie.insert(&p("w/v"), TaskId(5), &Place::Last).unwrap();
+    assert_eq!(
+      trie.move_node(&p("w/v"), &p("w"), &Place::Keep),
+      Err(MoveError::Taken(p("w")))
+    );
+    trie.move_node(&p("w/v"), &p("v"), &Place::Last).unwrap();
+    assert_eq!(trie.folder(&p("w")), Some(TaskId(4)));
+    assert_eq!(nodes(&trie), [3, 1, 2, 4, 5]);
+  }
+
+  /// `glob_nodes` matches groups and folders as well as tasks.
+  #[test]
+  fn globs_match_groups_too() {
+    let mut trie = PathTrie::new();
+    trie
+      .insert(&p("apps/web"), TaskId(1), &Place::Last)
+      .unwrap();
+    trie
+      .insert(&p("apps/api/x"), TaskId(2), &Place::Last)
+      .unwrap();
+    trie
+      .insert_folder(&p("tools"), TaskId(3), &Place::Last)
+      .unwrap();
+    assert_eq!(trie.glob_nodes("apps"), [p("apps")]);
+    assert_eq!(trie.glob_nodes("*"), [p("apps"), p("tools")]);
+    assert!(trie.glob("*").is_empty());
+    assert_eq!(
+      trie.glob_nodes("apps/**"),
+      [p("apps"), p("apps/api"), p("apps/api/x"), p("apps/web")]
+    );
+  }
+
   #[test]
   fn lists_paths_as_added_with_a_group_at_its_first_task() {
     let mut trie = PathTrie::new();
@@ -865,7 +1079,7 @@ mod tests {
     let mut trie = PathTrie::new();
     trie.insert(&p("a"), TaskId(1), &Place::Last).unwrap();
     for at in ["web/api", "db", "web/ui", "a/under"] {
-      trie.place(&p(at));
+      trie.place(&p(at), &Place::Last);
     }
     assert_eq!(listed(&trie), [1]);
     assert_eq!(trie.insert(&p("web"), TaskId(9), &Place::Last), Ok(()));

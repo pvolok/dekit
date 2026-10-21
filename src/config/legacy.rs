@@ -37,6 +37,7 @@ impl From<crate::mprocs::config::Config> for Config {
         .into_iter()
         .map(|proc| task_config(&paths, proc))
         .collect(),
+      folders: Vec::new(),
       defaults,
       tui: TuiConfig {
         sidebar: SidebarConfig {

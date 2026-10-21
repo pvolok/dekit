@@ -42,7 +42,8 @@ itself: a `command` tag plus its fields. Task-directed verbs (`start`,
 `stop`, `kill`, `veto`, `restart`, `force-restart`, `remove`, `rename`,
 `duplicate`, `set-origin`) carry a `target`, act on the matches
 atomically in the kernel, and reply with `{matched}`, the count of tasks
-acted on. A task registered concurrently
+acted on; `remove` counts the folders it takes too. A task registered
+concurrently
 is either fully included or fully excluded. Zero matches is a normal
 reply, not an error.
 

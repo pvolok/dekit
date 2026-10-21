@@ -59,6 +59,57 @@ impl Namespace {
       .insert(&key.path, id, place)
   }
 
+  pub fn insert_folder(
+    &mut self,
+    key: &TaskKey,
+    id: TaskId,
+    place: &Place,
+  ) -> Result<(), PathConflict> {
+    self
+      .space_mut(&key.space)
+      .paths
+      .insert_folder(&key.path, id, place)
+  }
+
+  pub fn remove_folder(&mut self, key: &TaskKey) -> Option<TaskId> {
+    self
+      .spaces
+      .get_mut(&key.space)
+      .and_then(|space| space.paths.remove_folder(&key.path))
+  }
+
+  /// Every task and folder at or under `key`, in list order.
+  pub fn nodes(&self, key: &TaskKey) -> Vec<(TaskPath, TaskId)> {
+    self
+      .spaces
+      .get(&key.space)
+      .map(|space| space.paths.nodes(&key.path))
+      .unwrap_or_default()
+  }
+
+  /// Every task, folder, and group whose path matches the glob.
+  pub fn glob_nodes(
+    &self,
+    space: &SpaceSelector,
+    pattern: &str,
+  ) -> Vec<TaskKey> {
+    let spaces: Vec<(&TaskSpaceId, &SpaceNamespace)> = match space {
+      SpaceSelector::One(space) => {
+        self.spaces.get_key_value(space).into_iter().collect()
+      }
+      SpaceSelector::Any => self.spaces.iter().collect(),
+    };
+    spaces
+      .into_iter()
+      .flat_map(|(space, ns)| {
+        ns.paths
+          .glob_nodes(pattern)
+          .into_iter()
+          .map(|path| TaskKey::new(space.clone(), path))
+      })
+      .collect()
+  }
+
   pub fn remove(&mut self, key: &TaskKey) -> Option<TaskId> {
     self
       .spaces
@@ -79,8 +130,8 @@ impl Namespace {
     }
   }
 
-  pub fn place(&mut self, key: &TaskKey) {
-    self.space_mut(&key.space).paths.place(&key.path);
+  pub fn place(&mut self, key: &TaskKey, place: &Place) {
+    self.space_mut(&key.space).paths.place(&key.path, place);
   }
 
   pub fn prune(&mut self, key: &TaskKey) {
@@ -89,7 +140,7 @@ impl Namespace {
     }
   }
 
-  /// The task listed just before the one at `key`.
+  /// The task or folder listed just before the one at `key`.
   pub fn before(&self, key: &TaskKey) -> Option<TaskId> {
     self.spaces.get(&key.space)?.paths.before(&key.path)
   }
@@ -115,24 +166,18 @@ impl Namespace {
       .collect()
   }
 
-  /// Tasks a subscription at `key` with `mode` would match.
+  /// The tasks and folders a subscription at `key` with `mode` would
+  /// match, in list order.
   pub fn in_scope(
     &self,
     key: &TaskKey,
     mode: SubMode,
   ) -> Vec<(TaskPath, TaskId)> {
-    let Some(space) = self.spaces.get(&key.space) else {
-      return Vec::new();
-    };
-    let mut result = Vec::new();
-    if let Some(id) = space.paths.resolve(&key.path) {
-      result.push((key.path.clone(), id));
+    let mut nodes = self.nodes(key);
+    if mode == SubMode::Exact {
+      nodes.retain(|(path, _)| *path == key.path);
     }
-    match mode {
-      SubMode::Exact => (),
-      SubMode::Subtree => result.extend(space.paths.descendants(&key.path)),
-    }
-    result
+    nodes
   }
 
   // ---- Pub/sub ----

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::cfg::{CfgCx, CfgDoc, CfgNode, CfgObj};
+use crate::config::folder::{FolderConfig, folder_from_cfg, folder_key};
 use crate::config::hook::{Hook, hook_from_cfg};
 use crate::config::keymap::KeymapConfig;
 use crate::config::log::LogConfig;
@@ -105,6 +106,8 @@ pub struct Config {
   pub runner: Option<crate::runner::RunnerSpec>,
   pub log: LogConfig,
   pub tasks: Vec<TaskConfig>,
+  /// In the config's order; `at` places each among the tasks.
+  pub folders: Vec<FolderConfig>,
   pub defaults: TaskConfig,
   pub tui: TuiConfig,
   pub keymap: KeymapConfig,
@@ -123,13 +126,50 @@ pub struct Config {
   pub agent: Option<Vec<String>>,
 }
 
+/// An entry under `tasks:`.
+#[derive(Clone, Copy)]
+pub enum Entry<'a> {
+  Task(&'a TaskConfig),
+  Folder(&'a FolderConfig),
+}
+
+impl Entry<'_> {
+  pub fn source(&self) -> Option<&crate::spec::Source> {
+    match self {
+      Entry::Task(task) => task.source.as_ref(),
+      Entry::Folder(folder) => folder.source.as_ref(),
+    }
+  }
+
+  pub fn path(&self) -> &str {
+    match self {
+      Entry::Task(task) => &task.path,
+      Entry::Folder(folder) => &folder.path,
+    }
+  }
+}
+
 impl Config {
-  /// The task entries, in the config's order.
+  /// The task and folder entries, in the config's order.
+  pub fn entries(&self) -> Vec<Entry<'_>> {
+    let mut folders = self.folders.iter().peekable();
+    let mut entries = Vec::with_capacity(self.tasks.len() + self.folders.len());
+    for (i, task) in self.tasks.iter().enumerate() {
+      while let Some(folder) = folders.next_if(|folder| folder.at <= i) {
+        entries.push(Entry::Folder(folder));
+      }
+      entries.push(Entry::Task(task));
+    }
+    entries.extend(folders.map(Entry::Folder));
+    entries
+  }
+
+  /// Where the task and folder entries are, in the config's order.
   pub fn sources(&self) -> Vec<crate::spec::Source> {
     self
-      .tasks
+      .entries()
       .iter()
-      .filter_map(|task| task.source.clone())
+      .filter_map(|entry| entry.source().cloned())
       .collect()
   }
 
@@ -138,6 +178,7 @@ impl Config {
       runner: None,
       log: LogConfig::default(),
       tasks: Vec::new(),
+      folders: Vec::new(),
       defaults: TaskConfig::default(),
       tui: TuiConfig::builtin(),
       keymap: KeymapConfig::default(),
@@ -192,6 +233,26 @@ impl Config {
         .find(|prefix| task_paths.contains(*prefix))
       {
         bail!("a task can't have tasks under it: '{path}' is under '{above}'");
+      }
+    }
+    let mut folders = HashSet::new();
+    for folder in &self.folders {
+      let path = folder.path.as_str();
+      if !folders.insert(path) {
+        bail!("duplicate folder '{path}/'");
+      }
+      if task_paths.contains(path) {
+        bail!("'{path}' is a task, so it can't be a folder too");
+      }
+      if let Some(above) = path
+        .match_indices('/')
+        .map(|(i, _)| &path[..i])
+        .find(|prefix| task_paths.contains(*prefix))
+      {
+        bail!(
+          "a task can't have tasks under it: folder '{path}/' is under \
+           '{above}'"
+        );
       }
     }
     if self.defaults.autorestart == Some(RestartMode::Always)
@@ -445,6 +506,20 @@ impl Config {
     };
     let tasks = tasks.as_obj()?;
     for (name, task) in tasks.iter() {
+      if let Some(folder) = folder_key(name) {
+        if folder.is_empty() {
+          bail!(task.error("a folder needs a name before its '/'"));
+        }
+        let mut config = folder_from_cfg(join(mount, folder), &task, cx)?;
+        config.source = Some(crate::spec::Source {
+          file: file.to_string(),
+          key: name.to_string(),
+          mount: mount.to_string(),
+        });
+        config.at = self.tasks.len();
+        self.folders.push(config);
+        continue;
+      }
       let path = join(mount, name);
       if !task_paths.insert(path.clone()) {
         bail!("duplicate task path '{}'", path);
@@ -855,6 +930,73 @@ mod tests {
       Err(err) => err.to_string(),
     };
     assert!(err.contains("config load cycle"), "{err}");
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  /// A key that ends in `/` is a folder, in its place among the tasks and
+  /// under the file's mount.
+  #[test]
+  fn folder_entries_load_in_place() {
+    let root = temp_project("folders");
+    std::fs::write(
+      root.join("dekit.yaml"),
+      "load: [{file: web.yaml, at: web}]\ntasks:\n  db: {cmd: ['true']}\n  apps/:\n    collapsed: true\n  apps/api: {cmd: ['true']}\n  tools/:\n",
+    )
+    .unwrap();
+    std::fs::write(
+      root.join("web.yaml"),
+      "tasks:\n  ui/: {}\n  ui/dev: {cmd: ['true']}\n",
+    )
+    .unwrap();
+    let config = Config::load_dir(&root).unwrap();
+    let entries: Vec<String> = config
+      .entries()
+      .iter()
+      .map(|entry| match entry {
+        Entry::Task(task) => task.path.clone(),
+        Entry::Folder(folder) => format!("{}/", folder.path),
+      })
+      .collect();
+    assert_eq!(
+      entries,
+      ["db", "apps/", "apps/api", "tools/", "web/ui/", "web/ui/dev"]
+    );
+    assert!(config.folders[0].collapsed);
+    assert!(!config.folders[1].collapsed);
+    let ui = config.folders[2].source.clone().unwrap();
+    assert_eq!(
+      (ui.file.as_str(), ui.key.as_str(), ui.mount.as_str()),
+      ("web.yaml", "ui/", "web")
+    );
+    assert_eq!(config.sources().len(), 6);
+
+    let load_err = |yaml: &str| {
+      std::fs::write(root.join("dekit.yaml"), yaml).unwrap();
+      match Config::load_dir(&root) {
+        Ok(_) => panic!("expected an error for {yaml}"),
+        Err(err) => format!("{err:#}"),
+      }
+    };
+    for (yaml, expected) in [
+      (
+        "tasks:\n  db: {cmd: x}\n  db/: {}\n",
+        "'db' is a task, so it can't be a folder too",
+      ),
+      (
+        "tasks:\n  db: {cmd: x}\n  db/x/: {}\n",
+        "folder 'db/x/' is under 'db'",
+      ),
+      ("tasks:\n  /: {}\n", "a folder needs a name before its '/'"),
+      ("tasks:\n  a b/: {}\n", "folder 'a b/': invalid task path"),
+      ("tasks:\n  apps/: {cmd: x}\n", "unknown field 'cmd'"),
+      (
+        "load: [{file: web.yaml, at: apps}]\ntasks:\n  apps/ui/: {}\n",
+        "duplicate folder 'apps/ui/'",
+      ),
+    ] {
+      let err = load_err(yaml);
+      assert!(err.contains(expected), "{yaml}: {err}");
+    }
     let _ = std::fs::remove_dir_all(root);
   }
 }

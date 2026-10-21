@@ -6,15 +6,18 @@ use anyhow::bail;
 
 use crate::{
   config::{
-    config::Config,
+    config::{Config, Entry},
     stop_signal::StopConfig,
     task::{AUTOSTART_TAG, CmdConfig, DYNAMIC_TAG, TaskConfig},
     task_log::{LogMode, TaskLogConfig},
   },
   kernel::{
-    kernel_message::{TaskContext, TaskRegistration, TaskSelector},
+    kernel_message::{
+      FolderDef, Place, Registration, TaskContext, TaskRegistration,
+      TaskSelector,
+    },
     task::{RestartMode, STOP_TIMEOUT, TaskId, TaskKind},
-    task_key::TaskKey,
+    task_key::{TaskKey, TaskSpaceId},
     task_path::TaskPath,
   },
   spec::{Base, Source, TaskSpec},
@@ -67,7 +70,7 @@ pub async fn register_saved_tasks(
     .iter()
     .filter_map(|task| match &task.kind {
       snap::TaskKind::Process(process) => Some((task, process)),
-      snap::TaskKind::Console {} => None,
+      snap::TaskKind::Console { .. } => None,
     })
     .collect();
   let new_id: HashMap<usize, TaskId> = process
@@ -122,16 +125,46 @@ pub async fn register_saved_tasks(
     });
   }
   let mut base = saved_base(snapshot, &registrations);
-  let sources: Vec<Option<Source>> =
-    registrations.iter().map(|r| r.def.origin.clone()).collect();
-  let Ok(results) = pc.register_tasks(registrations).await else {
+  // Listed as they were, the folders among the tasks; each named, with
+  // its entry, for what is refused.
+  let mut tasks: HashMap<usize, TaskRegistration> = listed
+    .into_iter()
+    .map(|saved| saved.id)
+    .zip(registrations)
+    .collect();
+  let mut nodes = Vec::new();
+  let mut named = Vec::new();
+  for node in snapshot.listed() {
+    match node {
+      snap::Listed::Task(saved) => {
+        let Some(registration) = tasks.remove(&saved.id) else {
+          continue;
+        };
+        let source = registration.def.origin.clone();
+        named.push((format!("task {}", name(saved)), source));
+        nodes.push(Registration::Task(registration));
+      }
+      snap::Listed::Folder(saved) => {
+        let what = format!("folder {}/", saved.path);
+        match saved.def(pc.alloc_id()) {
+          Ok(def) => {
+            named.push((what, saved.origin.clone()));
+            nodes.push(Registration::Folder(def));
+          }
+          Err(err) => {
+            warnings.push(format!("saved {what} not restored: {err:#}"));
+            lost.extend(saved.origin.clone());
+          }
+        }
+      }
+    }
+  }
+  let Ok(results) = pc.register_tasks(nodes).await else {
     bail!("the kernel has stopped");
   };
-  for ((saved, registered), source) in
-    listed.into_iter().zip(results).zip(sources)
-  {
+  for ((what, source), registered) in named.into_iter().zip(results) {
     if let Err(err) = registered {
-      warnings.push(format!("saved task {} not restored: {err}", name(saved)));
+      warnings.push(format!("saved {what} not restored: {err}"));
       lost.extend(source);
     }
   }
@@ -325,36 +358,55 @@ async fn register_config(
   let Ok(results) = pc.register_tasks(registrations).await else {
     bail!("the kernel has stopped");
   };
-  for (cfg, registered) in config.tasks.iter().zip(results) {
+  for (entry, registered) in config.entries().iter().zip(results) {
     if let Err(err) = registered {
-      bail!("Failed to register task '{}': {}", cfg.path, err);
+      match entry {
+        Entry::Task(cfg) => {
+          bail!("Failed to register task '{}': {}", cfg.path, err)
+        }
+        Entry::Folder(folder) => {
+          bail!("Failed to register folder '{}/': {}", folder.path, err)
+        }
+      }
     }
   }
   Ok(())
 }
 
-/// A registration for each config task, in the config's order and with a
-/// fresh id, pinned if it autostarts and `pin_autostart`.
+/// A registration for each config task and folder, in the config's order
+/// and with a fresh id, a task pinned if it autostarts and
+/// `pin_autostart`.
 pub fn config_registrations(
   config: &Config,
   pc: &TaskContext,
   pin_autostart: bool,
-) -> anyhow::Result<Vec<TaskRegistration>> {
+) -> anyhow::Result<Vec<Registration>> {
   let task_ids: Vec<TaskId> =
     config.tasks.iter().map(|_| pc.alloc_id()).collect();
   let deps_by_task = resolve_task_deps(config, &task_ids)?;
+  let mut tasks = config.tasks.iter().enumerate();
   config
-    .tasks
-    .iter()
-    .enumerate()
-    .map(|(i, cfg)| {
-      let deps = deps_by_task[i]
-        .iter()
-        .copied()
-        .map(TaskSelector::Id)
-        .collect();
-      let pinned = pin_autostart && cfg.autostart();
-      config_task_registration(config, cfg, task_ids[i], deps, pinned)
+    .entries()
+    .into_iter()
+    .map(|entry| match entry {
+      Entry::Task(_) => {
+        let (i, cfg) = tasks.next().expect("one entry for each task");
+        let deps = deps_by_task[i]
+          .iter()
+          .copied()
+          .map(TaskSelector::Id)
+          .collect();
+        let pinned = pin_autostart && cfg.autostart();
+        config_task_registration(config, cfg, task_ids[i], deps, pinned)
+          .map(Registration::Task)
+      }
+      Entry::Folder(folder) => Ok(Registration::Folder(FolderDef {
+        id: pc.alloc_id(),
+        space: TaskSpaceId::default_space(),
+        path: TaskPath::new(&folder.path)?,
+        place: Place::Last,
+        settings: folder.settings(),
+      })),
     })
     .collect()
 }
@@ -394,9 +446,13 @@ pub fn config_specs(config: &Config) -> Vec<(&TaskConfig, TaskSpec)> {
 
 /// The base of a config just taken in: each entry as it says.
 pub fn config_base(config: &Config) -> Base {
-  config_specs(config)
+  config
+    .entries()
     .into_iter()
-    .filter_map(|(cfg, spec)| Some((cfg.source.clone()?, spec)))
+    .filter_map(|entry| match entry {
+      Entry::Task(cfg) => Some((cfg.source.clone()?, config_spec(config, cfg))),
+      Entry::Folder(folder) => Some((folder.source.clone()?, folder.spec())),
+    })
     .collect()
 }
 
@@ -816,6 +872,64 @@ mod tests {
     .map(|(name, saved_pin)| (name.to_string(), false, saved_pin))
     .collect();
     assert_eq!(explain_all(&pc).await, pins);
+    pc.send(KernelCommand::Quit);
+    handle.await.unwrap();
+  }
+
+  /// Saved folders come back where they were listed, as they were; one
+  /// that can't is dropped from the base, so a reload offers it again.
+  #[tokio::test]
+  async fn saved_folders_come_back() {
+    let mut snapshot =
+      snap::decode(include_bytes!("../upgrade/fixtures/v1-orchestration.json"))
+        .unwrap();
+    let source = |key: &str| Source {
+      file: "dekit.yaml".into(),
+      key: key.into(),
+      mount: String::new(),
+    };
+    let folder = |id, path: &str, after, collapsed| snap::Folder {
+      id,
+      space: String::new(),
+      path: path.to_string(),
+      after,
+      collapsed,
+      origin: Some(source(&format!("{path}/"))),
+    };
+    let db = snapshot.tasks[0].id;
+    snapshot.folders = vec![
+      folder(100, "first", None, false),
+      folder(101, "infra", Some(db), true),
+      folder(102, "bad path", Some(101), false),
+    ];
+    let saved = ["first/", "infra/", "bad path/"]
+      .map(|key| (source(key), TaskSpec::default()));
+    snapshot.config_base = Some(saved.into_iter().collect());
+    let kernel = Kernel::new();
+    let pc = kernel.context();
+    let handle = tokio::spawn(kernel.run());
+    let (warnings, base) =
+      register_saved_tasks(&Config::make_default(), &pc, &snapshot)
+        .await
+        .unwrap();
+    assert_eq!(
+      warnings,
+      [
+        "saved folder bad path/ not restored: invalid task path: path \
+         contains invalid character: ' '"
+      ]
+    );
+    let keys: Vec<&str> = base.sources().map(|s| s.key.as_str()).collect();
+    assert_eq!(keys, ["first/", "infra/"]);
+    let folders = pc.folders(TaskSpaceId::default_space()).await;
+    let folders: Vec<(String, bool)> = folders
+      .iter()
+      .map(|f| (f.path.to_string(), f.settings.collapsed))
+      .collect();
+    assert_eq!(
+      folders,
+      [("first".to_string(), false), ("infra".to_string(), true)]
+    );
     pc.send(KernelCommand::Quit);
     handle.await.unwrap();
   }

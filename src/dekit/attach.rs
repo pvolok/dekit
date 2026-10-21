@@ -923,6 +923,7 @@ mod tests {
         },
         crate::project::Project::new(config.clone()),
         config.keymap.build(),
+        Default::default(),
       ))
       .unwrap();
     (pc, console_id, tokio::spawn(kernel.run()))

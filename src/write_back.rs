@@ -12,11 +12,14 @@ use std::sync::Arc;
 use serde_yaml::{Mapping, Value};
 
 use crate::command::{Command, CommandResult, execute};
-use crate::config::config::Config;
+use crate::config::config::{Config, Entry};
 use crate::config::writer::{self, Edit};
-use crate::kernel::kernel_message::{TaskContext, TaskDescription};
+use crate::kernel::kernel_message::{
+  FolderSettings, KernelCommand, TaskContext,
+};
 use crate::kernel::task::TaskId;
 use crate::project::{Project, relative_path};
+use crate::reload::Live;
 use crate::runner::atomic_write;
 use crate::spec::{Base, Source, TaskSpec, show_value};
 use crate::target::Target;
@@ -30,7 +33,8 @@ pub struct WritePlan {
 
 #[derive(Clone, Debug)]
 pub struct WriteItem {
-  /// The task's path here, or in the config for one removed here.
+  /// The task's path here, or in the config for one removed here; a
+  /// folder's ends in `/`.
   pub path: String,
   /// The entry as the file has it: its file, from the project root, and
   /// its key there.
@@ -42,6 +46,8 @@ pub struct WriteItem {
   pub note: Option<String>,
   edits: Vec<Edit>,
   pub task: Option<TaskId>,
+  /// The folder moved here, as it is.
+  folder: Option<(TaskId, FolderSettings)>,
   /// The entry once written: under the task's path for one moved here.
   entry: Source,
   /// What the entry says once written: what the task has; none for a
@@ -86,6 +92,13 @@ impl WritePlan {
   }
 }
 
+impl WriteItem {
+  /// The task or folder here that it writes.
+  pub fn here(&self) -> Option<TaskId> {
+    self.task.or(self.folder.as_ref().map(|(id, _)| *id))
+  }
+}
+
 /// What writing back would change in the config: every config task
 /// changed here, every one removed here, and the runner's own `include`d.
 /// With any included, only those are taken unless chosen.
@@ -93,17 +106,18 @@ pub fn plan(
   config: &Config,
   root: &Path,
   base: &Base,
-  live: &[TaskDescription],
+  live: &Live,
   include: &[TaskId],
 ) -> WritePlan {
   let specs = config_specs(config);
   let defaults = TaskSpec::from_config(&config.defaults);
   let mut items = Vec::new();
-  let here: HashSet<&Source> = live
-    .iter()
-    .filter_map(|task| task.origin.as_ref())
+  let tasks = live.tasks.iter().filter_map(|task| task.origin.as_ref());
+  let folders = live.folders.iter();
+  let here: HashSet<&Source> = tasks
+    .chain(folders.filter_map(|folder| folder.settings.origin.as_ref()))
     .collect();
-  for task in live {
+  for task in &live.tasks {
     let (Some(spec), Some(path)) = (&task.spec, &task.info.path) else {
       continue;
     };
@@ -192,6 +206,7 @@ pub fn plan(
           note,
           edits,
           task: Some(task.info.id),
+          folder: None,
           entry,
           spec: Some(spec.clone()),
         });
@@ -243,6 +258,7 @@ pub fn plan(
             entry,
           }],
           task: Some(task.info.id),
+          folder: None,
           entry: source,
           spec: Some(spec.clone()),
         });
@@ -250,14 +266,67 @@ pub fn plan(
       None => (),
     }
   }
+  // Moved here.
+  for folder in &live.folders {
+    let Some(source) = &folder.settings.origin else {
+      continue;
+    };
+    let Some(entry) = config
+      .folders
+      .iter()
+      .find(|entry| entry.source.as_ref() == Some(source))
+    else {
+      continue;
+    };
+    let path = folder.path.to_string();
+    if path == entry.path {
+      continue;
+    }
+    let key = key_in(&source.mount, &path).map(|key| format!("{key}/"));
+    let note = key
+      .is_none()
+      .then(|| format!("moves out of {}'s mount", source.file));
+    items.push(WriteItem {
+      path: format!("{path}/"),
+      source: source.clone(),
+      kind: WriteKind::Changed,
+      fields: vec![WriteField {
+        key: "path".into(),
+        was: Some(format!("{}/", entry.path).into()),
+        now: Some(format!("{path}/").into()),
+      }],
+      apply: include.is_empty(),
+      note,
+      edits: key
+        .iter()
+        .map(|key| Edit::RenameTask {
+          from: source.key.clone(),
+          to: key.clone(),
+        })
+        .collect(),
+      task: None,
+      folder: Some((folder.id, folder.settings.clone())),
+      entry: Source {
+        key: key.unwrap_or_else(|| source.key.clone()),
+        ..source.clone()
+      },
+      spec: Some(entry.spec()),
+    });
+  }
   // Removed here, still in the config.
-  for (cfg, _) in &specs {
-    let Some(source) = &cfg.source else { continue };
+  for entry in config.entries() {
+    let Some(source) = entry.source() else {
+      continue;
+    };
     if here.contains(source) || !base.contains(source) {
       continue;
     }
+    let path = match entry {
+      Entry::Task(cfg) => cfg.path.clone(),
+      Entry::Folder(folder) => format!("{}/", folder.path),
+    };
     items.push(WriteItem {
-      path: cfg.path.clone(),
+      path,
       source: source.clone(),
       kind: WriteKind::Removed,
       fields: Vec::new(),
@@ -267,6 +336,7 @@ pub fn plan(
         task: source.key.clone(),
       }],
       task: None,
+      folder: None,
       entry: source.clone(),
       spec: None,
     });
@@ -517,6 +587,17 @@ pub async fn written(
         continue;
       }
     }
+    if let Some((id, settings)) = &item.folder {
+      let settings = FolderSettings {
+        origin: Some(item.entry.clone()),
+        ..settings.clone()
+      };
+      let (tx, rx) = tokio::sync::oneshot::channel();
+      pc.send(KernelCommand::SetFolder(*id, settings, Some(tx)));
+      if rx.await.unwrap_or(0) == 0 {
+        continue;
+      }
+    }
     // Written under another key: the old one is gone.
     if item.entry != item.source {
       entries.push((item.source.clone(), None));
@@ -584,11 +665,22 @@ pub fn prompt(plan: &WritePlan) -> String {
      `defaults` gives may also be set on the task itself.\n\n",
     plan.root.display()
   );
+  if plan.chosen().any(|item| item.source.is_folder()) {
+    out.insert_str(
+      out.len() - 1,
+      "A key that ends in `/` is a folder: it holds the tasks under its \
+       path.\n",
+    );
+  }
   for item in plan.chosen() {
+    let noun = match item.source.is_folder() {
+      true => "folder",
+      false => "task",
+    };
     match item.kind {
       WriteKind::Changed => {
         out.push_str(&format!(
-          "- In {}, task `{}`:\n",
+          "- In {}, {noun} `{}`:\n",
           item.source.file, item.source.key
         ));
         for WriteField { key, was, now } in &item.fields {
@@ -619,7 +711,7 @@ pub fn prompt(plan: &WritePlan) -> String {
         }
       }
       WriteKind::Removed => out.push_str(&format!(
-        "- In {}, remove task `{}`.\n",
+        "- In {}, remove {noun} `{}`.\n",
         item.source.file, item.source.key
       )),
     }
@@ -634,7 +726,7 @@ pub fn prompt(plan: &WritePlan) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::test_util::{TempDir, source, spec, task};
+  use crate::test_util::{TempDir, live_with, source, spec, task};
 
   /// A base of one entry.
   fn base_of(source: &Source, spec: &TaskSpec) -> Base {
@@ -652,7 +744,8 @@ mod tests {
     config.tasks = vec![cfg];
     let taken = |include: &[TaskId]| {
       let base = base_of(&source, &spec("{cmd: [api]}"));
-      let plan = plan(&config, Path::new("/p"), &base, &[], include);
+      let plan =
+        plan(&config, Path::new("/p"), &base, &Live::default(), include);
       let items = plan.items.iter().map(|i| (i.kind, i.apply));
       items.collect::<Vec<_>>()
     };
@@ -689,7 +782,7 @@ mod tests {
     let mut here = base.clone();
     here.set("cwd", Some("/p/shared/src".into()));
     here.set_deps(vec!["web/db".into(), "cache".into()]);
-    let live = [task(1, "web/server", here, Some(source.clone()))];
+    let live = live_with([task(1, "web/server", here, Some(source.clone()))]);
     let plan = plan(
       &config,
       Path::new("/p"),
@@ -744,10 +837,10 @@ mod tests {
       "{{type: job, cmd: [make], cwd: '{}'}}",
       root.display()
     ));
-    let live = [
+    let live = live_with([
       task(1, "api", api.clone(), Some(source.clone())),
       task(2, "build", build.clone(), None),
-    ];
+    ]);
     let base = base_of(&source, &base);
     let mut plan = plan(&config, &root, &base, &live, &[TaskId(2)]);
     // Asked for the one task: the other change is offered, not taken.
@@ -780,7 +873,7 @@ mod tests {
       "stop",
       Some(serde_yaml::from_str("{signal: SIGINT, timeout: 30s}").unwrap()),
     );
-    let live = [task(1, "api", here, Some(source.clone()))];
+    let live = live_with([task(1, "api", here, Some(source.clone()))]);
     let plan = plan(&config, &root, &base_of(&source, &base), &live, &[]);
     let mut failed = write(&plan);
     let read = read_back(&plan, &Config::load_dir(&root), &mut failed);
@@ -813,7 +906,7 @@ mod tests {
     let config = Config::load_dir(&root).unwrap();
     let mut here = base.clone();
     here.set_at("env.A", Some("1".into()));
-    let live = [task(1, "api", here.clone(), Some(source.clone()))];
+    let live = live_with([task(1, "api", here.clone(), Some(source.clone()))]);
     let plan = plan(&config, &root, &base_of(&source, &base), &live, &[]);
     let mut failed = write(&plan);
     let read = read_back(&plan, &Config::load_dir(&root), &mut failed);
@@ -902,7 +995,7 @@ mod tests {
     let source = cfg.source.clone().unwrap();
     let mut here = base.clone();
     here.set("cwd", None);
-    let live = [task(1, "api", here, Some(source.clone()))];
+    let live = live_with([task(1, "api", here, Some(source.clone()))]);
     let plan = plan(&config, &root, &base_of(&source, &base), &live, &[]);
     let mut failed = write(&plan);
     let read = read_back(&plan, &Config::load_dir(&root), &mut failed);
@@ -949,7 +1042,7 @@ mod tests {
     let base = TaskSpec::from_config(&cfg);
     let mut here = base.clone();
     here.set_label(Some("API"));
-    let live = [task(1, "api", here, Some(source.clone()))];
+    let live = live_with([task(1, "api", here, Some(source.clone()))]);
     let plan = plan(&config, &root, &base_of(&source, &base), &live, &[]);
     let failed = write(&plan);
     assert_eq!(failed.len(), 1, "{failed:?}");
@@ -973,7 +1066,7 @@ mod tests {
       .find_map(|(cfg, _)| (cfg.path == "api").then(|| cfg.source.clone()))
       .flatten()
       .unwrap();
-    let live = [task(1, "api", spec("{cmd: [mine]}"), None)];
+    let live = live_with([task(1, "api", spec("{cmd: [mine]}"), None)]);
     let base = base_of(&api, &spec("{cmd: [api]}"));
     let plan = plan(&config, &root, &base, &live, &[TaskId(1)]);
     let failed = write(&plan);
@@ -995,7 +1088,8 @@ mod tests {
     let main = "tasks:\n  api:\n    cmd: [api]\n";
     std::fs::write(root.join("dekit.yaml"), main).unwrap();
     let config = Config::load_dir(&root).unwrap();
-    let live = [task(1, "web", spec("{cmd: [web], deps: [db]}"), None)];
+    let live =
+      live_with([task(1, "web", spec("{cmd: [web], deps: [db]}"), None)]);
     let plan = plan(&config, &root, &Base::default(), &live, &[TaskId(1)]);
     let failed = write(&plan);
     let after = std::fs::read_to_string(root.join("dekit.yaml")).unwrap();
@@ -1003,6 +1097,53 @@ mod tests {
     assert!(
       failed.len() == 1 && failed[0].1.contains("unknown process 'db'"),
       "{failed:?}"
+    );
+  }
+
+  /// A folder removed here is taken out of the config; one moved here is
+  /// written under its new key. Both read back.
+  #[test]
+  fn folders_are_written_back() {
+    let dir = TempDir::new("write-folders");
+    let root = dunce::canonicalize(&dir.0).unwrap();
+    let text = "tasks:\n  apps/:\n    collapsed: true\n  apps/web:\n    cmd: [web]\n  tmp/: {}\n";
+    std::fs::write(root.join("dekit.yaml"), text).unwrap();
+    let config = Config::load_dir(&root).unwrap();
+    let base = config_base(&config);
+    let apps = config.folders[0].clone();
+    let (cfg, _) = config_specs(&config).remove(0);
+    let mut live = live_with([task(
+      1,
+      "apps/web",
+      base.get(cfg.source.as_ref().unwrap()).unwrap().clone(),
+      cfg.source.clone(),
+    )]);
+    live.folders = vec![crate::kernel::kernel_message::FolderInfo {
+      id: TaskId(2),
+      space: crate::kernel::task_key::TaskSpaceId::default_space(),
+      path: crate::kernel::task_path::TaskPath::new("svc").unwrap(),
+      after: None,
+      settings: apps.settings(),
+    }];
+    let plan = plan(&config, &root, &base, &live, &[]);
+    let items: Vec<(WriteKind, &str)> = plan
+      .items
+      .iter()
+      .map(|item| (item.kind, item.path.as_str()))
+      .collect();
+    assert_eq!(
+      items,
+      [(WriteKind::Changed, "svc/"), (WriteKind::Removed, "tmp/")]
+    );
+    assert!(prompt(&plan).contains("A key that ends in `/` is a folder"));
+    let mut failed = write(&plan);
+    let read = read_back(&plan, &Config::load_dir(&root), &mut failed);
+    assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!(read.len(), 2);
+    let written = std::fs::read_to_string(root.join("dekit.yaml")).unwrap();
+    assert_eq!(
+      written,
+      "tasks:\n  svc/:\n    collapsed: true\n  apps/web:\n    cmd: [web]\n"
     );
   }
 }

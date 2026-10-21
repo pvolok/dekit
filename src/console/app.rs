@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -80,11 +81,14 @@ fn kernel_scroll_unit(unit: ScrollUnit) -> KernelScrollUnit {
   }
 }
 
+/// `groups` are the groups a saved console listed, and whether each was
+/// collapsed: they are shown so again once listed.
 pub fn console_task_registration(
   task_id: TaskId,
   def: TaskDef,
   project: Arc<Project>,
   keymap: Keymap,
+  groups: BTreeMap<String, bool>,
 ) -> TaskRegistration {
   let screen = Screen::new(DEFAULT_SIZE, 0);
   let handle = ScreenHandle::new(screen.frame());
@@ -103,7 +107,8 @@ pub fn console_task_registration(
         SubMode::Subtree,
       );
       let (tx, rx) = unbounded_channel();
-      tokio::spawn(App::new(project, keymap, rx, pc, screen, handle).run());
+      let app = App::new(project, keymap, rx, pc, screen, handle, groups);
+      tokio::spawn(app.run());
       Box::new(ChannelTask::new(tx))
     }),
   }
@@ -158,12 +163,13 @@ impl App {
     pc: TaskContext,
     screen: Screen,
     handle: ScreenHandle,
+    groups: BTreeMap<String, bool>,
   ) -> Self {
     let (sink, notifies) = unbounded_channel();
     App {
       state: State {
         scope: Scope::Tasks,
-        tasks: TaskTree::new(),
+        tasks: TaskTree::with_groups(groups),
         hide_keymap_window: !project.config().tui.tips.show,
         quitting: false,
         header: Default::default(),
@@ -437,12 +443,14 @@ impl App {
         return;
       }
       TaskCmd::Thaw => return,
-      // The console keeps no state worth carrying: attachments re-attach
-      // and the task list is replayed on resume.
+      // Attachments re-attach and the task list is replayed on resume:
+      // what is carried is how the groups were shown.
       TaskCmd::Freeze(number) => {
         self.pc.send(KernelCommand::TaskFrozen(
           number,
-          TaskKindSnapshot::Console {},
+          TaskKindSnapshot::Console {
+            groups: self.state.tasks.groups(),
+          },
         ));
         return;
       }
@@ -789,6 +797,9 @@ impl App {
       Action::PrevTask => self.state.tasks.prev(),
       Action::Expand => self.state.tasks.expand(),
       Action::Collapse => self.state.tasks.collapse(),
+      Action::Fold { op, target } => {
+        self.state.tasks.fold(op, target.as_deref())
+      }
       Action::SelectTask { index } => self.state.tasks.select_task(index),
 
       Action::StartTask => {
@@ -1028,6 +1039,11 @@ impl App {
         state,
         vt,
       } => self.add_task(id, label, path, after, kind, state, vt),
+      TaskNotify::FolderAdded {
+        path,
+        after,
+        collapsed,
+      } => self.state.tasks.add_folder(id, path, after, collapsed),
       TaskNotify::StateChanged(state) => self.state.tasks.set_status(id, state),
       TaskNotify::Removed => self.state.tasks.remove(id),
       TaskNotify::Changed { label, kind } => {

@@ -520,6 +520,7 @@ fn config_keys_match_code_schema_and_docs() {
   use std::collections::BTreeSet;
 
   use crate::config::config::{PRESENTATION_KEYS, ROOT_KEYS};
+  use crate::config::folder::FOLDER_KEYS;
   use crate::config::ready::{READY_CHECKS, READY_SETTINGS};
   use crate::config::stop_signal::STOP_KEYS;
   use crate::config::task::{TASK_KEYS, TASK_SETTING_KEYS};
@@ -530,6 +531,7 @@ fn config_keys_match_code_schema_and_docs() {
   let mut docs_task = BTreeSet::new();
   let mut docs_ready = BTreeSet::new();
   let mut docs_stop = BTreeSet::new();
+  let mut docs_folder = BTreeSet::new();
   for topic in &docs.topics {
     for block in &topic.blocks {
       let Block::Fields {
@@ -540,7 +542,9 @@ fn config_keys_match_code_schema_and_docs() {
         continue;
       };
       for item in items {
-        if let Some(key) = item.key.strip_prefix("tasks.*.") {
+        if let Some(key) = item.key.strip_prefix("tasks.*/.") {
+          docs_folder.insert(key.to_string());
+        } else if let Some(key) = item.key.strip_prefix("tasks.*.") {
           match key.split_once('.') {
             None => docs_task.insert(key.to_string()),
             Some(("ready", sub)) => docs_ready.insert(sub.to_string()),
@@ -566,6 +570,7 @@ fn config_keys_match_code_schema_and_docs() {
   let code_ready = set(&[READY_CHECKS, READY_SETTINGS].concat());
   assert_eq!(docs_ready, code_ready, "ready keys: docs vs code");
   assert_eq!(docs_stop, set(STOP_KEYS), "stop keys: docs vs code");
+  assert_eq!(docs_folder, set(FOLDER_KEYS), "folder keys: docs vs code");
 
   let schema: serde_json::Value =
     serde_json::from_str(include_str!("../../schemas/dekit.json")).unwrap();
@@ -599,6 +604,11 @@ fn config_keys_match_code_schema_and_docs() {
     }
   }
   assert_eq!(schema_stop, set(STOP_KEYS), "stop keys: schema vs code");
+  assert_eq!(
+    keys(&schema["$defs"]["folder"]["properties"]),
+    set(FOLDER_KEYS),
+    "folder keys: schema vs code"
+  );
 }
 
 const JS_MEMBERS: &str = r#"(() => {

@@ -242,6 +242,7 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
         },
         crate::project::Project::new(config.clone()),
         keymap,
+        Default::default(),
       );
       if let Err(err) = kernel.register_task_registration(registration) {
         bail!("Failed to register console task: {err}");

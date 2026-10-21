@@ -13,10 +13,10 @@ use crate::upgrade::snapshot as snap;
 
 use super::{
   kernel_message::{
-    DepExplain, DuplicateRequest, KernelCommand, KernelMessage, KernelQuery,
-    MoveError, MoveTask, Place, RegisterError, SpaceSelector, TaskDescription,
-    TaskExplain, TaskInfo, TaskRegistration, TaskSelector, TaskUpdate,
-    task_name,
+    DepExplain, DuplicateRequest, FolderDef, FolderInfo, FolderSettings,
+    KernelCommand, KernelMessage, KernelQuery, MoveError, MoveTask, Place,
+    RegisterError, Registration, SpaceSelector, TaskDescription, TaskExplain,
+    TaskInfo, TaskRegistration, TaskSelector, TaskUpdate, task_name,
   },
   namespace::Namespace,
   path_trie::PathConflict,
@@ -96,6 +96,13 @@ enum SentCmd {
 /// Pathless last; then by space and the place in it, or by id.
 type ListKey<'a> = (bool, Option<(&'a TaskSpaceId, Vec<usize>)>, TaskId);
 
+/// A folder in the graph: where it is, and what its entry says.
+struct Folder {
+  space: TaskSpaceId,
+  path: TaskPath,
+  settings: FolderSettings,
+}
+
 struct Graph {
   sender: UnboundedSender<KernelMessage>,
 
@@ -110,6 +117,9 @@ struct Graph {
   /// Reverse of `edges`: `redges[b]` contains `a` when `a` requires `b`.
   redges: HashMap<TaskId, HashSet<TaskId>>,
   ns: Namespace,
+  /// The folders, by id: nodes in the tree beside the tasks, none of
+  /// them in `tasks`.
+  folders: HashMap<TaskId, Folder>,
   tags: HashMap<String, HashSet<TaskId>>,
 
   /// Tasks whose `wanted`/`supported`/drive decision may have changed and
@@ -152,6 +162,7 @@ impl Graph {
       edges: HashMap::new(),
       redges: HashMap::new(),
       ns: Namespace::new(),
+      folders: HashMap::new(),
       tags: HashMap::new(),
 
       dirty: VecDeque::new(),
@@ -189,7 +200,8 @@ impl Graph {
     factory: Box<dyn FnOnce(TaskContext) -> Box<dyn Task>>,
     saved: Option<&snap::Task>,
   ) -> Result<(), RegisterError> {
-    if self.tasks.contains_key(&task_id) {
+    if self.tasks.contains_key(&task_id) || self.folders.contains_key(&task_id)
+    {
       return Err(RegisterError::IdTaken);
     }
     // Deps must exist: refusing here keeps every edge endpoint a
@@ -204,13 +216,7 @@ impl Graph {
         let key = TaskKey::new(space.clone(), p.clone());
         match self.ns.insert(&key, task_id, &def.place) {
           Ok(()) => Some(p),
-          Err(PathConflict::Taken(_)) => {
-            return Err(RegisterError::PathTaken(key));
-          }
-          Err(PathConflict::Nested(other)) => {
-            let other = TaskKey::new(space.clone(), other);
-            return Err(RegisterError::PathNested(key, other));
-          }
+          Err(conflict) => return Err(self.conflict(key, conflict)),
         }
       }
       None => None,
@@ -358,33 +364,51 @@ impl Graph {
     Ok(())
   }
 
-  /// Registers the tasks, listed in the order given, each after the ones
-  /// among them it depends on. A place is held for every path before the
-  /// first task is registered, and dropped again if its task is refused.
+  /// Registers the tasks and folders, listed in the order given: the
+  /// folders first, then each task after the ones among them it depends
+  /// on. A place is held for
+  /// every path before the first is registered, and dropped again if
+  /// what is at it is refused.
   fn register_tasks(
     &mut self,
-    tasks: Vec<(Option<&snap::Task>, TaskRegistration)>,
+    tasks: Vec<(Option<&snap::Task>, Registration)>,
   ) -> Vec<Result<(), RegisterError>> {
-    let keys: Vec<Option<TaskKey>> = tasks
+    let places: Vec<Option<(TaskKey, &Place)>> = tasks
       .iter()
-      .map(|(_, registration)| {
-        let def = &registration.def;
-        let path = def.path.clone()?;
-        Some(TaskKey::new(def.space.clone(), path))
+      .map(|(_, registration)| match registration {
+        Registration::Task(registration) => {
+          let def = &registration.def;
+          let path = def.path.clone()?;
+          Some((TaskKey::new(def.space.clone(), path), &def.place))
+        }
+        Registration::Folder(def) => {
+          let key = TaskKey::new(def.space.clone(), def.path.clone());
+          Some((key, &def.place))
+        }
       })
       .collect();
-    for key in keys.iter().flatten() {
-      self.ns.place(key);
+    for (key, place) in places.iter().flatten() {
+      self.ns.place(key, place);
     }
+    let keys: Vec<Option<TaskKey>> = places
+      .into_iter()
+      .map(|place| place.map(|(key, _)| key))
+      .collect();
 
     let slot: HashMap<TaskId, usize> = tasks
       .iter()
       .enumerate()
-      .map(|(i, (_, registration))| (registration.task_id, i))
+      .filter_map(|(i, (_, registration))| match registration {
+        Registration::Task(registration) => Some((registration.task_id, i)),
+        Registration::Folder(_) => None,
+      })
       .collect();
     let mut missing_deps: Vec<usize> = vec![0; tasks.len()];
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
     for (i, (_, registration)) in tasks.iter().enumerate() {
+      let Registration::Task(registration) = registration else {
+        continue;
+      };
       for dep in &registration.def.deps {
         let dep = match dep {
           TaskSelector::Id(dep) => dep,
@@ -396,8 +420,15 @@ impl Graph {
         }
       }
     }
-    let mut ready: VecDeque<usize> =
-      (0..tasks.len()).filter(|i| missing_deps[*i] == 0).collect();
+    // The folders first: a task under one finds it there, and is listed
+    // in it as it shows.
+    let folder = |i: &usize| matches!(tasks[*i].1, Registration::Folder(_));
+    let (folders, rest): (Vec<usize>, Vec<usize>) =
+      (0..tasks.len()).partition(folder);
+    let mut ready: VecDeque<usize> = folders
+      .into_iter()
+      .chain(rest.into_iter().filter(|i| missing_deps[*i] == 0))
+      .collect();
     let mut order = Vec::with_capacity(tasks.len());
     while let Some(i) = ready.pop_front() {
       order.push(i);
@@ -412,18 +443,21 @@ impl Graph {
     // dependency it lacks.
     order.extend((0..tasks.len()).filter(|i| missing_deps[*i] > 0));
 
-    let mut tasks: Vec<Option<(Option<&snap::Task>, TaskRegistration)>> =
+    let mut tasks: Vec<Option<(Option<&snap::Task>, Registration)>> =
       tasks.into_iter().map(Some).collect();
     let mut results: Vec<Result<(), RegisterError>> =
       tasks.iter().map(|_| Ok(())).collect();
     for i in order {
       let (saved, registration) = tasks[i].take().expect("ordered once");
-      results[i] = self.register_task_with_id(
-        registration.task_id,
-        registration.def,
-        registration.factory,
-        saved,
-      );
+      results[i] = match registration {
+        Registration::Task(registration) => self.register_task_with_id(
+          registration.task_id,
+          registration.def,
+          registration.factory,
+          saved,
+        ),
+        Registration::Folder(def) => self.register_folder(def),
+      };
     }
     for (key, result) in keys.iter().zip(&results) {
       if let (Some(key), Err(_)) = (key, result) {
@@ -431,6 +465,133 @@ impl Graph {
       }
     }
     results
+  }
+
+  /// Why a task or folder can't go at `key`.
+  fn conflict(&self, key: TaskKey, conflict: PathConflict) -> RegisterError {
+    match conflict {
+      PathConflict::Taken(id) if self.folders.contains_key(&id) => {
+        RegisterError::FolderAt(key)
+      }
+      PathConflict::Taken(_) => RegisterError::PathTaken(key),
+      PathConflict::Nested(other) => {
+        let other = TaskKey::new(key.space.clone(), other);
+        RegisterError::PathNested(key, other)
+      }
+    }
+  }
+
+  fn register_folder(&mut self, def: FolderDef) -> Result<(), RegisterError> {
+    if self.tasks.contains_key(&def.id) || self.folders.contains_key(&def.id) {
+      return Err(RegisterError::IdTaken);
+    }
+    let key = TaskKey::new(def.space.clone(), def.path.clone());
+    if let Err(conflict) = self.ns.insert_folder(&key, def.id, &def.place) {
+      return Err(self.conflict(key, conflict));
+    }
+    let folder = Folder {
+      space: def.space,
+      path: def.path,
+      settings: def.settings,
+    };
+    let notify = self.folder_added(&folder);
+    self.folders.insert(def.id, folder);
+    self.notify_subscribers(def.id, key.space, Some(key.path), notify);
+    Ok(())
+  }
+
+  /// `FolderAdded` for a folder, listed where it is now.
+  fn folder_added(&self, folder: &Folder) -> TaskNotify {
+    let key = TaskKey::new(folder.space.clone(), folder.path.clone());
+    TaskNotify::FolderAdded {
+      path: folder.path.clone(),
+      after: self.ns.before(&key),
+      collapsed: folder.settings.collapsed,
+    }
+  }
+
+  /// `Added` for the task or folder at `path`, as it is now.
+  fn added_at(
+    &self,
+    id: TaskId,
+    space: &TaskSpaceId,
+    path: &TaskPath,
+  ) -> Option<TaskNotify> {
+    if let Some(folder) = self.folders.get(&id) {
+      return Some(self.folder_added(folder));
+    }
+    let task = self.tasks.get(&id)?;
+    Some(TaskNotify::Added {
+      after: self.ns.before(&TaskKey::new(space.clone(), path.clone())),
+      path: Some(path.clone()),
+      label: task.label.clone(),
+      kind: task.kind,
+      state: task.state,
+      vt: task.vt.clone(),
+    })
+  }
+
+  /// Takes a folder away, leaving what is under it.
+  fn remove_folder(&mut self, id: TaskId) -> bool {
+    let Some(folder) = self.folders.remove(&id) else {
+      return false;
+    };
+    let key = TaskKey::new(folder.space.clone(), folder.path.clone());
+    self.ns.remove_folder(&key);
+    self.notify_subscribers(
+      id,
+      folder.space,
+      Some(folder.path),
+      TaskNotify::Removed,
+    );
+    true
+  }
+
+  fn set_folder(&mut self, id: TaskId, settings: FolderSettings) -> bool {
+    match self.folders.get_mut(&id) {
+      Some(folder) => {
+        folder.settings = settings;
+        true
+      }
+      None => false,
+    }
+  }
+
+  /// What `Remove` takes away: the tasks the selector matches, and for a
+  /// glob each group and folder it matches with every task and folder
+  /// under it; for a folder's id, the folder with what is under it. The
+  /// ones the sender may change, each once, in list order.
+  fn removal(
+    &self,
+    sender: TaskId,
+    selector: &TaskSelector,
+  ) -> (Vec<TaskId>, Vec<TaskId>) {
+    let roots: Vec<TaskKey> = match selector {
+      TaskSelector::Id(id) => match self.folders.get(id) {
+        Some(folder) => {
+          vec![TaskKey::new(folder.space.clone(), folder.path.clone())]
+        }
+        None => Vec::new(),
+      },
+      TaskSelector::Glob(space, pattern) => self.ns.glob_nodes(space, pattern),
+      TaskSelector::Tag(_, _) => Vec::new(),
+    };
+    let mut tasks: Vec<TaskId> = self.matching_ids(selector);
+    let mut folders = Vec::new();
+    for root in &roots {
+      for (_, id) in self.ns.nodes(root) {
+        if self.folders.contains_key(&id) {
+          folders.push(id);
+        } else {
+          tasks.push(id);
+        }
+      }
+    }
+    let mut seen = HashSet::new();
+    tasks.retain(|id| seen.insert(*id) && self.can_mutate(sender, *id));
+    folders
+      .retain(|id| seen.insert(*id) && self.can_mutate_folder(sender, *id));
+    (tasks, folders)
   }
 
   /// Begin quitting. Returns true if a quit was already in progress (the
@@ -447,7 +608,8 @@ impl Graph {
     false
   }
 
-  /// Subscribes and replays `Added` for every task already in scope.
+  /// Subscribes and replays `Added` for every task and folder already in
+  /// scope, in list order.
   fn subscribe(&mut self, subscriber: TaskId, key: TaskKey, mode: SubMode) {
     // Tasks the subscriber already hears about are not replayed again.
     let replay: Vec<(TaskPath, TaskId)> = self
@@ -458,18 +620,9 @@ impl Graph {
       .collect();
     self.ns.subscribe(subscriber, &key, mode);
     for (path, id) in replay {
-      let t = &self.tasks[&id];
-      let notify = TaskNotify::Added {
-        after: self
-          .ns
-          .before(&TaskKey::new(key.space.clone(), path.clone())),
-        path: Some(path),
-        label: t.label.clone(),
-        kind: t.kind,
-        state: t.state,
-        vt: t.vt.clone(),
-      };
-      self.deliver(id, notify, HashSet::from([subscriber]));
+      if let Some(notify) = self.added_at(id, &key.space, &path) {
+        self.deliver(id, notify, HashSet::from([subscriber]));
+      }
     }
   }
 
@@ -486,6 +639,12 @@ impl Graph {
 
   fn can_register(&self, sender: TaskId, space: &TaskSpaceId) -> bool {
     !space.is_reserved() || self.sender_space(sender) == *space
+  }
+
+  fn can_mutate_folder(&self, sender: TaskId, id: TaskId) -> bool {
+    self.folders.get(&id).is_some_and(|folder| {
+      !folder.space.is_reserved() || self.sender_space(sender) == folder.space
+    })
   }
 
   fn can_mutate(&self, sender: TaskId, task_id: TaskId) -> bool {
@@ -1583,9 +1742,9 @@ impl Graph {
     }
   }
 
-  /// Moves the tasks at or under a path, and tells each one's subscribers:
-  /// `Moved` to those who see it before and after, `Removed` and `Added`
-  /// to those who see it on one side only.
+  /// Moves the tasks and folders at or under a path, and tells each
+  /// one's subscribers: `Moved` to those who see it before and after,
+  /// `Removed` and `Added` to those who see it on one side only.
   fn move_tasks(&mut self, req: &MoveTask) -> Result<usize, MoveError> {
     let moved = self
       .ns
@@ -1594,6 +1753,8 @@ impl Graph {
     for m in &moved {
       if let Some(task) = self.tasks.get_mut(&m.id) {
         task.path = Some(m.to.clone());
+      } else if let Some(folder) = self.folders.get_mut(&m.id) {
+        folder.path = m.to.clone();
       }
     }
     for m in &moved {
@@ -1609,16 +1770,8 @@ impl Graph {
       let after = self
         .ns
         .before(&TaskKey::new(req.space.clone(), m.to.clone()));
-      let Some(task) = self.tasks.get(&m.id) else {
+      let Some(added) = self.added_at(m.id, &req.space, &m.to) else {
         continue;
-      };
-      let added = TaskNotify::Added {
-        path: Some(m.to.clone()),
-        label: task.label.clone(),
-        after,
-        kind: task.kind,
-        state: task.state,
-        vt: task.vt.clone(),
       };
       let gone: HashSet<TaskId> = before.difference(&now).copied().collect();
       let new: HashSet<TaskId> = now.difference(&before).copied().collect();
@@ -1725,6 +1878,30 @@ impl Graph {
   }
 
   // ---- Reads ----
+
+  /// The folders in a space, in list order.
+  fn folders(&self, space: &TaskSpaceId) -> Vec<FolderInfo> {
+    let mut folders: Vec<(Vec<usize>, FolderInfo)> = self
+      .folders
+      .iter()
+      .filter(|(_, folder)| folder.space == *space)
+      .map(|(id, folder)| {
+        let key = TaskKey::new(space.clone(), folder.path.clone());
+        let position =
+          self.ns.position(space, &folder.path).unwrap_or_default();
+        let info = FolderInfo {
+          id: *id,
+          space: folder.space.clone(),
+          path: folder.path.clone(),
+          after: self.ns.before(&key),
+          settings: folder.settings.clone(),
+        };
+        (position, info)
+      })
+      .collect();
+    folders.sort_by(|(a, _), (b, _)| a.cmp(b));
+    folders.into_iter().map(|(_, info)| info).collect()
+  }
 
   fn list_tasks(&self, selector: &TaskSelector) -> Vec<TaskInfo> {
     let mut tasks: Vec<TaskInfo> = self
@@ -2108,11 +2285,33 @@ impl Graph {
     }
     // In list order: a resume lists the tasks as it finds them here.
     tasks.sort_by_cached_key(|task| self.list_key(TaskId(task.id)));
+    let mut folders: Vec<(Vec<usize>, snap::Folder)> = self
+      .folders
+      .iter()
+      .map(|(id, folder)| {
+        let key = TaskKey::new(folder.space.clone(), folder.path.clone());
+        let position = self
+          .ns
+          .position(&folder.space, &folder.path)
+          .unwrap_or_default();
+        let saved = snap::Folder {
+          id: id.0,
+          space: folder.space.as_str().to_string(),
+          path: folder.path.as_str().to_string(),
+          after: self.ns.before(&key).map(|id| id.0),
+          collapsed: folder.settings.collapsed,
+          origin: folder.settings.origin.clone(),
+        };
+        (position, saved)
+      })
+      .collect();
+    folders.sort_by(|(a, x), (b, y)| (&x.space, a).cmp(&(&y.space, b)));
     KernelSnapshot {
       next_task_id: self
         .next_task_id
         .load(std::sync::atomic::Ordering::Relaxed),
       tasks,
+      folders: folders.into_iter().map(|(_, folder)| folder).collect(),
     }
   }
 
@@ -2280,7 +2479,7 @@ impl Kernel {
   pub fn restore(
     &mut self,
     next_task_id: usize,
-    tasks: Vec<(&snap::Task, TaskRegistration)>,
+    tasks: Vec<(Option<&snap::Task>, Registration)>,
   ) -> anyhow::Result<()> {
     self
       .graph
@@ -2289,10 +2488,16 @@ impl Kernel {
     self.graph.now = Instant::now();
     let ids: Vec<TaskId> = tasks
       .iter()
-      .map(|(_, registration)| registration.task_id)
+      .map(|(_, registration)| match registration {
+        Registration::Task(registration) => registration.task_id,
+        Registration::Folder(def) => def.id,
+      })
       .collect();
     let snapshot: HashSet<TaskId> = ids.iter().copied().collect();
     for (_, registration) in &tasks {
+      let Registration::Task(registration) = registration else {
+        continue;
+      };
       for dep in &registration.def.deps {
         let dep = match dep {
           TaskSelector::Id(dep) => dep,
@@ -2306,10 +2511,6 @@ impl Kernel {
         }
       }
     }
-    let tasks = tasks
-      .into_iter()
-      .map(|(saved, registration)| (Some(saved), registration))
-      .collect();
     let results = self.graph.register_tasks(tasks);
     for (id, result) in ids.into_iter().zip(results) {
       result
@@ -2410,6 +2611,8 @@ impl Kernel {
       | KernelCommand::Up(..)
       | KernelCommand::Veto(..)
       | KernelCommand::Remove(..)
+      | KernelCommand::DropFolder(..)
+      | KernelCommand::SetFolder(..)
       | KernelCommand::SetLabel(..)
       | KernelCommand::Duplicate(..)
       | KernelCommand::Update(..)
@@ -2503,12 +2706,15 @@ impl Kernel {
         let mut refused = Vec::with_capacity(registrations.len());
         let mut allowed = Vec::with_capacity(registrations.len());
         for registration in registrations {
-          if self.graph.can_register(msg.from, &registration.def.space) {
+          let space = match &registration {
+            Registration::Task(registration) => &registration.def.space,
+            Registration::Folder(def) => &def.space,
+          };
+          if self.graph.can_register(msg.from, space) {
             refused.push(None);
             allowed.push((None, registration));
           } else {
-            refused
-              .push(Some(RegisterError::ReservedSpace(registration.def.space)));
+            refused.push(Some(RegisterError::ReservedSpace(space.clone())));
           }
         }
         let mut registered = self.graph.register_tasks(allowed).into_iter();
@@ -2595,12 +2801,29 @@ impl Kernel {
         }
       }
       KernelCommand::Remove(selector, ack) => {
-        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
-        for id in &ids {
+        let (tasks, folders) = self.graph.removal(msg.from, &selector);
+        for id in &tasks {
           self.graph.remove_task(*id);
         }
+        for id in &folders {
+          self.graph.remove_folder(*id);
+        }
         if let Some(ack) = ack {
-          let _ = ack.send(ids.len());
+          let _ = ack.send(tasks.len() + folders.len());
+        }
+      }
+      KernelCommand::DropFolder(id, ack) => {
+        let dropped = self.graph.can_mutate_folder(msg.from, id)
+          && self.graph.remove_folder(id);
+        if let Some(ack) = ack {
+          let _ = ack.send(usize::from(dropped));
+        }
+      }
+      KernelCommand::SetFolder(id, settings, ack) => {
+        let set = self.graph.can_mutate_folder(msg.from, id)
+          && self.graph.set_folder(id, settings);
+        if let Some(ack) = ack {
+          let _ = ack.send(usize::from(set));
         }
       }
       KernelCommand::SetLabel(selector, label, ack) => {
@@ -2743,6 +2966,9 @@ impl Kernel {
           .filter_map(|id| self.graph.explain(id))
           .collect();
         let _ = reply.send(explains);
+      }
+      KernelQuery::Folders(space, reply) => {
+        let _ = reply.send(self.graph.folders(&space));
       }
       KernelQuery::Describe(selector, reply) => {
         let mut ids = self.graph.matching_ids(&selector);

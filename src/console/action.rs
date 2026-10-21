@@ -52,6 +52,13 @@ pub enum Action {
   Expand,
   /// Close the selected group, or step out to the group it is in.
   Collapse,
+  /// Open, close, or toggle the groups `target` matches as a path or
+  /// glob, or else the selected one or the one the selected task is in.
+  Fold {
+    op: FoldOp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+  },
   SelectTask {
     index: usize,
   },
@@ -163,6 +170,18 @@ impl Action {
       Action::PrevTask => "Prev".to_string(),
       Action::Expand => "Expand group".to_string(),
       Action::Collapse => "Collapse group".to_string(),
+      Action::Fold { op, target } => {
+        let verb = match op {
+          FoldOp::Open => "Expand",
+          FoldOp::Close => "Collapse",
+          FoldOp::Toggle => "Toggle",
+        };
+        match target.as_deref() {
+          None => format!("{verb} this group"),
+          Some("**") => format!("{verb} all groups"),
+          Some(target) => format!("{verb} {target}"),
+        }
+      }
       Action::SelectTask { index } => format!("Select task #{}", index),
       Action::StartTask => "Start".to_string(),
       Action::StopTask => "Stop".to_string(),
@@ -201,6 +220,15 @@ impl Action {
       Action::SendKey { key } => format!("Send {} key", key.spec()),
     }
   }
+}
+
+/// What `fold` does to the groups.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FoldOp {
+  Open,
+  Close,
+  Toggle,
 }
 
 /// A tab of the runners modal.

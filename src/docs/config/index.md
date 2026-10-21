@@ -32,7 +32,7 @@ on_idle: {command: down}
 :::fields kind=config
 - key: tasks
   type: object
-  desc: Tasks by path (|config/tasks|). Paths may nest, as in `services/web`.
+  desc: Tasks by path (|config/tasks|). Paths may nest, as in `services/web`. A key that ends in `/` is a folder (|config/tasks#folders|).
 - key: defaults
   type: object
   desc: Task settings shared by every task, such as `cwd`, `env`, `autorestart`, or `stop`. A task's own value wins. Not `type` or `ready`.

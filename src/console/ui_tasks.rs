@@ -105,20 +105,25 @@ pub fn render_tasks(
     let status = area.take_right(status_text.width() as u16);
     grid.draw_text(status, &status_text, paint(status_color));
 
-    // Groups end like directories: `web/` open, `web/…` closed.
+    // Groups end like directories: `web/` open, `web/…` closed over what
+    // is in it.
     let (name, suffix) = match node {
       // A label equal to the path would repeat the groups above.
       Node::Task(task) => match &task.label {
         Some(label) if label != path.as_str() => (label.as_str(), ""),
         Some(_) | None => (path.name(), ""),
       },
-      Node::Group(group) if group.collapsed => (path.name(), "/…"),
+      Node::Group(group) if group.collapsed && !group.is_empty() => {
+        (path.name(), "/…")
+      }
       Node::Group(_) => (path.name(), "/"),
     };
-    // A config task changed here and not written back.
+    // A config task or folder changed here and not written back.
     let edited = match node {
       Node::Task(task) => state.config.edited.contains(&task.id),
-      Node::Group(_) => false,
+      Node::Group(group) => group
+        .folder
+        .is_some_and(|id| state.config.edited.contains(&id)),
     };
     let edited_w = if edited { 2 } else { 0 };
     let mut name_area =
@@ -229,7 +234,7 @@ fn group_status(
 ) -> (Cow<'static, str>, Rgb) {
   let color = if group.failed > 0 {
     theme.failed
-  } else if group.up == group.len() {
+  } else if group.len() > 0 && group.up == group.len() {
     theme.up
   } else {
     theme.down
