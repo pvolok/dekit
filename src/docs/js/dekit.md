@@ -8,14 +8,26 @@ order: 10
 `std.dekit` sends commands to the runner the script belongs to: the
 project runner for a `script:` task, or the nearest project for
 `dekit script.js`. Targets are written as on the command line
-(|start/targets|) but cannot name another runner. Every call resolves to
-the number of tasks it acted on.
+(|start/targets|) but cannot name another runner. Every verb resolves to
+the number of tasks it acted on; `wait` resolves to how the wait went.
 
 ```js
 await std.dekit.add("tmp/build", ["npm", "run", "build"]);
 const started = await std.dekit.start("+workers");
 std.log(`started ${started} workers`);
+
+await std.dekit.start("db");
+await std.dekit.wait("db");
+await std.process.exec("./seed.sh");
 ```
+
+A verb followed by `wait` waits for the run the verb began: the runner
+has done what the verb asked before it reads the wait. `wait` rejects on
+a failure or a timeout with an error whose `result` is what `dekit wait
+--json` prints (|cli/wait|), so `Promise.all` over several waits fails as
+soon as one does. A `script:` task must not wait on itself: one that
+waits on a task that depends on it, or on a glob or tag that matches it
+(a job script waiting on `**`), waits forever. Name what it waits on.
 
 :::fields kind=js
 - key: std.dekit.start
@@ -45,4 +57,7 @@ std.log(`started ${started} workers`);
 - key: std.dekit.add
   signature: "(path: string, cmd: string[]) => Promise<number>"
   desc: Add a task at an exact path that runs `cmd`, tag it `dynamic`, and start it.
+- key: std.dekit.wait
+  signature: "(target: string, opts?: {for?: \"ready\" | \"exit\", timeoutMs?: number}) => Promise<WaitResult>"
+  desc: "Wait until the matching tasks are ready, or with `for: \"exit\"` until they have exited, as `dekit wait` does. `timeoutMs` gives up after that long; 0 checks once."
 :::

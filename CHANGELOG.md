@@ -1,5 +1,21 @@
 ## Unreleased
 
+- `dekit wait <target>` waits until tasks are ready, or with `--for exit`
+  until they have exited, and exits 0, 1 for a failure, or 124 when
+  `--timeout` runs out; `--timeout 0` checks once
+- `--wait` on `up`, `start`, and `restart` returns once what they started
+  is ready, and on `stop`, `kill`, and `veto` once it is down;
+  `--wait-timeout` bounds it. A failure names the task at the root and
+  shows the end of its screen
+- `std.dekit.wait(target, {for, timeoutMs})` waits from a script
+- `dekit run x --dep db` waits for `db` when it is not ready yet, instead
+  of exiting 1 at once
+- A running job shows as `running`, not `ready`; `ls --json` and `why`
+  carry `kind`
+- A stop dekit gave up on, because the process outlived a kill, shows as
+  `idle (stop timed out)`, with `reason: "kill_timeout"`
+- RPC: the `wait` method and feature, `kind` in task-info, and the
+  `kill_timeout` reason
 - A `tasks:` key that ends in `/` is a folder: `apps/: {collapsed: true}`
   lists the `apps` folder collapsed at first, and a folder stays while it
   is empty

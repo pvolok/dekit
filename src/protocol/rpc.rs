@@ -49,6 +49,21 @@ pub enum RpcRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     apply: bool,
   },
+  /// Wait until tasks meet a condition, for the rest of the connection:
+  /// `target` observes the tasks it matches; `command` carries out a
+  /// verb, then waits on what it acted on, for what the verb implies.
+  /// One of the two is given; `for` only with `target`.
+  Wait {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<Target>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<Command>,
+    #[serde(default, rename = "for", skip_serializing_if = "Option::is_none")]
+    wait_for: Option<WaitFor>,
+    /// None waits for as long as it takes; 0 checks once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+  },
   /// Replace the runner live with the given binary.
   /// The reply comes from the new binary after activation, as
   /// `{version}`; `unsupported` where live replacement is not available,
@@ -61,7 +76,7 @@ pub enum RpcRequest {
 /// Gate for `from_wire`: methods not listed here are `unknown_method`
 /// instead of `invalid_params`. Kept in sync with the enum by tests.
 const METHODS: &[&str] = &[
-  "command", "ls", "why", "screen", "attach", "reload", "upgrade",
+  "command", "ls", "why", "screen", "attach", "reload", "upgrade", "wait",
 ];
 
 impl RpcRequest {
@@ -136,7 +151,8 @@ pub struct ScreenResult {
 /// detail for `done`/`exited`/`backoff`. `state` is one of `idle`,
 /// `starting`, `running`, `ready`, `stopping`, `backoff`, `done`,
 /// `exited`. `reason` says why dekit ended it: `ready_timeout` (not ready
-/// in time).
+/// in time), or on an idle task `kill_timeout` (its stop was given up
+/// on: the process outlived a hard kill).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RpcState {
   pub state: String,
@@ -156,8 +172,98 @@ pub struct RpcTaskInfo {
   pub path: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub label: Option<String>,
+  /// `service` or `job`; absent from an older runner.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub kind: Option<String>,
   #[serde(flatten)]
   pub state: RpcState,
+}
+
+/// What a `wait` on a target waits for; a command's verb implies its own.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitFor {
+  /// Ready, or done for a job.
+  Ready,
+  /// No process, and won't start again by itself; the last run is
+  /// judged.
+  Exit,
+}
+
+/// Feature `wait`: the server takes the `wait` method.
+pub const FEATURE_WAIT: &str = "wait";
+
+/// Events of a wait session, server to client. `task-changed` and
+/// `task-removed` carry one task each.
+pub const EVENT_TASKS: &str = "tasks";
+pub const EVENT_TASK_CHANGED: &str = "task-changed";
+pub const EVENT_TASK_REMOVED: &str = "task-removed";
+pub const EVENT_WAIT_DONE: &str = "wait-done";
+
+/// How a wait ended.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitOutcome {
+  Met,
+  Failed,
+  /// `timeout_ms` ran out with tasks still pending.
+  Timeout,
+}
+
+/// Where a task stands in a wait.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitMark {
+  Pending,
+  Met,
+  Failed,
+}
+
+impl From<crate::kernel::kernel_message::WaitMark> for WaitMark {
+  fn from(mark: crate::kernel::kernel_message::WaitMark) -> Self {
+    use crate::kernel::kernel_message::WaitMark as Mark;
+    match mark {
+      Mark::Pending => WaitMark::Pending,
+      Mark::Met => WaitMark::Met,
+      Mark::Failed => WaitMark::Failed,
+    }
+  }
+}
+
+/// A task of a wait's set: its task-info, where it stands, and for a
+/// failed one why.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RpcWaitTask {
+  #[serde(flatten)]
+  pub info: RpcTaskInfo,
+  pub wait: WaitMark,
+  /// The task at the root of a failure that came from a dep.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub blocked_by: Option<String>,
+  /// Removed while waited on; the rest is how it last was.
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub removed: bool,
+  /// Why it is (not) running, as `why` answers, when it failed; in
+  /// `wait-done` only.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub why: Option<RpcWhy>,
+}
+
+/// Params of `tasks`: the wait's set as it is, in list order.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WaitTasksEvent {
+  pub tasks: Vec<RpcWaitTask>,
+}
+
+/// Params of `wait-done`, the session's last event: how the wait ended,
+/// and `tasks` the set as it ended. `quitting`: the runner is stopping,
+/// so nothing is wanted any more.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WaitDoneEvent {
+  pub wait: WaitOutcome,
+  pub tasks: Vec<RpcWaitTask>,
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub quitting: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -353,6 +459,26 @@ mod tests {
         binary: "/opt/dekit/bin/dekit".to_string(),
       },
       RpcRequest::Command(Command::Up),
+      RpcRequest::Wait {
+        target: Some(Target::glob("**")),
+        command: None,
+        wait_for: None,
+        timeout_ms: Some(0),
+      },
+      RpcRequest::Wait {
+        target: Some(Target::tag("ci")),
+        command: None,
+        wait_for: Some(WaitFor::Exit),
+        timeout_ms: None,
+      },
+      RpcRequest::Wait {
+        target: None,
+        command: Some(Command::Restart {
+          target: Target::glob("api"),
+        }),
+        wait_for: None,
+        timeout_ms: Some(90_000),
+      },
     ]
   }
 
@@ -387,6 +513,12 @@ mod tests {
       ),
       ("upgrade", r#"{"binary":"/opt/dekit/bin/dekit"}"#),
       ("command", r#"{"command":"up"}"#),
+      ("wait", r#"{"target":"**","timeout_ms":0}"#),
+      ("wait", r#"{"for":"exit","target":"+ci"}"#),
+      (
+        "wait",
+        r#"{"command":{"command":"restart","target":"api"},"timeout_ms":90000}"#,
+      ),
     ];
     let samples = samples();
     assert_eq!(samples.len(), expected.len());
@@ -418,12 +550,14 @@ mod tests {
           id: TaskId(3),
           path: "db".to_string(),
           label: None,
+          kind: None,
           state: ready.clone(),
         },
         RpcTaskInfo {
           id: TaskId(7),
           path: "web/dev".to_string(),
           label: Some("Web".to_string()),
+          kind: None,
           state: exited.clone(),
         },
       ],
@@ -473,6 +607,80 @@ mod tests {
       r#"{"screen":"ok"}"#
     );
     assert_eq!(ok_result().to_string(), "{}");
+
+    let api = RpcTaskInfo {
+      id: TaskId(4),
+      path: "api".to_string(),
+      label: None,
+      kind: Some("service".to_string()),
+      state: RpcState {
+        state: "idle".to_string(),
+        exit_code: None,
+        signal: None,
+        reason: None,
+      },
+    };
+    let pending = RpcWaitTask {
+      info: api.clone(),
+      wait: WaitMark::Pending,
+      blocked_by: None,
+      removed: false,
+      why: None,
+    };
+    assert_eq!(
+      serde_json::to_string(&WaitTasksEvent {
+        tasks: vec![pending]
+      })
+      .unwrap(),
+      r#"{"tasks":[{"id":4,"path":"api","kind":"service","state":"idle","wait":"pending"}]}"#
+    );
+    // `task-removed` carries the task as it last was, marked removed.
+    let removed = RpcWaitTask {
+      info: api.clone(),
+      wait: WaitMark::Met,
+      blocked_by: None,
+      removed: true,
+      why: None,
+    };
+    assert_eq!(
+      serde_json::to_string(&removed).unwrap(),
+      r#"{"id":4,"path":"api","kind":"service","state":"idle","wait":"met","removed":true}"#
+    );
+    let failed = RpcWaitTask {
+      info: api,
+      wait: WaitMark::Failed,
+      blocked_by: Some("db".to_string()),
+      removed: false,
+      why: None,
+    };
+    assert_eq!(
+      serde_json::to_string(&WaitDoneEvent {
+        wait: WaitOutcome::Failed,
+        tasks: vec![failed],
+        quitting: false,
+      })
+      .unwrap(),
+      r#"{"wait":"failed","tasks":[{"id":4,"path":"api","kind":"service","state":"idle","wait":"failed","blocked_by":"db"}]}"#
+    );
+    assert_eq!(
+      serde_json::to_string(&WaitDoneEvent {
+        wait: WaitOutcome::Failed,
+        tasks: Vec::new(),
+        quitting: true,
+      })
+      .unwrap(),
+      r#"{"wait":"failed","tasks":[],"quitting":true}"#
+    );
+    let stopped = RpcState {
+      state: "idle".to_string(),
+      exit_code: None,
+      signal: None,
+      reason: Some("kill_timeout".to_string()),
+    };
+    assert_eq!(
+      serde_json::to_string(&stopped).unwrap(),
+      r#"{"state":"idle","reason":"kill_timeout"}"#
+    );
   }
 
   #[test]

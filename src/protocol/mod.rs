@@ -9,7 +9,8 @@ pub use caps::{Feature, KittyGraphics, TermCaps};
 pub use conn::{ConnReceiver, ConnSender, Msg, client_handshake, server_hello};
 pub use ctl::{Bye, ByeSwitch, CtlMsg, Event, Request, RpcError, codes};
 pub use rpc::{
-  ActResult, QuitResult, RpcRequest, RpcState, RpcTaskInfo, RpcWhy, RpcWhyDep,
-  ScreenResult, TaskListResult, ok_result,
+  ActResult, QuitResult, RpcRequest, RpcState, RpcTaskInfo, RpcWaitTask,
+  RpcWhy, RpcWhyDep, ScreenResult, TaskListResult, WaitDoneEvent, WaitFor,
+  WaitMark, WaitOutcome, WaitTasksEvent, ok_result,
 };
 pub use screen::ScreenCommand;

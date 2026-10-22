@@ -8,7 +8,7 @@ use super::*;
 use crate::kernel::kernel_message::{
   Ack, FolderDef, FolderSettings, KernelSnapshot, Place, Registration,
 };
-use crate::kernel::task::RestartMode;
+use crate::kernel::task::{ReadyMode, RestartMode, StateReason};
 use crate::upgrade::snapshot::TaskKind as TaskKindSnapshot;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -246,7 +246,8 @@ async fn start_starts_and_unpin_stops() {
   let a = fx.add("a", path_def("a"));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.pc.send(KernelCommand::Unpin(TaskSelector::Id(a), None));
@@ -262,11 +263,13 @@ async fn second_task_at_same_path_is_refused() {
   let b = fx.add("b", path_def("x"));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(b), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(b), None));
   fx.flush().await;
   fx.assert_no_cmd();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.quit(handle).await;
@@ -321,7 +324,7 @@ async fn start_pulls_dependencies_up_in_order() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -360,19 +363,20 @@ async fn veto_breaks_dependents_leaf_first() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
   // Keeping the dep down takes the dependent down first.
-  fx.pc.send(KernelCommand::Veto(TaskSelector::Id(dep), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Veto, TaskSelector::Id(dep), None));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
 
   // The dependent stays wanted but blocked; starting the dep again brings
   // both back.
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(dep), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(dep), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -393,19 +397,20 @@ async fn start_of_dependent_releases_vetoed_dep() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
   // Keep the dep down: dependent breaks first.
-  fx.pc.send(KernelCommand::Veto(TaskSelector::Id(dep), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Veto, TaskSelector::Id(dep), None));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
 
   // Starting the dependent demands the dep: it is released and both come
   // back, dep first.
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -426,7 +431,7 @@ async fn start_of_dependent_revives_exited_dep() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -438,7 +443,7 @@ async fn start_of_dependent_revives_exited_dep() {
   fx.assert_no_cmd();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -465,14 +470,17 @@ async fn start_of_dependent_does_not_rerun_done_job() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("job", RecordedCmd::Start));
   fx.pc.send_msg(job, Report::Stopped(ExitInfo::code(0)));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
   // Cycling the dependent leaves the completed job alone.
-  fx.pc
-    .send(KernelCommand::Restart(TaskSelector::Id(app), None));
+  fx.pc.send(KernelCommand::Act(
+    Verb::Restart,
+    TaskSelector::Id(app),
+    None,
+  ));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
   fx.flush().await;
@@ -495,9 +503,9 @@ async fn unpin_keeps_task_wanted_by_another() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(dep), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(dep), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -536,7 +544,7 @@ async fn dependent_waits_for_readiness() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   fx.flush().await;
   fx.assert_no_cmd();
@@ -567,7 +575,7 @@ async fn job_satisfies_dependents_only_when_done() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("job", RecordedCmd::Start));
   fx.flush().await;
   fx.assert_no_cmd();
@@ -594,7 +602,8 @@ async fn crash_restarts_with_backoff() {
   );
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.pc.send_msg(a, Report::Stopped(ExitInfo::code(1)));
@@ -660,6 +669,7 @@ fn restored_running_task_follows_the_new_ready_check() {
     vetoed: false,
     killed: false,
     start_failed: false,
+    stop_timed_out: false,
     saved_pin: false,
     attempts: 0,
     last_start_secs_ago: Some(40),
@@ -761,7 +771,8 @@ async fn clean_exit_does_not_restart() {
   );
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.pc.send_msg(a, Report::Stopped(ExitInfo::code(0)));
@@ -783,7 +794,8 @@ async fn always_restarts_after_a_clean_exit() {
   );
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.pc.send_msg(a, Report::Stopped(ExitInfo::code(0)));
@@ -807,9 +819,11 @@ async fn commanded_stop_never_autorestarts() {
   );
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   tokio::time::advance(Duration::from_secs(60)).await;
   fx.flush().await;
@@ -825,19 +839,21 @@ async fn restart_cycles_task() {
   let a = fx.add("a", path_def("a"));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.pc
-    .send(KernelCommand::Restart(TaskSelector::Id(a), None));
+    .send(KernelCommand::Act(Verb::Restart, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   // Restart on a stopped, unpinned task starts it.
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   fx.pc
-    .send(KernelCommand::Restart(TaskSelector::Id(a), None));
+    .send(KernelCommand::Act(Verb::Restart, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.quit(handle).await;
@@ -849,16 +865,19 @@ async fn stop_of_leaf_keeps_it_down_until_started() {
   let a = fx.add("a", path_def("a"));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   // Nothing wants the task once the stop unpins it.
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   fx.flush().await;
   fx.assert_no_cmd();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.quit(handle).await;
@@ -878,7 +897,7 @@ async fn quit_stops_tasks_in_reverse_dependency_order() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
@@ -969,7 +988,7 @@ fn registration_with_missing_dep_is_refused() {
   );
   turn(
     &mut kernel,
-    KernelCommand::Start(TaskSelector::Id(app_id), None),
+    KernelCommand::Act(Verb::Start, TaskSelector::Id(app_id), None),
   );
   assert_eq!(fx.rx.try_recv().unwrap(), ("dep", RecordedCmd::Start));
   assert_eq!(fx.rx.try_recv().unwrap(), ("app", RecordedCmd::Start));
@@ -981,7 +1000,10 @@ fn add_edge_to_unregistered_id_is_refused() {
   let a = fx.add("a", path_def("a"));
   let mut kernel = fx.kernel.take().unwrap();
 
-  turn(&mut kernel, KernelCommand::Start(TaskSelector::Id(a), None));
+  turn(
+    &mut kernel,
+    KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None),
+  );
   assert_eq!(fx.rx.try_recv().unwrap(), ("a", RecordedCmd::Start));
 
   // No edge to something that does not exist; `a` stays up.
@@ -1206,10 +1228,12 @@ async fn stale_started_report_is_ignored() {
   let a = fx.add("a", path_def("a"));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
   // A started report that was in flight when the stop landed must not
@@ -1219,7 +1243,8 @@ async fn stale_started_report_is_ignored() {
   fx.assert_no_cmd();
 
   // The task still starts normally when demanded again.
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.quit(handle).await;
@@ -1231,16 +1256,19 @@ async fn kill_hard_kills_and_unpins() {
   let a = fx.add("a", path_def("a"));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   // Kill skips the graceful stop; the unpin keeps the task down.
-  fx.pc.send(KernelCommand::Kill(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Kill, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Kill));
   fx.flush().await;
   fx.assert_no_cmd();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.quit(handle).await;
@@ -1272,7 +1300,8 @@ async fn dep_crash_breaks_dependents_in_order_and_recovers() {
   );
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("c", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
@@ -1309,13 +1338,15 @@ async fn veto_of_leaf_dep_tears_down_chain_in_order() {
   );
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("c", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   // Keeping the deepest dep down unwinds the chain dependents-first.
-  fx.pc.send(KernelCommand::Veto(TaskSelector::Id(c), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Veto, TaskSelector::Id(c), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("b", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("c", RecordedCmd::Stop));
@@ -1337,14 +1368,15 @@ async fn stop_of_required_task_bounces_it() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
   // The app still wants the dep, so the stop is a bounce: the dep is
   // stopped directly, the app breaks and recovers along the way. The
   // middle two land in one reconcile pass, so their order is not defined.
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(dep), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(dep), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
   let mut cmds = [fx.recv().await, fx.recv().await];
   cmds.sort();
@@ -1371,14 +1403,17 @@ async fn restart_of_dep_bounces_it_and_its_dependent() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
   // The dep is stopped directly; the dependent breaks and recovers once
   // the dep is ready again.
-  fx.pc
-    .send(KernelCommand::Restart(TaskSelector::Id(dep), None));
+  fx.pc.send(KernelCommand::Act(
+    Verb::Restart,
+    TaskSelector::Id(dep),
+    None,
+  ));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
   let mut cmds = [fx.recv().await, fx.recv().await];
   cmds.sort();
@@ -1405,12 +1440,15 @@ async fn restart_pins_like_start() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
 
-  fx.pc
-    .send(KernelCommand::Restart(TaskSelector::Id(dep), None));
+  fx.pc.send(KernelCommand::Act(
+    Verb::Restart,
+    TaskSelector::Id(dep),
+    None,
+  ));
   assert_eq!(fx.recv().await, ("dep", RecordedCmd::Stop));
   let mut cmds = [fx.recv().await, fx.recv().await];
   cmds.sort();
@@ -1444,13 +1482,16 @@ async fn stop_unpins_so_revival_is_temporary() {
   let handle = fx.run();
 
   // Pin a, then stop it: the stop also unpins.
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
   // Starting a dependent revives a, but only while b wants it.
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(b), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(b), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
 
@@ -1467,7 +1508,8 @@ async fn remove_of_running_task_hard_kills_it() {
   let a = fx.add("a", path_def("a"));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.pc.send(KernelCommand::Remove(TaskSelector::Id(a), None));
@@ -1494,7 +1536,8 @@ async fn dead_channel_task_is_marked_exited() {
   let handle = fx.run();
 
   // The driving future is gone; starting must not wedge in Starting.
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   fx.flush().await;
   assert_eq!(
     state_of(&fx.pc, a).await,
@@ -1517,10 +1560,12 @@ async fn unresponsive_task_is_killed_then_given_up() {
     });
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   fx.flush().await;
 
@@ -1551,12 +1596,14 @@ async fn stop_while_starting_stops_it() {
     });
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   // Still Starting: the stop must reach the task, not wait for it to
   // finish starting.
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   fx.flush().await;
   assert_eq!(state_of(&fx.pc, a).await, Some(TaskState::Idle));
@@ -1577,11 +1624,12 @@ async fn restart_while_starting_bounces_it() {
     });
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.pc
-    .send(KernelCommand::Restart(TaskSelector::Id(a), None));
+    .send(KernelCommand::Act(Verb::Restart, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
@@ -1601,14 +1649,17 @@ async fn start_during_stop_grace_survives_give_up() {
     });
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
   // Change of mind while the stop grace is running.
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   fx.flush().await;
   fx.assert_no_cmd();
 
@@ -1654,7 +1705,8 @@ async fn job_success_beats_stop_decided_in_same_step() {
   );
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(j), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(j), None));
   assert_eq!(fx.recv().await, ("d", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("j", RecordedCmd::Start));
   fx.flush().await;
@@ -1662,7 +1714,8 @@ async fn job_success_beats_stop_decided_in_same_step() {
   // Stopping the dep breaks j's support in the same step in which j's
   // success report is queued (j exits when it hears the dep stopping).
   // The success must win: j is Done, never commanded to stop.
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(d), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(d), None));
   assert_eq!(fx.recv().await, ("d", RecordedCmd::Stop));
   assert_eq!(
     state_of(&fx.pc, j).await,
@@ -1702,7 +1755,7 @@ async fn explain_reports_block_reason() {
   let handle = fx.run();
 
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(app), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
   let mut started = vec![fx.recv().await, fx.recv().await];
   started.sort();
   assert_eq!(
@@ -1780,7 +1833,8 @@ fn glob_selector_pins_exactly_the_matches() {
   let mut kernel = fx.kernel.take().unwrap();
 
   let n = turn_matching(&mut kernel, |ack| {
-    KernelCommand::Start(
+    KernelCommand::Act(
+      Verb::Start,
       TaskSelector::Glob(SpaceSelector::default_space(), "a".to_string()),
       ack,
     )
@@ -1791,7 +1845,8 @@ fn glob_selector_pins_exactly_the_matches() {
   assert!(!pinned(&kernel, b));
 
   let n = turn_matching(&mut kernel, |ack| {
-    KernelCommand::Start(
+    KernelCommand::Act(
+      Verb::Start,
       TaskSelector::Glob(SpaceSelector::default_space(), "*".to_string()),
       ack,
     )
@@ -1810,7 +1865,8 @@ fn tag_and_all_selectors() {
   let mut kernel = fx.kernel.take().unwrap();
 
   let n = turn_matching(&mut kernel, |ack| {
-    KernelCommand::Start(
+    KernelCommand::Act(
+      Verb::Start,
       TaskSelector::Tag(SpaceSelector::default_space(), "web".to_string()),
       ack,
     )
@@ -1828,7 +1884,8 @@ fn tag_and_all_selectors() {
   assert!(!pinned(&kernel, b));
 
   let n = turn_matching(&mut kernel, |ack| {
-    KernelCommand::Start(
+    KernelCommand::Act(
+      Verb::Start,
       TaskSelector::Tag(SpaceSelector::default_space(), "nope".to_string()),
       ack,
     )
@@ -1845,7 +1902,7 @@ fn id_selector_matches_only_a_live_task() {
   let mut kernel = fx.kernel.take().unwrap();
 
   let n = turn_matching(&mut kernel, |ack| {
-    KernelCommand::Start(TaskSelector::Id(a), ack)
+    KernelCommand::Act(Verb::Start, TaskSelector::Id(a), ack)
   });
   assert_eq!(n, 1);
   assert!(pinned(&kernel, a));
@@ -1855,7 +1912,7 @@ fn id_selector_matches_only_a_live_task() {
     KernelCommand::Remove(TaskSelector::Id(a), None),
   );
   let n = turn_matching(&mut kernel, |ack| {
-    KernelCommand::Start(TaskSelector::Id(a), ack)
+    KernelCommand::Act(Verb::Start, TaskSelector::Id(a), ack)
   });
   assert_eq!(n, 0);
   assert!(!pinned(&kernel, a));
@@ -1863,7 +1920,7 @@ fn id_selector_matches_only_a_live_task() {
   // Unlike bare `Start`, the selector never pre-pins an id that has
   // not registered yet.
   let n = turn_matching(&mut kernel, |ack| {
-    KernelCommand::Start(TaskSelector::Id(never_registered), ack)
+    KernelCommand::Act(Verb::Start, TaskSelector::Id(never_registered), ack)
   });
   assert_eq!(n, 0);
   assert!(!pinned(&kernel, never_registered));
@@ -1881,11 +1938,14 @@ fn commands_on_a_removed_id_leave_no_edges() {
     KernelCommand::Remove(TaskSelector::Id(a), None),
   );
 
-  turn(&mut kernel, KernelCommand::Start(TaskSelector::Id(a), None));
+  turn(
+    &mut kernel,
+    KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None),
+  );
   assert!(!pinned(&kernel, a));
   turn(
     &mut kernel,
-    KernelCommand::Restart(TaskSelector::Id(a), None),
+    KernelCommand::Act(Verb::Restart, TaskSelector::Id(a), None),
   );
   assert!(!pinned(&kernel, a));
 
@@ -1907,7 +1967,8 @@ async fn start_matching_tag_starts_the_tagged_tasks() {
   let handle = fx.run();
 
   let (tx, rx) = tokio::sync::oneshot::channel();
-  fx.pc.send(KernelCommand::Start(
+  fx.pc.send(KernelCommand::Act(
+    Verb::Start,
     TaskSelector::Tag(SpaceSelector::default_space(), "web".to_string()),
     Some(tx),
   ));
@@ -2024,7 +2085,11 @@ async fn reserved_task_controls_its_space() {
 
   pc.send(KernelCommand::Remove(TaskSelector::Id(provider), None));
   let (tx, rx) = tokio::sync::oneshot::channel();
-  pc.send(KernelCommand::Start(TaskSelector::Id(provider), Some(tx)));
+  pc.send(KernelCommand::Act(
+    Verb::Start,
+    TaskSelector::Id(provider),
+    Some(tx),
+  ));
   assert_eq!(rx.await.unwrap(), 0);
   assert_eq!(
     resolve_in(&pc, TaskSpaceId::dekit(), "console").await,
@@ -2061,18 +2126,22 @@ async fn active_watch_reports_transitions_only() {
   fx.flush().await;
   assert!(watch.try_recv().is_err(), "no report without a transition");
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(b), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(b), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
   assert_eq!(watch.recv().await, Some(true));
 
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   fx.flush().await;
   assert!(watch.try_recv().is_err(), "one task is still active");
 
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(b), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(b), None));
   assert_eq!(fx.recv().await, ("b", RecordedCmd::Stop));
   assert_eq!(watch.recv().await, Some(false));
 
@@ -2089,7 +2158,8 @@ async fn active_watch_sees_a_move() {
   let glob =
     TaskSelector::Glob(SpaceSelector::default_space(), "web/**".into());
   let mut watch = fx.pc.watch_active(glob);
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   assert_eq!(watch.recv().await, Some(true));
 
@@ -2208,7 +2278,8 @@ async fn freeze_defers_intent_until_thaw() {
   let a = fx.add("a", path_def("a"));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   let snapshot = freeze(&fx).await;
@@ -2232,7 +2303,8 @@ async fn second_freeze_is_refused_and_reports_still_apply() {
   let mut fx = Fixture::new();
   let a = fx.add("a", path_def("a"));
   let handle = fx.run();
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   let _first = freeze(&fx).await;
@@ -2270,7 +2342,8 @@ async fn freeze_is_refused_while_shutting_down() {
       Box::new(StubbornTask { name: "a", tx, ctx })
     });
   let handle = fx.run();
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   // The stubborn task keeps the quit in progress.
   fx.pc.send(KernelCommand::Quit);
@@ -2305,7 +2378,8 @@ async fn quit_saves_and_quit_without_save_does_not() {
     let a = fx.add("a", path_def("a"));
     let saves = count_saves(&mut fx);
     let handle = fx.run();
-    fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+    fx.pc
+      .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
     assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
     fx.pc.send(if save {
@@ -2339,7 +2413,8 @@ async fn quit_without_save_drops_a_save_under_way() {
     });
   let saves = count_saves(&mut fx);
   let handle = fx.run();
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   fx.pc.send(KernelCommand::Quit);
@@ -2439,7 +2514,8 @@ async fn thawed_intent_is_handled_one_message_at_a_time() {
 
   // Settled one message at a time, as without the freeze, the start
   // happens before the unpin undoes it.
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   fx.pc.send(KernelCommand::Unpin(TaskSelector::Id(a), None));
   fx.flush().await;
   fx.assert_no_cmd();
@@ -2463,7 +2539,8 @@ async fn stopping_task_keeps_its_deadline_in_the_snapshot() {
       Box::new(StubbornTask { name: "a", tx, ctx })
     });
   let handle = fx.run();
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   fx.pc.send(KernelCommand::Unpin(TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
@@ -2492,7 +2569,8 @@ async fn restore_rebuilds_graph_and_drives_only_what_changed() {
     },
   );
   let handle = fx.run();
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(b), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(b), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
   let snapshot = freeze(&fx).await;
@@ -2570,7 +2648,8 @@ async fn not_ready_in_time_stops_and_stays_exited() {
   let a = fx.add("a", ready_timeout_def("a", RestartMode::Never));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   fx.flush().await;
   assert_eq!(state_of(&fx.pc, a).await, Some(TaskState::Running));
@@ -2586,7 +2665,8 @@ async fn not_ready_in_time_stops_and_stays_exited() {
   fx.assert_no_cmd();
 
   // A start runs it again, with a fresh timeout.
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   fx.flush().await;
   assert_eq!(state_of(&fx.pc, a).await, Some(TaskState::Running));
@@ -2600,7 +2680,8 @@ async fn not_ready_in_time_backs_off_and_retries_on_failure() {
   let a = fx.add("a", ready_timeout_def("a", RestartMode::OnFailure));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   fx.flush().await;
 
@@ -2633,7 +2714,8 @@ async fn ready_in_time_is_not_failed() {
   let a = fx.add("a", ready_timeout_def("a", RestartMode::Never));
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   tokio::time::advance(Duration::from_secs(4)).await;
   fx.pc.send_msg(a, Report::Ready);
@@ -2659,14 +2741,16 @@ async fn start_during_a_failed_stop_brings_it_back() {
     });
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   tokio::time::advance(Duration::from_secs(5)).await;
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
 
   // Had the stop finished first, this start would revive the task; it
   // must do the same while the stop is still under way.
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   fx.flush().await;
   fx.assert_no_cmd();
   tokio::time::advance(STOP_TIMEOUT + Duration::from_millis(1)).await;
@@ -2691,7 +2775,8 @@ async fn failed_stop_that_gives_up_still_lands_as_failed() {
     });
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   tokio::time::advance(Duration::from_secs(5)).await;
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
@@ -2721,9 +2806,11 @@ async fn stop_timeout_is_per_task() {
   );
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
-  fx.pc.send(KernelCommand::Stop(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   fx.flush().await;
   tokio::time::advance(Duration::from_millis(1990)).await;
@@ -2756,7 +2843,8 @@ async fn snapshot_carries_the_ready_timeout_and_a_failed_start() {
   );
   let handle = fx.run();
 
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
   fx.flush().await;
   let snapshot = freeze(&fx).await;
@@ -2801,6 +2889,7 @@ fn saved_task(state: snap::TaskState) -> snap::Task {
     vetoed: false,
     killed: false,
     start_failed: false,
+    stop_timed_out: false,
     saved_pin: false,
     attempts: 0,
     last_start_secs_ago: Some(40),
@@ -2856,7 +2945,7 @@ fn restore_keeps_only_states_the_config_can_be_in() {
   };
   let left = Some(Duration::from_secs(4));
   use RestartMode::{Always, Never, OnFailure};
-  use TaskState::{Backoff, Done, Exited, Idle, Ready, Stopping};
+  use TaskState::{Backoff, Done, Exited, Idle, Ready, Running, Stopping};
   for (saved_state, start_failed, def, state, failed_after, timer) in [
     (Done(ok), false, job(Never), Done(ok), false, None),
     // The reported case: a done job that is now a service.
@@ -2901,8 +2990,10 @@ fn restore_keeps_only_states_the_config_can_be_in() {
     (Backoff(late), false, service(OnFailure), Idle, false, None),
     (Stopping, true, timed(Never), Stopping, true, left),
     (Stopping, true, service(Never), Stopping, false, left),
-    // A live job process is ready until it exits.
-    (Ready, false, job(Never), Ready, false, None),
+    // A live job process runs until it exits; an older runner had it
+    // ready.
+    (Ready, false, job(Never), Running, false, None),
+    (Running, false, job(Never), Running, false, None),
     // Only states with a timer arm one.
     (Idle, false, service(Never), Idle, false, None),
   ] {
@@ -3047,7 +3138,8 @@ async fn a_quit_during_a_save_is_answered() {
     });
   let _saves = count_saves(&mut fx);
   let handle = fx.run();
-  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
 
   let within = SAVE_TIMEOUT + STOP_TIMEOUT + KILL_WAIT;
@@ -3119,7 +3211,8 @@ fn autostart() -> TaskSelector {
 
 async fn up(fx: &Fixture) -> usize {
   let (tx, rx) = tokio::sync::oneshot::channel();
-  fx.pc.send(KernelCommand::Up(autostart(), Some(tx)));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Up, autostart(), Some(tx)));
   tokio::time::timeout(Duration::from_secs(1), rx)
     .await
     .expect("up not answered")
@@ -3192,7 +3285,8 @@ async fn start_by_tag_reruns_a_done_job() {
   fx.pc.send_msg(setup, Report::Stopped(ExitInfo::code(0)));
   assert_eq!(fx.recv().await, ("db", RecordedCmd::Start));
 
-  fx.pc.send(KernelCommand::Start(autostart(), None));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, autostart(), None));
   let mut cmds = vec![fx.recv().await, fx.recv().await];
   cmds.sort();
   assert_eq!(
@@ -3219,7 +3313,7 @@ fn up_retries_a_crashed_autostart_task() {
   };
   let backoff = add(&mut kernel, "backoff", RestartMode::OnFailure);
   let exited = add(&mut kernel, "exited", RestartMode::Never);
-  turn(&mut kernel, KernelCommand::Up(autostart(), None));
+  turn(&mut kernel, KernelCommand::Act(Verb::Up, autostart(), None));
   for id in [backoff, exited] {
     kernel.graph.on_task_stopped(id, ExitInfo::code(1));
   }
@@ -3234,7 +3328,7 @@ fn up_retries_a_crashed_autostart_task() {
   );
   kernel.graph.sent.clear();
 
-  turn(&mut kernel, KernelCommand::Up(autostart(), None));
+  turn(&mut kernel, KernelCommand::Act(Verb::Up, autostart(), None));
   for id in [backoff, exited] {
     assert!(kernel.graph.sent.contains(&(id, SentCmd::Start)), "{id:?}");
     assert_eq!(kernel.graph.tasks[&id].state, TaskState::Ready);
@@ -3263,7 +3357,7 @@ fn up_starts_saved_pins_once() {
   assert!(kernel.graph.explain(a).unwrap().saved_pin);
 
   let up = |kernel: &mut Kernel| {
-    turn_matching(kernel, |ack| KernelCommand::Up(autostart(), ack))
+    turn_matching(kernel, |ack| KernelCommand::Act(Verb::Up, autostart(), ack))
   };
   assert_eq!(up(&mut kernel), 3);
   for id in [a, b, auto] {
@@ -3273,7 +3367,10 @@ fn up_starts_saved_pins_once() {
   }
   assert_eq!(kernel.graph.tasks[&other].state, TaskState::Idle);
 
-  turn(&mut kernel, KernelCommand::Stop(TaskSelector::Id(a), None));
+  turn(
+    &mut kernel,
+    KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None),
+  );
   kernel.graph.sent.clear();
   assert_eq!(up(&mut kernel), 1);
   assert_eq!(kernel.graph.tasks[&a].state, TaskState::Idle);
@@ -3291,10 +3388,14 @@ fn a_stop_before_up_clears_the_saved_pin() {
     },
     |_| Box::new(crate::kernel::task::TargetTask),
   );
-  turn(&mut kernel, KernelCommand::Stop(TaskSelector::Id(a), None));
+  turn(
+    &mut kernel,
+    KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None),
+  );
   assert!(!kernel.graph.tasks[&a].saved_pin);
-  let matched =
-    turn_matching(&mut kernel, |ack| KernelCommand::Up(autostart(), ack));
+  let matched = turn_matching(&mut kernel, |ack| {
+    KernelCommand::Act(Verb::Up, autostart(), ack)
+  });
   assert_eq!(matched, 0);
   assert_eq!(kernel.graph.tasks[&a].state, TaskState::Idle);
   assert!(kernel.graph.sent.is_empty());
@@ -3366,7 +3467,7 @@ async fn an_update_while_getting_ready_applies_from_the_next_start() {
   );
   let handle = fx.run();
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(api), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(api), None));
   assert_eq!(fx.recv().await, ("api", RecordedCmd::Start));
 
   let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3380,8 +3481,11 @@ async fn an_update_while_getting_ready_applies_from_the_next_start() {
   fx.flush().await;
   assert_eq!(state_of(&fx.pc, api).await, Some(TaskState::Ready));
 
-  fx.pc
-    .send(KernelCommand::Restart(TaskSelector::Id(api), None));
+  fx.pc.send(KernelCommand::Act(
+    Verb::Restart,
+    TaskSelector::Id(api),
+    None,
+  ));
   assert_eq!(fx.recv().await, ("api", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("api", RecordedCmd::Start));
   fx.pc.send_msg(api, Report::Started);
@@ -3405,7 +3509,7 @@ async fn a_run_keeps_its_definition_through_an_update() {
   );
   let handle = fx.run();
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(api), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(api), None));
   assert_eq!(fx.recv().await, ("api", RecordedCmd::Start));
   fx.flush().await;
 
@@ -3430,8 +3534,11 @@ async fn a_run_keeps_its_definition_through_an_update() {
   );
   fx.pc.send(KernelCommand::Thaw);
 
-  fx.pc
-    .send(KernelCommand::Restart(TaskSelector::Id(api), None));
+  fx.pc.send(KernelCommand::Act(
+    Verb::Restart,
+    TaskSelector::Id(api),
+    None,
+  ));
   assert_eq!(fx.recv().await, ("api", RecordedCmd::Stop));
   assert_eq!(fx.recv().await, ("api", RecordedCmd::Start));
   fx.flush().await;
@@ -3529,8 +3636,11 @@ async fn a_running_job_edited_into_a_service_ends_as_a_job() {
     },
   );
   let handle = fx.run();
-  fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(migrate), None));
+  fx.pc.send(KernelCommand::Act(
+    Verb::Start,
+    TaskSelector::Id(migrate),
+    None,
+  ));
   assert_eq!(fx.recv().await, ("migrate", RecordedCmd::Start));
 
   let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3549,12 +3659,15 @@ async fn a_running_job_edited_into_a_service_ends_as_a_job() {
     Some(TaskState::Done(_))
   ));
 
-  fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(migrate), None));
+  fx.pc.send(KernelCommand::Act(
+    Verb::Start,
+    TaskSelector::Id(migrate),
+    None,
+  ));
   assert_eq!(fx.recv().await, ("migrate", RecordedCmd::Start));
   fx.flush().await;
   let tasks = described(&fx.pc).await;
-  assert_eq!(tasks[0].kind, TaskKind::Service);
+  assert_eq!(tasks[0].info.kind, TaskKind::Service);
 
   fx.quit(handle).await;
 }
@@ -3631,7 +3744,7 @@ async fn update_redefines_in_place_and_refuses_a_cycle() {
   assert_eq!(rx.await.unwrap(), Ok(1));
   let tasks = described(&fx.pc).await;
   let api_now = tasks.iter().find(|t| t.info.id == api).unwrap();
-  assert_eq!(api_now.kind, TaskKind::Job);
+  assert_eq!(api_now.info.kind, TaskKind::Job);
   assert_eq!(api_now.info.label.as_deref(), Some("API"));
   let spec = api_now.spec.as_ref().unwrap();
   assert_eq!(spec.deps(), ["cache"]);
@@ -3656,7 +3769,7 @@ async fn update_redefines_in_place_and_refuses_a_cycle() {
   assert!(matches!(rx.await.unwrap(), Err(RegisterError::DepCycle(_))));
   let tasks = described(&fx.pc).await;
   let cache_now = tasks.iter().find(|t| t.info.id == cache).unwrap();
-  assert_eq!(cache_now.kind, TaskKind::Service, "nothing changed");
+  assert_eq!(cache_now.info.kind, TaskKind::Service, "nothing changed");
   let names: Vec<String> = tasks.iter().map(|t| t.info.name()).collect();
   assert_eq!(names, ["db", "cache", "api"]);
 
@@ -3845,7 +3958,7 @@ async fn a_run_starts_where_the_task_is() {
   ));
   assert_eq!(rx.await.unwrap(), Ok(1));
   fx.pc
-    .send(KernelCommand::Start(TaskSelector::Id(api), None));
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(api), None));
   assert_eq!(told.recv().await.unwrap().as_deref(), Some("apps/web/api"));
   fx.quit(handle).await;
 }
@@ -4245,5 +4358,645 @@ async fn a_folder_moves_with_its_group() {
     ]
   );
   assert_eq!(fx.folder_paths().await, ["h/apps"]);
+  fx.quit(handle).await;
+}
+
+// ---- Waits ----
+
+/// The set a wait began with: its first event.
+async fn wait_set(events: &mut UnboundedReceiver<WaitEvent>) -> Vec<WaitTask> {
+  let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+    .await
+    .expect("the set in time")
+    .expect("the wait is open");
+  match event {
+    WaitEvent::Set(tasks) => tasks,
+    other => panic!("expected the set first, got {other:?}"),
+  }
+}
+
+/// Reads a wait's events up to its verdict.
+async fn verdict_of(
+  events: &mut UnboundedReceiver<WaitEvent>,
+) -> (WaitVerdict, Vec<WaitTask>) {
+  loop {
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+      .await
+      .expect("a verdict in time")
+      .expect("the wait reports its verdict");
+    if let WaitEvent::Done { verdict, tasks, .. } = event {
+      return (verdict, tasks);
+    }
+  }
+}
+
+/// No verdict has come yet.
+fn assert_waiting(events: &mut UnboundedReceiver<WaitEvent>) {
+  while let Ok(event) = events.try_recv() {
+    assert!(
+      !matches!(event, WaitEvent::Done { .. }),
+      "the wait ended early: {event:?}"
+    );
+  }
+}
+
+fn checked_def(path: &str) -> TaskDef {
+  TaskDef {
+    ready: ReadyMode::Reported { timeout: None },
+    ..path_def(path)
+  }
+}
+
+#[tokio::test]
+async fn ready_wait_follows_a_start_to_its_ready_report() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", checked_def("a"));
+  let handle = fx.run();
+
+  let mut events = fx.pc.wait(
+    WaitOn::Act(Verb::Start, TaskSelector::Id(a)),
+    WaitCond::Ready,
+  );
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  let set = wait_set(&mut events).await;
+  assert_eq!(set.len(), 1);
+  assert_eq!(set[0].mark, WaitMark::Pending);
+  assert_eq!(set[0].info.state, TaskState::Running);
+  fx.flush().await;
+  assert_waiting(&mut events);
+
+  fx.pc.send_msg(a, Report::Ready);
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Met);
+  assert_eq!(tasks[0].info.state, TaskState::Ready);
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn restart_wait_waits_for_the_new_run() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", checked_def("a"));
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  fx.pc.send_msg(a, Report::Ready);
+  fx.flush().await;
+  assert_eq!(state_of(&fx.pc, a).await, Some(TaskState::Ready));
+
+  // The old run is ready when the restart lands; only the new one counts.
+  let mut events = fx.pc.wait(
+    WaitOn::Act(Verb::Restart, TaskSelector::Id(a)),
+    WaitCond::Ready,
+  );
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  let set = wait_set(&mut events).await;
+  assert_eq!(set[0].mark, WaitMark::Pending);
+  fx.flush().await;
+  assert_waiting(&mut events);
+
+  fx.pc.send_msg(a, Report::Ready);
+  assert_eq!(verdict_of(&mut events).await.0, WaitVerdict::Met);
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn ready_wait_fails_naming_the_dep_at_the_root() {
+  let mut fx = Fixture::new();
+  let db = fx.add("db", checked_def("db"));
+  let migrate = fx.add(
+    "migrate",
+    TaskDef {
+      kind: TaskKind::Job,
+      deps: vec![TaskSelector::Id(db)],
+      ..path_def("migrate")
+    },
+  );
+  let app = fx.add(
+    "app",
+    TaskDef {
+      deps: vec![TaskSelector::Id(migrate)],
+      ..path_def("app")
+    },
+  );
+  let handle = fx.run();
+
+  let mut events = fx.pc.wait(
+    WaitOn::Act(Verb::Start, TaskSelector::Id(app)),
+    WaitCond::Ready,
+  );
+  assert_eq!(fx.recv().await, ("db", RecordedCmd::Start));
+  fx.flush().await;
+  assert_waiting(&mut events);
+
+  // The dep of a dep fails and won't be retried: the app can't get there.
+  fx.pc.send_msg(db, Report::Stopped(ExitInfo::code(1)));
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Failed);
+  assert_eq!(tasks[0].info.id, app);
+  assert_eq!(tasks[0].mark, WaitMark::Failed);
+  assert_eq!(tasks[0].blocked_by.as_deref(), Some("db"));
+  assert!(tasks[0].why.as_ref().is_some_and(|why| why.wanted));
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn ready_wait_rides_out_retries() {
+  let mut fx = Fixture::new();
+  let a = fx.add(
+    "a",
+    TaskDef {
+      restart: RestartMode::OnFailure,
+      ..checked_def("a")
+    },
+  );
+  let handle = fx.run();
+
+  let mut events = fx.pc.wait(
+    WaitOn::Act(Verb::Start, TaskSelector::Id(a)),
+    WaitCond::Ready,
+  );
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  fx.pc.send_msg(a, Report::Stopped(ExitInfo::code(1)));
+  fx.flush().await;
+  assert!(matches!(
+    state_of(&fx.pc, a).await,
+    Some(TaskState::Backoff(_))
+  ));
+  // dekit will start it again by itself: the wait goes on.
+  assert_waiting(&mut events);
+
+  tokio::time::advance(Duration::from_secs(1)).await;
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  fx.pc.send_msg(a, Report::Ready);
+  assert_eq!(verdict_of(&mut events).await.0, WaitVerdict::Met);
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn ready_wait_leaves_out_what_nobody_wants() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", path_def("a"));
+  let b = fx.add("b", path_def("b"));
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  fx.flush().await;
+
+  // `**` asks after what should run.
+  let mut events = fx
+    .pc
+    .wait(WaitOn::Matches(TaskSelector::all()), WaitCond::Ready);
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Met);
+  assert_eq!(tasks.iter().map(|t| t.info.id).collect::<Vec<_>>(), [a]);
+
+  // A set of tasks nobody wants stays whole, and fails saying so.
+  let mut events = fx
+    .pc
+    .wait(WaitOn::Matches(TaskSelector::Id(b)), WaitCond::Ready);
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Failed);
+  assert_eq!(tasks[0].info.id, b);
+  assert!(tasks[0].why.as_ref().is_some_and(|why| !why.wanted));
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn exit_wait_judges_the_last_run() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", path_def("a"));
+  let job = fx.add(
+    "job",
+    TaskDef {
+      kind: TaskKind::Job,
+      ..path_def("job")
+    },
+  );
+  let idle = fx.add("idle", path_def("idle"));
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(job), None));
+  assert_eq!(fx.recv().await, ("job", RecordedCmd::Start));
+  fx.flush().await;
+  // A job runs until it ends; it is never ready.
+  assert_eq!(state_of(&fx.pc, job).await, Some(TaskState::Running));
+
+  let mut failed = fx
+    .pc
+    .wait(WaitOn::Matches(TaskSelector::Id(a)), WaitCond::Exit);
+  let mut done = fx
+    .pc
+    .wait(WaitOn::Matches(TaskSelector::Id(job)), WaitCond::Exit);
+  // Nothing runs it, and nothing will: it is over already.
+  let mut never = fx
+    .pc
+    .wait(WaitOn::Matches(TaskSelector::Id(idle)), WaitCond::Exit);
+  assert_eq!(verdict_of(&mut never).await.0, WaitVerdict::Met);
+  fx.flush().await;
+  assert_waiting(&mut failed);
+  assert_waiting(&mut done);
+
+  fx.pc.send_msg(a, Report::Stopped(ExitInfo::code(2)));
+  let (verdict_a, tasks) = verdict_of(&mut failed).await;
+  assert_eq!(verdict_a, WaitVerdict::Failed);
+  assert_eq!(tasks[0].info.state, TaskState::Exited(ExitInfo::code(2)));
+  fx.pc.send_msg(job, Report::Stopped(ExitInfo::code(0)));
+  assert_eq!(verdict_of(&mut done).await.0, WaitVerdict::Met);
+
+  fx.quit(handle).await;
+}
+
+/// `dekit run x --dep db`: a task waiting on a dep that can still get
+/// ready has not finished.
+#[tokio::test]
+async fn exit_wait_holds_while_deps_can_still_get_ready() {
+  let mut fx = Fixture::new();
+  let db = fx.add("db", checked_def("db"));
+  let x = fx.add(
+    "x",
+    TaskDef {
+      deps: vec![TaskSelector::Id(db)],
+      ..path_def("x")
+    },
+  );
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(x), None));
+  assert_eq!(fx.recv().await, ("db", RecordedCmd::Start));
+  fx.flush().await;
+
+  let mut events = fx.pc.wait(WaitOn::Ids(vec![x]), WaitCond::Exit);
+  assert_eq!(wait_set(&mut events).await[0].info.state, TaskState::Idle);
+  fx.flush().await;
+  assert_waiting(&mut events);
+
+  fx.pc.send_msg(db, Report::Ready);
+  assert_eq!(fx.recv().await, ("x", RecordedCmd::Start));
+  fx.flush().await;
+  assert_waiting(&mut events);
+  fx.pc.send_msg(x, Report::Stopped(ExitInfo::code(0)));
+  assert_eq!(verdict_of(&mut events).await.0, WaitVerdict::Met);
+
+  fx.quit(handle).await;
+}
+
+/// Once a dep has failed for good, a task behind it never runs: its wait
+/// for exit is over, and failed, naming the dep.
+#[tokio::test]
+async fn exit_wait_fails_for_a_task_behind_a_failed_dep() {
+  let mut fx = Fixture::new();
+  let db = fx.add("db", checked_def("db"));
+  let y = fx.add(
+    "y",
+    TaskDef {
+      deps: vec![TaskSelector::Id(db)],
+      ..path_def("y")
+    },
+  );
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(y), None));
+  assert_eq!(fx.recv().await, ("db", RecordedCmd::Start));
+  fx.flush().await;
+
+  let mut events = fx.pc.wait(WaitOn::Ids(vec![y]), WaitCond::Exit);
+  wait_set(&mut events).await;
+  fx.flush().await;
+  assert_waiting(&mut events);
+
+  // `autorestart: never`: db is exited, and won't be retried.
+  fx.pc.send_msg(db, Report::Stopped(ExitInfo::code(1)));
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Failed);
+  assert_eq!(tasks[0].info.state, TaskState::Idle);
+  assert_eq!(tasks[0].blocked_by.as_deref(), Some("db"));
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn down_wait_fails_at_once_when_a_started_task_still_needs_it() {
+  let mut fx = Fixture::new();
+  let dep = fx.add("dep", path_def("dep"));
+  let app = fx.add(
+    "app",
+    TaskDef {
+      deps: vec![TaskSelector::Id(dep)],
+      ..path_def("app")
+    },
+  );
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(app), None));
+  assert_eq!(fx.recv().await, ("dep", RecordedCmd::Start));
+  assert_eq!(fx.recv().await, ("app", RecordedCmd::Start));
+
+  let mut events = fx.pc.wait(
+    WaitOn::Act(Verb::Stop, TaskSelector::Id(dep)),
+    WaitCond::Down,
+  );
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Failed);
+  let why = tasks[0].why.as_ref().expect("why it failed");
+  assert_eq!(why.required_by, ["app"]);
+
+  // Vetoed, it goes down after its dependent, and stays down.
+  let mut events = fx.pc.wait(
+    WaitOn::Act(Verb::Veto, TaskSelector::Id(dep)),
+    WaitCond::Down,
+  );
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Met);
+  assert_eq!(tasks[0].info.state, TaskState::Idle);
+  assert_eq!(state_of(&fx.pc, app).await, Some(TaskState::Idle));
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn down_wait_reports_the_last_run_without_judging_it() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", path_def("a"));
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  fx.pc.send_msg(a, Report::Stopped(ExitInfo::code(1)));
+  fx.flush().await;
+
+  // It crashed an hour ago; the stop of it is still a stop.
+  let mut events = fx
+    .pc
+    .wait(WaitOn::Act(Verb::Stop, TaskSelector::Id(a)), WaitCond::Down);
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Met);
+  assert_eq!(tasks[0].info.state, TaskState::Exited(ExitInfo::code(1)));
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_given_up_on_is_remembered_and_fails_a_down_wait() {
+  let mut fx = Fixture::new();
+  let tx = fx.tx.clone();
+  let a = fx
+    .kernel
+    .as_mut()
+    .unwrap()
+    .register_task(path_def("a"), move |ctx| {
+      Box::new(StubbornTask { name: "a", tx, ctx })
+    });
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+
+  let mut events = fx
+    .pc
+    .wait(WaitOn::Act(Verb::Stop, TaskSelector::Id(a)), WaitCond::Down);
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+  tokio::time::advance(STOP_TIMEOUT + Duration::from_millis(1)).await;
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Kill));
+  fx.flush().await;
+  assert_waiting(&mut events);
+
+  tokio::time::advance(KILL_WAIT + Duration::from_millis(1)).await;
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Failed);
+  assert_eq!(tasks[0].info.state, TaskState::Idle);
+  assert_eq!(tasks[0].info.reason, Some(StateReason::KillTimeout));
+  let listed = fx.pc.list_tasks(TaskSelector::Id(a)).await;
+  assert_eq!(listed[0].reason, Some(StateReason::KillTimeout));
+
+  // The next run clears it.
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  let listed = fx.pc.list_tasks(TaskSelector::Id(a)).await;
+  assert_eq!(listed[0].reason, None);
+
+  // It ignores this stop too; the quit would wait it out.
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+  tokio::time::advance(STOP_TIMEOUT + Duration::from_millis(1)).await;
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Kill));
+  tokio::time::advance(KILL_WAIT + Duration::from_millis(1)).await;
+  fx.flush().await;
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn removed_tasks_fail_a_ready_wait_and_meet_an_exit_wait() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", checked_def("a"));
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  fx.flush().await;
+
+  let mut ready = fx.pc.wait(WaitOn::Ids(vec![a]), WaitCond::Ready);
+  let mut exit = fx.pc.wait(WaitOn::Ids(vec![a]), WaitCond::Exit);
+  fx.flush().await;
+  assert_waiting(&mut ready);
+  assert_waiting(&mut exit);
+
+  fx.pc.send(KernelCommand::Remove(TaskSelector::Id(a), None));
+  let (verdict_ready, tasks) = verdict_of(&mut ready).await;
+  assert_eq!(verdict_ready, WaitVerdict::Failed);
+  assert!(tasks[0].removed);
+  assert_eq!(tasks[0].info.path.as_ref().map(|p| p.as_str()), Some("a"));
+  assert_eq!(verdict_of(&mut exit).await.0, WaitVerdict::Met);
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn up_wait_with_nothing_to_start_is_met() {
+  let mut fx = Fixture::new();
+  let _a = fx.add("a", path_def("a"));
+  let handle = fx.run();
+
+  let mut events = fx.pc.wait(
+    WaitOn::Act(Verb::Up, TaskSelector::Tag(SpaceSelector::Any, "x".into())),
+    WaitCond::Ready,
+  );
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Met);
+  assert!(tasks.is_empty());
+
+  fx.quit(handle).await;
+}
+
+/// The stop of a failed start ends the run only when `autorestart` won't
+/// try again; either way it says why.
+#[tokio::test]
+async fn a_failed_start_has_ended_only_when_it_wont_be_retried() {
+  use RestartMode::{Always, Never, OnFailure};
+  for (restart, ended) in [(Never, true), (OnFailure, false), (Always, false)] {
+    let mut kernel = Kernel::new();
+    let def = TaskDef {
+      ready: ReadyMode::Reported {
+        timeout: Some(Duration::from_secs(30)),
+      },
+      restart,
+      ..path_def("a")
+    };
+    let saved = snap::Task {
+      start_failed: true,
+      ..saved_task(snap::TaskState::Stopping {})
+    };
+    kernel
+      .graph
+      .register_task_with_id(
+        TaskId(1),
+        def,
+        Box::new(|_| Box::new(crate::kernel::task::TargetTask)),
+        Some(&saved),
+      )
+      .unwrap();
+    let task = &kernel.graph.tasks[&TaskId(1)];
+    assert!(task.start_failed, "{restart:?}");
+    assert_eq!(task.has_ended(), ended, "{restart:?}");
+    assert_eq!(
+      task.reason(),
+      Some(StateReason::ReadyTimeout),
+      "{restart:?}"
+    );
+  }
+}
+
+/// A job is never ready; a run of it that stayed up still ends the
+/// backoff, as a ready service's does.
+#[tokio::test]
+async fn a_job_that_ran_a_while_resets_its_backoff() {
+  let mut kernel = Kernel::new();
+  let def = TaskDef {
+    kind: TaskKind::Job,
+    restart: RestartMode::OnFailure,
+    ..path_def("a")
+  };
+  // Running for 40s, after three failed tries.
+  let saved = snap::Task {
+    attempts: 3,
+    ..saved_task(snap::TaskState::Running {})
+  };
+  kernel
+    .graph
+    .register_task_with_id(
+      TaskId(1),
+      def,
+      Box::new(|_| Box::new(crate::kernel::task::TargetTask)),
+      Some(&saved),
+    )
+    .unwrap();
+  assert_eq!(kernel.graph.tasks[&TaskId(1)].state, TaskState::Running);
+  kernel.graph.on_task_stopped(TaskId(1), ExitInfo::code(1));
+  let task = &kernel.graph.tasks[&TaskId(1)];
+  assert!(matches!(task.state, TaskState::Backoff(_)));
+  assert_eq!(task.attempts, 1, "the long run reset the count");
+}
+
+/// A task that stops being wanted without changing state (a veto of one
+/// waiting on its deps) is seen at once.
+#[tokio::test]
+async fn ready_wait_fails_when_a_waiting_task_is_vetoed() {
+  let mut fx = Fixture::new();
+  let db = fx.add("db", checked_def("db"));
+  let app = fx.add(
+    "app",
+    TaskDef {
+      deps: vec![TaskSelector::Id(db)],
+      ..path_def("app")
+    },
+  );
+  let handle = fx.run();
+  let mut events = fx.pc.wait(
+    WaitOn::Act(Verb::Start, TaskSelector::Id(app)),
+    WaitCond::Ready,
+  );
+  assert_eq!(fx.recv().await, ("db", RecordedCmd::Start));
+  fx.flush().await;
+  assert_waiting(&mut events);
+
+  fx.pc
+    .send(KernelCommand::Act(Verb::Veto, TaskSelector::Id(app), None));
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Failed);
+  assert_eq!(tasks[0].info.state, TaskState::Idle);
+  assert!(tasks[0].why.as_ref().is_some_and(|why| why.vetoed));
+
+  fx.quit(handle).await;
+}
+
+/// Editing a waiting task's deps changes no state, yet can leave it
+/// behind a dep that won't get ready: its wait hears of it at once.
+#[tokio::test]
+async fn ready_wait_fails_when_an_edit_leaves_it_behind_a_failed_dep() {
+  let mut fx = Fixture::new();
+  let db = fx.add("db", checked_def("db"));
+  let seed = fx.add(
+    "seed",
+    TaskDef {
+      kind: TaskKind::Job,
+      ..path_def("seed")
+    },
+  );
+  let app = fx.add(
+    "app",
+    TaskDef {
+      deps: vec![TaskSelector::Id(db)],
+      spec: Some(crate::spec::TaskSpec::with_cmd(vec!["app".into()])),
+      ..path_def("app")
+    },
+  );
+  let handle = fx.run();
+  // db stays wanted on its own, and seed has failed for good.
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(db), None));
+  assert_eq!(fx.recv().await, ("db", RecordedCmd::Start));
+  fx.pc.send(KernelCommand::Act(
+    Verb::Start,
+    TaskSelector::Id(seed),
+    None,
+  ));
+  assert_eq!(fx.recv().await, ("seed", RecordedCmd::Start));
+  fx.pc.send_msg(seed, Report::Stopped(ExitInfo::code(1)));
+  fx.flush().await;
+
+  let mut events = fx.pc.wait(
+    WaitOn::Act(Verb::Start, TaskSelector::Id(app)),
+    WaitCond::Ready,
+  );
+  wait_set(&mut events).await;
+  fx.flush().await;
+  assert_waiting(&mut events);
+
+  let mut edit = update(vec![TaskSelector::Id(seed)], "app");
+  edit.next.kind = TaskKind::Service;
+  // Only the deps change.
+  edit.tags = Vec::new();
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  fx.pc
+    .send(KernelCommand::Update(TaskSelector::Id(app), edit, tx));
+  assert_eq!(rx.await.unwrap(), Ok(1));
+  let (verdict, tasks) = verdict_of(&mut events).await;
+  assert_eq!(verdict, WaitVerdict::Failed);
+  assert_eq!(tasks[0].info.state, TaskState::Idle);
+  assert_eq!(tasks[0].blocked_by.as_deref(), Some("seed"));
+  assert!(tasks[0].why.is_some(), "the verdict says why");
+
   fx.quit(handle).await;
 }

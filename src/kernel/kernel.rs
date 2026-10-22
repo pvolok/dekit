@@ -16,15 +16,16 @@ use super::{
     DepExplain, DuplicateRequest, FolderDef, FolderInfo, FolderSettings,
     KernelCommand, KernelMessage, KernelQuery, MoveError, MoveTask, Place,
     RegisterError, Registration, SpaceSelector, TaskDescription, TaskExplain,
-    TaskInfo, TaskRegistration, TaskSelector, TaskUpdate, task_name,
+    TaskInfo, TaskRegistration, TaskSelector, TaskUpdate, Verb, WaitCond,
+    WaitEvent, WaitMark, WaitOn, WaitRequest, WaitTask, WaitVerdict, task_name,
   },
   namespace::Namespace,
   path_trie::PathConflict,
   sub_trie::SubMode,
   task::{
-    Effects, ExitInfo, INIT_TASK_ID, NextRun, ReadyMode, Run, STOP_TIMEOUT,
-    Task, TaskCmd, TaskDef, TaskEffect, TaskHandle, TaskId, TaskKind,
-    TaskNotification, TaskNotify, TaskState,
+    Effects, ExitInfo, INIT_TASK_ID, NextRun, Run, STOP_TIMEOUT, Task, TaskCmd,
+    TaskDef, TaskEffect, TaskHandle, TaskId, TaskKind, TaskNotification,
+    TaskNotify, TaskState,
   },
   task_key::{TaskKey, TaskSpaceId},
   task_path::TaskPath,
@@ -59,6 +60,26 @@ struct ActiveWatch {
   selector: TaskSelector,
   sender: UnboundedSender<bool>,
   active: bool,
+}
+
+/// A wait in progress: its set, fixed when it began, and how each task
+/// was last reported, so only changes go out.
+struct WaitWatch {
+  cond: WaitCond,
+  /// In list order.
+  ids: Vec<TaskId>,
+  /// How each task was last reported; filled once the `Set` event has
+  /// gone out.
+  last: HashMap<TaskId, WaitTask>,
+  begun: bool,
+  events: UnboundedSender<WaitEvent>,
+}
+
+/// Where a task of a wait stands: its mark, and whether it is gone.
+#[derive(Clone, Copy)]
+struct Standing {
+  mark: WaitMark,
+  removed: bool,
 }
 
 /// An upgrade freeze in progress: which tasks still owe their snapshot,
@@ -135,8 +156,10 @@ struct Graph {
   /// them one at a time, each against settled state.
   pending_effects: VecDeque<(TaskId, TaskEffect)>,
   active_watches: Vec<ActiveWatch>,
-  /// Set whenever a task is added, removed, moved, retagged or changes
-  /// state; watches only need re-checking then.
+  waits: Vec<WaitWatch>,
+  /// Set whenever a task is added, removed, moved, renamed, retagged, or
+  /// redefined, changes state, gains or loses an edge, or comes to be
+  /// wanted or not; watches and waits only need checking again then.
   state_changed: bool,
   frozen: Option<Frozen>,
   /// Freezes begun so far; numbers them.
@@ -172,6 +195,7 @@ impl Graph {
       timer_changes: Vec::new(),
       pending_effects: VecDeque::new(),
       active_watches: Vec::new(),
+      waits: Vec::new(),
       state_changed: false,
       frozen: None,
       freezes: 0,
@@ -240,6 +264,7 @@ impl Graph {
       wanted_parents: 0,
       active_dependents: 0,
       start_failed: false,
+      stop_timed_out: false,
       saved_pin: def.saved_pin,
       kind: def.kind,
       ready: def.ready,
@@ -275,10 +300,10 @@ impl Graph {
       // after a fresh start. An end state the config would not file its
       // exit as is dropped: the task has not ended as what it now is.
       handle.state = match state {
-        TaskState::Running => match handle.ready {
-          ReadyMode::Immediate => TaskState::Ready,
-          ReadyMode::Reported { .. } => TaskState::Running,
-        },
+        TaskState::Running => handle.started_state(),
+        // A job runs until it ends; an older runner had a running one
+        // ready.
+        TaskState::Ready if handle.kind == TaskKind::Job => TaskState::Running,
         TaskState::Backoff(info)
         | TaskState::Done(info)
         | TaskState::Exited(info) => {
@@ -292,6 +317,8 @@ impl Graph {
         | TaskState::Stopping => state,
       };
       handle.vetoed = saved.vetoed;
+      handle.stop_timed_out =
+        saved.stop_timed_out && handle.state == TaskState::Idle;
       handle.saved_pin = saved.saved_pin;
       handle.killed = saved.killed;
       // The verdict of a ready timeout the task no longer has is dropped:
@@ -691,10 +718,6 @@ impl Graph {
   }
 
   fn check_active_watches(&mut self) {
-    if !self.state_changed {
-      return;
-    }
-    self.state_changed = false;
     let mut watches = std::mem::take(&mut self.active_watches);
     watches.retain_mut(|watch| {
       let active = self.any_active(&watch.selector);
@@ -705,6 +728,341 @@ impl Graph {
       watch.sender.send(active).is_ok()
     });
     self.active_watches = watches;
+  }
+
+  /// Carries out `verb` on the selector's matches (for `up`, its set)
+  /// and returns the tasks it acted on.
+  fn act(
+    &mut self,
+    verb: Verb,
+    sender: TaskId,
+    selector: &TaskSelector,
+  ) -> Vec<TaskId> {
+    let ids = match verb {
+      Verb::Up => self.up_set(sender, selector),
+      Verb::Start
+      | Verb::Restart
+      | Verb::ForceRestart
+      | Verb::Stop
+      | Verb::Kill
+      | Verb::Veto => self.mutable_matching_ids(sender, selector),
+    };
+    for id in &ids {
+      match verb {
+        Verb::Up => self.cmd_up(*id),
+        Verb::Start => self.cmd_start(*id),
+        Verb::Restart => self.cmd_restart(*id),
+        Verb::ForceRestart => {
+          self.cmd_kill(*id);
+          self.cmd_start(*id);
+        }
+        Verb::Stop => self.cmd_stop(*id),
+        Verb::Kill => self.cmd_kill(*id),
+        Verb::Veto => self.cmd_veto(*id),
+      }
+    }
+    ids
+  }
+
+  // ---- Waits ----
+
+  /// Fixes a wait's set; it is first checked once this step settles, so
+  /// a verb it carries out is seen with what it brought about.
+  fn begin_wait(&mut self, sender: TaskId, request: WaitRequest) {
+    let WaitRequest { on, cond, events } = request;
+    let mut ids = match on {
+      WaitOn::Matches(selector) => {
+        let ids = self.matching_ids(&selector);
+        let wanted = |id: &TaskId| self.tasks.get(id).is_some_and(|t| t.wanted);
+        // `wait '**'` asks after what should run; a set of tasks nobody
+        // wants stays whole, so that it fails saying so.
+        if cond == WaitCond::Ready && ids.iter().any(wanted) {
+          ids.into_iter().filter(wanted).collect()
+        } else {
+          ids
+        }
+      }
+      WaitOn::Ids(ids) => ids,
+      WaitOn::Act(verb, selector) => self.act(verb, sender, &selector),
+    };
+    ids.sort_by_cached_key(|id| self.list_key(*id));
+    self.waits.push(WaitWatch {
+      cond,
+      ids,
+      last: HashMap::new(),
+      begun: false,
+      events,
+    });
+  }
+
+  /// Checks the waits against the settled graph: a new one always, the
+  /// others when the graph `changed`. One whose verdict is in, or whose
+  /// receiver is gone, ends.
+  fn check_waits(&mut self, changed: bool) {
+    if self.waits.is_empty() {
+      return;
+    }
+    let mut live = HashMap::new();
+    let mut waits = std::mem::take(&mut self.waits);
+    waits.retain_mut(|wait| {
+      if !changed && wait.begun {
+        return !wait.events.is_closed();
+      }
+      self.advance_wait(wait, &mut live)
+    });
+    self.waits = waits;
+  }
+
+  /// Reports what changed in the wait's set; false once it has ended.
+  fn advance_wait(
+    &self,
+    wait: &mut WaitWatch,
+    live: &mut HashMap<TaskId, bool>,
+  ) -> bool {
+    // Where each task stands, before anything is built for the client:
+    // most checks find nothing to report.
+    let standings: Vec<Standing> = wait
+      .ids
+      .iter()
+      .map(|id| self.wait_standing(wait.cond, *id, live))
+      .collect();
+    if !wait.begun {
+      wait.begun = true;
+      let tasks: Vec<WaitTask> = wait
+        .ids
+        .iter()
+        .zip(&standings)
+        .map(|(id, standing)| {
+          self.wait_task(wait.cond, *id, None, *standing, live)
+        })
+        .collect();
+      if wait.events.send(WaitEvent::Set(tasks.clone())).is_err() {
+        return false;
+      }
+      wait.last = tasks.into_iter().map(|t| (t.info.id, t)).collect();
+    } else {
+      for (id, standing) in wait.ids.iter().zip(&standings) {
+        let last = wait.last.get(id);
+        if last.is_some_and(|last| self.wait_task_same(last, *id, *standing)) {
+          continue;
+        }
+        let task = self.wait_task(wait.cond, *id, last, *standing, live);
+        if wait
+          .events
+          .send(WaitEvent::Changed(Box::new(task.clone())))
+          .is_err()
+        {
+          return false;
+        }
+        wait.last.insert(*id, task);
+      }
+    }
+    match wait_verdict(wait.cond, &standings) {
+      Some(verdict) => {
+        // The set as it ends, and why each failed task is (not) running.
+        let mut last = std::mem::take(&mut wait.last);
+        let mut tasks: Vec<WaitTask> = wait
+          .ids
+          .iter()
+          .zip(&standings)
+          .map(|(id, standing)| {
+            last.remove(id).unwrap_or_else(|| {
+              self.wait_task(wait.cond, *id, None, *standing, live)
+            })
+          })
+          .collect();
+        for task in &mut tasks {
+          if task.mark == WaitMark::Failed && !task.removed {
+            task.why = self.explain(task.info.id);
+          }
+        }
+        let quitting = self.quitting;
+        let _ = wait.events.send(WaitEvent::Done {
+          verdict,
+          tasks,
+          quitting,
+        });
+        false
+      }
+      None => !wait.events.is_closed(),
+    }
+  }
+
+  /// Where one task of a wait stands now.
+  fn wait_standing(
+    &self,
+    cond: WaitCond,
+    id: TaskId,
+    live: &mut HashMap<TaskId, bool>,
+  ) -> Standing {
+    let Some(task) = self.tasks.get(&id) else {
+      // A removed task never gets ready; it is no longer running either.
+      let mark = match cond {
+        WaitCond::Ready => WaitMark::Failed,
+        WaitCond::Exit | WaitCond::Down => WaitMark::Met,
+      };
+      return Standing {
+        mark,
+        removed: true,
+      };
+    };
+    let running = task.state.is_active();
+    let is_live = self.is_live(id, live);
+    let mark = match cond {
+      WaitCond::Ready if task.is_satisfied() => WaitMark::Met,
+      WaitCond::Ready if !is_live => WaitMark::Failed,
+      WaitCond::Ready => WaitMark::Pending,
+      WaitCond::Exit if running || is_live => WaitMark::Pending,
+      WaitCond::Exit if self.ended_badly(task) => WaitMark::Failed,
+      WaitCond::Exit => WaitMark::Met,
+      // It won't go down by itself: something wants it running.
+      WaitCond::Down if is_live => WaitMark::Failed,
+      WaitCond::Down if running => WaitMark::Pending,
+      WaitCond::Down if task.stop_timed_out => WaitMark::Failed,
+      WaitCond::Down => WaitMark::Met,
+    };
+    Standing {
+      mark,
+      removed: false,
+    }
+  }
+
+  /// Whether a task stands as it was last reported; a client hears of
+  /// it again only when it doesn't.
+  fn wait_task_same(
+    &self,
+    last: &WaitTask,
+    id: TaskId,
+    standing: Standing,
+  ) -> bool {
+    if last.mark != standing.mark || last.removed != standing.removed {
+      return false;
+    }
+    match self.tasks.get(&id) {
+      // A removed task's info is how it last was.
+      None => true,
+      Some(task) => {
+        last.info.state == task.state
+          && last.info.reason == task.reason()
+          && last.info.path == task.path
+          && last.info.label == task.label
+      }
+    }
+  }
+
+  /// One task of a wait as the client hears of it. A removed task keeps
+  /// the info it was `last` reported with.
+  fn wait_task(
+    &self,
+    cond: WaitCond,
+    id: TaskId,
+    last: Option<&WaitTask>,
+    standing: Standing,
+    live: &mut HashMap<TaskId, bool>,
+  ) -> WaitTask {
+    let Standing { mark, removed } = standing;
+    if removed {
+      let info = match last {
+        Some(last) => last.info.clone(),
+        None => TaskInfo {
+          id,
+          space: TaskSpaceId::default_space(),
+          path: None,
+          label: None,
+          kind: TaskKind::Service,
+          state: TaskState::Idle,
+          reason: None,
+          vt: None,
+        },
+      };
+      return WaitTask {
+        info,
+        mark,
+        blocked_by: None,
+        removed: true,
+        why: None,
+      };
+    }
+    let blocked_by = match cond {
+      WaitCond::Ready | WaitCond::Exit if mark == WaitMark::Failed => {
+        let root = self.dead_root(id, live);
+        (root != id).then(|| self.name(root))
+      }
+      WaitCond::Ready | WaitCond::Exit | WaitCond::Down => None,
+    };
+    WaitTask {
+      info: self.info(id).expect("task is there"),
+      mark,
+      blocked_by,
+      removed: false,
+      why: None,
+    }
+  }
+
+  /// How a task with no process, that won't start again by itself,
+  /// ended: badly when its run failed, its stop was given up on, or it
+  /// is wanted but held back by a dep that won't get ready.
+  fn ended_badly(&self, task: &TaskHandle) -> bool {
+    match task.state {
+      TaskState::Exited(info) | TaskState::Backoff(info) => !info.success(),
+      TaskState::Done(_) => false,
+      TaskState::Idle => task.stop_timed_out || task.wanted,
+      TaskState::Starting
+      | TaskState::Running
+      | TaskState::Ready
+      | TaskState::Stopping => false,
+    }
+  }
+
+  /// Whether the kernel will run the task, or keep it running, without
+  /// anyone acting: it is wanted, its run hasn't ended, and each dep is
+  /// satisfied or live itself. A task in backoff is live: it will be
+  /// started again. `memo` holds the answers of one check.
+  fn is_live(&self, id: TaskId, memo: &mut HashMap<TaskId, bool>) -> bool {
+    if let Some(live) = memo.get(&id) {
+      return *live;
+    }
+    let live = self.tasks.get(&id).is_some_and(|task| {
+      task.wanted
+        && !task.has_ended()
+        && self.edges.get(&id).is_none_or(|deps| {
+          deps.iter().all(|dep| {
+            self.tasks.get(dep).is_some_and(|t| t.is_satisfied())
+              || self.is_live(*dep, memo)
+          })
+        })
+    });
+    memo.insert(id, live);
+    live
+  }
+
+  /// The task at the root of why `id` is not live: itself, when nothing
+  /// wants it or its run has ended, else the first dep in list order
+  /// that is neither satisfied nor live, followed down.
+  fn dead_root(&self, id: TaskId, memo: &mut HashMap<TaskId, bool>) -> TaskId {
+    let Some(task) = self.tasks.get(&id) else {
+      return id;
+    };
+    if !task.wanted || task.has_ended() {
+      return id;
+    }
+    let mut deps: Vec<TaskId> =
+      self.edges.get(&id).into_iter().flatten().copied().collect();
+    deps.sort_by_cached_key(|dep| self.list_key(*dep));
+    for dep in deps {
+      let satisfied = self.tasks.get(&dep).is_some_and(|t| t.is_satisfied());
+      if !satisfied && !self.is_live(dep, memo) {
+        return self.dead_root(dep, memo);
+      }
+    }
+    id
+  }
+
+  fn name(&self, id: TaskId) -> String {
+    match self.tasks.get(&id) {
+      Some(task) => task_name(id, &task.space, task.path.as_ref()),
+      None => task_name(id, &TaskSpaceId::default_space(), None),
+    }
   }
 
   // ---- Intent ----
@@ -745,7 +1103,11 @@ impl Graph {
       };
       // Had the failed start's stop already landed, this demand would
       // revive the task; so it lands in Idle instead.
-      task.start_failed = false;
+      if task.start_failed {
+        task.start_failed = false;
+        // It is no longer a run that has ended.
+        self.state_changed = true;
+      }
       let state = task.state;
       self.set_vetoed(id, false);
       let revive = match state {
@@ -841,6 +1203,8 @@ impl Graph {
     }
     if self.edges.entry(from).or_default().insert(to) {
       self.redges.entry(to).or_default().insert(from);
+      // Whether `from` is live turns on its deps.
+      self.state_changed = true;
       let parent_wanted =
         from == INIT_TASK_ID || self.tasks.get(&from).is_some_and(|t| t.wanted);
       let parent_active = from != INIT_TASK_ID
@@ -872,6 +1236,7 @@ impl Graph {
       None => false,
     };
     if removed {
+      self.state_changed = true;
       if let Some(set) = self.redges.get_mut(&to) {
         set.remove(&from);
         if set.is_empty() {
@@ -986,6 +1351,8 @@ impl Graph {
     let new_wanted = self.compute_wanted(id);
     if self.tasks[&id].wanted != new_wanted {
       self.tasks.get_mut(&id).unwrap().wanted = new_wanted;
+      // Whether a task is live turns on it.
+      self.state_changed = true;
       // Children count this task among their wanted parents.
       if let Some(deps) = self.edges.get(&id) {
         let deps: Vec<TaskId> = deps.iter().copied().collect();
@@ -1297,7 +1664,17 @@ impl Graph {
           // still wanted (a Start during the grace must not be lost). The
           // real process may be leaked.
           log::warn!("Task {:?} did not stop after kill; giving up", task_id);
+          let start_failed = task.start_failed;
           self.land_stop(task_id, ExitInfo::error());
+          // Remembered until the next state change, so that `ls` and a
+          // wait on it don't take the stop for a clean one.
+          if !start_failed
+            && let Some(task) = self.tasks.get_mut(&task_id)
+            && task.state == TaskState::Idle
+          {
+            task.stop_timed_out = true;
+            self.state_changed = true;
+          }
         } else {
           // The stop was ignored for the whole grace period: hard-kill.
           self.hard_kill(task_id);
@@ -1324,15 +1701,16 @@ impl Graph {
       return;
     };
     match task.state {
-      TaskState::Starting => match task.ready {
-        ReadyMode::Immediate => self.set_state(task_id, TaskState::Ready),
-        ReadyMode::Reported { timeout } => {
-          self.set_state(task_id, TaskState::Running);
-          if let Some(timeout) = timeout {
-            self.schedule_state_timeout(task_id, timeout);
-          }
+      TaskState::Starting => {
+        let state = task.started_state();
+        let timeout = task.ready.timeout();
+        self.set_state(task_id, state);
+        if state == TaskState::Running
+          && let Some(timeout) = timeout
+        {
+          self.schedule_state_timeout(task_id, timeout);
         }
-      },
+      }
       TaskState::Idle
       | TaskState::Running
       | TaskState::Ready
@@ -1371,12 +1749,11 @@ impl Graph {
     match task.state {
       TaskState::Stopping => self.land_stop(task_id, info),
       TaskState::Starting | TaskState::Running | TaskState::Ready => {
-        // Only a start that got ready and stayed up ends the backoff; one
-        // that never got ready counts, however long it ran.
+        // Only a start that got up (ready, or running for a job) and
+        // stayed up ends the backoff; one that never got ready counts,
+        // however long it ran.
         let uptime = task.last_start.map(|t| now.duration_since(t));
-        if task.state == TaskState::Ready
-          && uptime.is_some_and(|t| t > BACKOFF_RESET)
-        {
+        if task.is_up() && uptime.is_some_and(|t| t > BACKOFF_RESET) {
           task.attempts = 0;
         }
         self.land_exit(task_id, info);
@@ -1451,6 +1828,7 @@ impl Graph {
     task.epoch += 1;
     task.killed = false;
     task.start_failed = false;
+    task.stop_timed_out = false;
     // The epoch bump ended whatever timer was running.
     if task.deadline.take().is_some() {
       self.timer_changes.push(task_id);
@@ -1567,6 +1945,7 @@ impl Graph {
       spec.set_label(label.as_deref());
     }
     task.label = label;
+    self.state_changed = true;
     self.notify_changed(task_id);
   }
 
@@ -1668,6 +2047,8 @@ impl Graph {
     // What happens around its runs follows at once.
     task.restart = update.restart;
     task.label = update.label.clone();
+    // Its restart mode and kind decide whether its run has ended.
+    self.state_changed = true;
     self.set_tags(task_id, update.tags.clone());
     let old: Vec<TaskId> = self
       .edges
@@ -1863,17 +2244,23 @@ impl Graph {
   fn describe(&self, task_id: TaskId) -> Option<TaskDescription> {
     let task = self.tasks.get(&task_id)?;
     Some(TaskDescription {
-      info: TaskInfo {
-        id: task_id,
-        space: task.space.clone(),
-        path: task.path.clone(),
-        label: task.label.clone(),
-        state: task.state,
-        vt: task.vt.clone(),
-      },
-      kind: task.kind,
+      info: self.info(task_id)?,
       spec: self.def_spec(task_id),
       origin: task.origin.clone(),
+    })
+  }
+
+  fn info(&self, id: TaskId) -> Option<TaskInfo> {
+    let task = self.tasks.get(&id)?;
+    Some(TaskInfo {
+      id,
+      space: task.space.clone(),
+      path: task.path.clone(),
+      label: task.label.clone(),
+      kind: task.kind,
+      state: task.state,
+      reason: task.reason(),
+      vt: task.vt.clone(),
     })
   }
 
@@ -1907,16 +2294,7 @@ impl Graph {
     let mut tasks: Vec<TaskInfo> = self
       .matching_ids(selector)
       .into_iter()
-      .filter_map(|id| {
-        self.tasks.get(&id).map(|handle| TaskInfo {
-          id,
-          space: handle.space.clone(),
-          path: handle.path.clone(),
-          label: handle.label.clone(),
-          state: handle.state,
-          vt: handle.vt.clone(),
-        })
-      })
+      .filter_map(|id| self.info(id))
       .collect();
     tasks.sort_by_cached_key(|task| self.list_key(task.id));
     tasks
@@ -1992,10 +2370,7 @@ impl Graph {
 
   fn explain(&self, task_id: TaskId) -> Option<TaskExplain> {
     let task = self.tasks.get(&task_id)?;
-    let name = |id: TaskId| match self.tasks.get(&id) {
-      Some(t) => task_name(id, &t.space, t.path.as_ref()),
-      None => task_name(id, &TaskSpaceId::default_space(), None),
-    };
+    let name = |id: TaskId| self.name(id);
     let pinned = self
       .redges
       .get(&task_id)
@@ -2025,6 +2400,7 @@ impl Graph {
         DepExplain {
           name: name(dep),
           state: task.map_or(TaskState::Idle, |t| t.state),
+          reason: task.and_then(|t| t.reason()),
           wanted: task.is_some_and(|t| t.wanted),
           satisfied: task.is_some_and(|t| t.is_satisfied()),
         }
@@ -2034,6 +2410,7 @@ impl Graph {
       id: task_id,
       name: name(task_id),
       state: task.state,
+      reason: task.reason(),
       wanted: task.wanted,
       supported: task.supported,
       vetoed: task.vetoed,
@@ -2268,6 +2645,7 @@ impl Graph {
         vetoed: task.vetoed,
         killed: task.killed,
         start_failed: task.start_failed,
+        stop_timed_out: task.stop_timed_out,
         saved_pin: task.saved_pin,
         attempts: task.attempts,
         last_start_secs_ago: task
@@ -2351,6 +2729,20 @@ impl Graph {
         self.queue_effects(listener_id, &mut fx);
       }
     }
+  }
+}
+
+/// A wait's verdict, once it is in: `ready` and `down` fail as soon as a
+/// task fails, and are met once every task is; `exit` waits for every
+/// task, then fails if any of them did.
+fn wait_verdict(cond: WaitCond, standings: &[Standing]) -> Option<WaitVerdict> {
+  let any = |mark| standings.iter().any(|standing| standing.mark == mark);
+  let (failed, pending) = (any(WaitMark::Failed), any(WaitMark::Pending));
+  match cond {
+    WaitCond::Ready | WaitCond::Down if failed => Some(WaitVerdict::Failed),
+    _ if pending => None,
+    _ if failed => Some(WaitVerdict::Failed),
+    _ => Some(WaitVerdict::Met),
   }
 }
 
@@ -2564,7 +2956,11 @@ impl Kernel {
       return;
     }
     self.graph.settle();
-    self.graph.check_active_watches();
+    let changed = std::mem::take(&mut self.graph.state_changed);
+    if changed {
+      self.graph.check_active_watches();
+    }
+    self.graph.check_waits(changed);
     timers.update(&mut self.graph);
   }
 
@@ -2602,14 +2998,8 @@ impl Kernel {
       | KernelCommand::QuitWithin { .. }
       | KernelCommand::RegisterTask(..)
       | KernelCommand::RegisterTasks(..)
-      | KernelCommand::Start(..)
-      | KernelCommand::Stop(..)
-      | KernelCommand::Kill(..)
-      | KernelCommand::Restart(..)
-      | KernelCommand::ForceRestart(..)
+      | KernelCommand::Act(..)
       | KernelCommand::Unpin(..)
-      | KernelCommand::Up(..)
-      | KernelCommand::Veto(..)
       | KernelCommand::Remove(..)
       | KernelCommand::DropFolder(..)
       | KernelCommand::SetFolder(..)
@@ -2622,6 +3012,7 @@ impl Kernel {
       | KernelCommand::SubscribePath(..)
       | KernelCommand::UnsubscribePath(..)
       | KernelCommand::WatchActive(..)
+      | KernelCommand::Wait(..)
       | KernelCommand::StateTimeout(..) => {
         frozen.deferred.push(msg);
         return false;
@@ -2727,57 +3118,8 @@ impl Kernel {
           .collect();
         let _ = ack.send(results);
       }
-      KernelCommand::Start(selector, ack) => {
-        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
-        for id in &ids {
-          self.graph.cmd_start(*id);
-        }
-        if let Some(ack) = ack {
-          let _ = ack.send(ids.len());
-        }
-      }
-      KernelCommand::Up(selector, ack) => {
-        let ids = self.graph.up_set(msg.from, &selector);
-        for id in &ids {
-          self.graph.cmd_up(*id);
-        }
-        if let Some(ack) = ack {
-          let _ = ack.send(ids.len());
-        }
-      }
-      KernelCommand::Stop(selector, ack) => {
-        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
-        for id in &ids {
-          self.graph.cmd_stop(*id);
-        }
-        if let Some(ack) = ack {
-          let _ = ack.send(ids.len());
-        }
-      }
-      KernelCommand::Kill(selector, ack) => {
-        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
-        for id in &ids {
-          self.graph.cmd_kill(*id);
-        }
-        if let Some(ack) = ack {
-          let _ = ack.send(ids.len());
-        }
-      }
-      KernelCommand::Restart(selector, ack) => {
-        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
-        for id in &ids {
-          self.graph.cmd_restart(*id);
-        }
-        if let Some(ack) = ack {
-          let _ = ack.send(ids.len());
-        }
-      }
-      KernelCommand::ForceRestart(selector, ack) => {
-        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
-        for id in &ids {
-          self.graph.cmd_kill(*id);
-          self.graph.cmd_start(*id);
-        }
+      KernelCommand::Act(verb, selector, ack) => {
+        let ids = self.graph.act(verb, msg.from, &selector);
         if let Some(ack) = ack {
           let _ = ack.send(ids.len());
         }
@@ -2786,15 +3128,6 @@ impl Kernel {
         let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
           self.graph.set_pin(*id, false);
-        }
-        if let Some(ack) = ack {
-          let _ = ack.send(ids.len());
-        }
-      }
-      KernelCommand::Veto(selector, ack) => {
-        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
-        for id in &ids {
-          self.graph.cmd_veto(*id);
         }
         if let Some(ack) = ack {
           let _ = ack.send(ids.len());
@@ -2921,6 +3254,7 @@ impl Kernel {
       KernelCommand::WatchActive(selector, sender) => {
         self.graph.watch_active(selector, sender);
       }
+      KernelCommand::Wait(request) => self.graph.begin_wait(msg.from, *request),
 
       KernelCommand::Freeze(reply) => self.graph.begin_freeze(reply),
       KernelCommand::TaskFrozen(number, snapshot) => {

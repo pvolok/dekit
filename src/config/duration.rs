@@ -6,7 +6,7 @@ use crate::cfg::{CfgCx, CfgNode, FromCfg};
 
 /// The longest duration a config may set, so a deadline built from it
 /// can't overflow.
-const MAX: Duration = Duration::from_secs(24 * 3600);
+pub const MAX: Duration = Duration::from_secs(24 * 3600);
 
 /// `500ms`, `10s`, `2m`, `1h`: a positive whole number and a unit, at
 /// most 24h.

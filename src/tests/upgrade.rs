@@ -365,3 +365,27 @@ async fn send_key(sender: &mut ConnSender, spec: &str) {
     .await
     .unwrap();
 }
+
+/// A `wait` in flight is carried across: the client keeps its
+/// connection, and the verdict comes from the new image.
+#[test]
+fn a_wait_survives_the_upgrade() {
+  let runner = TestRunner::new("uw");
+  runner
+    .yaml("tasks:\n  gate:\n    cmd: [sleep, '60']\n    ready: {file: go}\n");
+  runner.start_runner();
+  let waiting =
+    runner.spawn(&["start", "gate", "--wait", "--wait-timeout", "30s"]);
+  wait_until("gate running", || {
+    task_line(&runner, "gate").contains("running")
+  });
+
+  let out = runner.upgrade();
+  assert!(out.status.success(), "upgrade: {}", stderr(&out));
+  std::fs::write(runner.work.path.join("go"), "").unwrap();
+
+  let out = waiting.wait_with_output().unwrap();
+  assert!(out.status.success(), "wait: {}", stderr(&out));
+  assert!(task_line(&runner, "gate").contains("ready"));
+  runner.stop();
+}

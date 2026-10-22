@@ -19,6 +19,7 @@ use crate::{
       Connections, Resumed, ServerCtx, dispatch_connection,
       hello_from_snapshot, init_logging, runner_handle, serve,
     },
+    wait::{CarriedWait, WaitConn, resume_wait_session},
   },
   kernel::{
     kernel::Kernel,
@@ -145,6 +146,17 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
       } => Box::pin(resume_session(
         ctx, reg, fd, hello, task, attach, sender, receiver,
       )),
+      Carried::Wait { hello, wait } => Box::pin(resume_wait_session(
+        ctx,
+        WaitConn {
+          reg,
+          fd,
+          hello,
+          sender,
+          receiver,
+        },
+        wait,
+      )),
     });
   }
 
@@ -270,6 +282,10 @@ enum Carried {
     task: TaskId,
     attach: Attachment,
   },
+  Wait {
+    hello: Hello,
+    wait: CarriedWait,
+  },
 }
 
 fn prepare<'a>(
@@ -350,6 +366,20 @@ fn prepare<'a>(
         hello,
         pending_upgrade: *pending_upgrade,
       }),
+      snap::ConnectionKind::Wait {
+        tasks,
+        cond,
+        timeout_ms,
+      } => Carried::Wait {
+        hello: hello.ok_or_else(|| {
+          anyhow::anyhow!("wait connection {} has no hello", conn.fd)
+        })?,
+        wait: CarriedWait {
+          ids: tasks.iter().copied().map(TaskId).collect(),
+          cond: (*cond).into(),
+          timeout: timeout_ms.map(std::time::Duration::from_millis),
+        },
+      },
       snap::ConnectionKind::Attach {
         task,
         width,

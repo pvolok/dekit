@@ -11,7 +11,7 @@ use proptest::prelude::*;
 
 use super::{Graph, Kernel, SentCmd};
 use crate::kernel::kernel_message::{
-  KernelCommand, KernelMessage, SpaceSelector, TaskSelector,
+  KernelCommand, KernelMessage, SpaceSelector, TaskSelector, Verb,
 };
 use crate::kernel::sub_trie::SubMode;
 use crate::kernel::task::{
@@ -510,13 +510,13 @@ impl Run {
     let selector = self.to_selector(world, sel);
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     let command = match intent {
-      Intent::Start => KernelCommand::Start(selector, Some(tx)),
-      Intent::Up => KernelCommand::Up(selector, Some(tx)),
-      Intent::Stop => KernelCommand::Stop(selector, Some(tx)),
-      Intent::Kill => KernelCommand::Kill(selector, Some(tx)),
-      Intent::Restart => KernelCommand::Restart(selector, Some(tx)),
+      Intent::Start => KernelCommand::Act(Verb::Start, selector, Some(tx)),
+      Intent::Up => KernelCommand::Act(Verb::Up, selector, Some(tx)),
+      Intent::Stop => KernelCommand::Act(Verb::Stop, selector, Some(tx)),
+      Intent::Kill => KernelCommand::Act(Verb::Kill, selector, Some(tx)),
+      Intent::Restart => KernelCommand::Act(Verb::Restart, selector, Some(tx)),
       Intent::Unpin => KernelCommand::Unpin(selector, Some(tx)),
-      Intent::Veto => KernelCommand::Veto(selector, Some(tx)),
+      Intent::Veto => KernelCommand::Act(Verb::Veto, selector, Some(tx)),
     };
     let sent = self.turn(INIT_TASK_ID, command);
     assert_eq!(

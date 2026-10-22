@@ -7,7 +7,7 @@ use crate::{
   config::{config::Config, task::AUTOSTART_TAG},
   kernel::kernel_message::{
     Ack, DuplicateRequest, KernelCommand, MoveError, MoveTask, Place,
-    RegisterError, TaskContext, TaskSelector,
+    RegisterError, TaskContext, TaskSelector, Verb,
   },
   spec::{Source, TaskSpec},
   target::Target,
@@ -127,6 +127,31 @@ pub enum Command {
 }
 
 impl Command {
+  /// The verb a wait can carry out for it, with its target: for `up`,
+  /// the autostart tasks (the kernel adds the saved pins).
+  pub fn verb(&self) -> Option<(Verb, Target)> {
+    let (verb, target) = match self {
+      Command::Up => (Verb::Up, Target::tag(AUTOSTART_TAG)),
+      Command::Start { target } => (Verb::Start, target.clone()),
+      Command::Restart { target } => (Verb::Restart, target.clone()),
+      Command::ForceRestart { target } => (Verb::ForceRestart, target.clone()),
+      Command::Stop { target } => (Verb::Stop, target.clone()),
+      Command::Kill { target } => (Verb::Kill, target.clone()),
+      Command::Veto { target } => (Verb::Veto, target.clone()),
+      Command::Batch { .. }
+      | Command::Down
+      | Command::Quit
+      | Command::Add { .. }
+      | Command::Update { .. }
+      | Command::Move { .. }
+      | Command::Remove { .. }
+      | Command::Rename { .. }
+      | Command::Duplicate { .. }
+      | Command::SetOrigin { .. } => return None,
+    };
+    Some((verb, target))
+  }
+
   /// Whether it starts a runner where none is up: what it does needs one
   /// running. Stopping or removing does not.
   pub fn starts_runner(&self) -> bool {
@@ -354,30 +379,21 @@ fn dispatch(
     }
     Command::Down => quit(pc, true, pending, acks),
     Command::Quit => quit(pc, false, pending, acks),
-    Command::Up => act(
-      pc,
-      &Target::tag(AUTOSTART_TAG),
-      KernelCommand::Up,
-      pending,
-      acks,
-    )?,
-    Command::Start { target } => {
-      act(pc, target, KernelCommand::Start, pending, acks)?
-    }
-    Command::Stop { target } => {
-      act(pc, target, KernelCommand::Stop, pending, acks)?
-    }
-    Command::Kill { target } => {
-      act(pc, target, KernelCommand::Kill, pending, acks)?
-    }
-    Command::Veto { target } => {
-      act(pc, target, KernelCommand::Veto, pending, acks)?
-    }
-    Command::Restart { target } => {
-      act(pc, target, KernelCommand::Restart, pending, acks)?
-    }
-    Command::ForceRestart { target } => {
-      act(pc, target, KernelCommand::ForceRestart, pending, acks)?
+    Command::Up
+    | Command::Start { .. }
+    | Command::Stop { .. }
+    | Command::Kill { .. }
+    | Command::Veto { .. }
+    | Command::Restart { .. }
+    | Command::ForceRestart { .. } => {
+      let (verb, target) = command.verb().expect("a verb");
+      act(
+        pc,
+        &target,
+        |selector, ack| KernelCommand::Act(verb, selector, ack),
+        pending,
+        acks,
+      )?
     }
     Command::Remove { target } => {
       act(pc, target, KernelCommand::Remove, pending, acks)?

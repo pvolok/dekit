@@ -72,6 +72,13 @@ declare const std: {
     remove(target: string): Promise<number>;
     /** Register a process task at an exact path with the given argv and start it. */
     add(path: string, cmd: string[]): Promise<number>;
+    /** Wait until the matching tasks are ready (done, for a job), or with
+     *  `for: "exit"` until they have exited and won't start again by
+     *  themselves. Resolves with the result when that is met; rejects on a
+     *  failure or after `timeoutMs` with an error whose `result` is it. A
+     *  verb followed by `wait` waits for the run the verb began. A script
+     *  must not wait on itself, as a job script waiting on `**` would. */
+    wait(target: string, opts?: WaitOptions): Promise<WaitResult>;
   };
 
   /** Environment variable access. */
@@ -234,3 +241,58 @@ declare const std: {
     ): void;
   };
 };
+
+interface WaitOptions {
+  /** `"ready"` (the default) or `"exit"`. */
+  for?: "ready" | "exit";
+  /** Give up after this many milliseconds, at most a day; 0 checks once. */
+  timeoutMs?: number;
+}
+
+/** How a wait ended, as `dekit wait --json` prints it. */
+interface WaitResult {
+  wait: "met" | "failed" | "timeout";
+  /** The runner is stopping, so nothing is wanted any more. */
+  quitting?: boolean;
+  tasks: {
+    id: number;
+    path: string;
+    label?: string;
+    kind?: "service" | "job";
+    state: string;
+    exit_code?: number;
+    signal?: number;
+    reason?: string;
+    wait: "pending" | "met" | "failed";
+    blocked_by?: string;
+    removed?: boolean;
+    /** Why a failed task is (not) running, as `dekit why --json` prints
+     *  it. */
+    why?: WaitWhy;
+  }[];
+}
+
+interface WaitWhy {
+  id: number;
+  path: string;
+  state: string;
+  exit_code?: number;
+  signal?: number;
+  reason?: string;
+  wanted: boolean;
+  supported: boolean;
+  vetoed: boolean;
+  pinned: boolean;
+  saved_pin?: boolean;
+  required_by: string[];
+  deps: {
+    path: string;
+    state: string;
+    exit_code?: number;
+    signal?: number;
+    reason?: string;
+    wanted: boolean;
+    satisfied: boolean;
+  }[];
+  attempts: number;
+}

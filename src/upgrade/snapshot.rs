@@ -100,6 +100,10 @@ pub mod v1 {
     pub killed: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub start_failed: bool,
+    /// Idle after a stop that was given up on: the process outlived a
+    /// hard kill.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_timed_out: bool,
     /// Started at the last save, and not pinned since: `up` starts it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub saved_pin: bool,
@@ -592,6 +596,45 @@ pub mod v1 {
       #[serde(default, skip_serializing_if = "Option::is_none")]
       cell_pixels: Option<(u16, u16)>,
     },
+    /// A `wait` session: its set, what it waits for, and the time it had
+    /// left. It goes on from the state the tasks are in.
+    Wait {
+      tasks: Vec<usize>,
+      cond: WaitCond,
+      #[serde(default, skip_serializing_if = "Option::is_none")]
+      timeout_ms: Option<u64>,
+    },
+  }
+
+  /// `crate::kernel::kernel_message::WaitCond`.
+  #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(rename_all = "snake_case")]
+  pub enum WaitCond {
+    Ready,
+    Exit,
+    Down,
+  }
+}
+
+impl From<crate::kernel::kernel_message::WaitCond> for WaitCond {
+  fn from(cond: crate::kernel::kernel_message::WaitCond) -> Self {
+    use crate::kernel::kernel_message::WaitCond as Cond;
+    match cond {
+      Cond::Ready => WaitCond::Ready,
+      Cond::Exit => WaitCond::Exit,
+      Cond::Down => WaitCond::Down,
+    }
+  }
+}
+
+impl From<WaitCond> for crate::kernel::kernel_message::WaitCond {
+  fn from(cond: WaitCond) -> Self {
+    use crate::kernel::kernel_message::WaitCond as Cond;
+    match cond {
+      WaitCond::Ready => Cond::Ready,
+      WaitCond::Exit => Cond::Exit,
+      WaitCond::Down => Cond::Down,
+    }
   }
 }
 
@@ -1101,6 +1144,35 @@ mod tests {
     };
     assert_eq!(process.ready_log.as_deref(), Some("listening"));
     assert_eq!(process.ready_probe, None);
+  }
+
+  /// A carried wait is its set, what it waits for, and the time it had
+  /// left; a task's given-up stop is written only when there is one.
+  #[test]
+  fn wait_connection_and_stop_timed_out_round_trip() {
+    let kind = super::v1::ConnectionKind::Wait {
+      tasks: vec![3, 7],
+      cond: super::v1::WaitCond::Down,
+      timeout_ms: Some(1500),
+    };
+    let json = serde_json::to_string(&kind).unwrap();
+    assert_eq!(
+      json,
+      r#"{"kind":"wait","tasks":[3,7],"cond":"down","timeout_ms":1500}"#
+    );
+    assert_eq!(
+      serde_json::from_str::<super::v1::ConnectionKind>(&json).unwrap(),
+      kind
+    );
+
+    let mut snapshot = decode(include_bytes!("fixtures/v1.json")).unwrap();
+    let mut encoded = Vec::new();
+    encode(&snapshot, &mut encoded).unwrap();
+    assert!(!String::from_utf8_lossy(&encoded).contains("stop_timed_out"));
+    snapshot.tasks[1].stop_timed_out = true;
+    let mut encoded = Vec::new();
+    encode(&snapshot, &mut encoded).unwrap();
+    assert_eq!(decode(&encoded).unwrap(), snapshot);
   }
 
   /// `atch2`: the carried attach connection keeps what the client said

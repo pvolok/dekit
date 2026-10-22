@@ -28,6 +28,8 @@ the same.
   desc: "Params `{apply?}`; result `{plan: {changes, order?, edited_here}, applied, errors}`: what dekit.yaml would change (|cli/reload|), carried out with `apply`. A change is `{kind, path, apply, fields?, reason?, failed?}`; `reason`, why it is off unless asked, is `removed-here`, `conflict`, `changed-here`, `running`, or `{in-the-way: <path>}`. The config on disk not loading is `bad_config`."
 - cmd: upgrade
   desc: "Params `{binary}`; result `{version}` from the new binary once it has taken over."
+- cmd: wait
+  desc: "Params `{target?, command?, for?, timeout_ms?}`; result `{}`, or `{matched}` for a command, then the connection is a wait session (|rpc/requests#waits|). Feature `wait`."
 :::
 
 A target is written as on the command line (|start/targets|): a path, a
@@ -93,12 +95,54 @@ the task has no screen.
 ## Task state
 
 `ls` task-info and `why` carry a stable state token: `idle`, `starting`,
-`running`, `ready`, `stopping`, `backoff`, `done`, or `exited`. `done`,
-`exited`, and `backoff` also carry how the last run ended: `exit_code` or
-`signal`, and `reason: "ready_timeout"` when the task was stopped for not
-being ready in time. Task-info is `{id, path, label?, state, exit_code?,
-signal?, reason?}` where `path` is the space-qualified target of the task
-(`@dekit/console`).
+`running`, `ready`, `stopping`, `backoff`, `done`, or `exited`. A job is
+`running` until it ends, never `ready`. `done`, `exited`, and `backoff`
+also carry how the last run ended: `exit_code` or `signal`, and `reason:
+"ready_timeout"` when the task was stopped for not being ready in time,
+which a `stopping` task carries too while that stop is under way. An
+`idle` task carries `reason: "kill_timeout"` when its last stop was given
+up on: the process outlived a hard kill and may still run.
+Task-info is `{id, path, label?, kind, state, exit_code?, signal?,
+reason?}` where `path` is the space-qualified target of the task
+(`@dekit/console`) and `kind` is `service` or `job`.
+
+## Waits {#waits}
+
+`wait` waits until a set of tasks meets a condition. With `target` it
+observes the tasks the target matches when it begins; for `ready`, the
+ones nobody wants are left out, unless that leaves none. With `command`,
+one of `up`, `start`, `restart`, `force-restart`, `stop`, `kill`, or
+`veto`, it carries the command out and waits on the tasks it acted on,
+in the same kernel step; `for` is then refused, and any other command is
+`invalid_params`. No task to wait on is `no_match`, except after `up`.
+
+`for` is `ready`, the default, or `exit`; the stop verbs wait for down.
+Each turns on whether a task is *live*: wanted (started, or needed by a
+started task, and not vetoed), its run not ended (`exited`, `done`, or
+stopping after a failed start that `autorestart` won't retry), and each
+dep satisfied or live itself. A task in `backoff` is live.
+
+- `ready`: met when the task is ready, or done for a job; failed when it is neither that nor live.
+- `exit`: met when the task has no process and isn't live; failed if its last run failed, its stop was given up on, or a dep that can't get ready held it back.
+- down: met when the task has no process and isn't live, whatever its last run was; failed while it is live, or when its stop was given up on.
+
+`ready` and down fail as soon as one task fails; `exit` waits for every
+task first. `timeout_ms`, at most 24h, ends the wait as `timeout`; 0
+checks once. The set is fixed when the wait begins, and each step of the kernel is checked
+whole: met is every task at once.
+
+Like `attach`, it is the last request on its connection. After the ok
+response the server sends `tasks {tasks}`, the set as it is, then
+`task-changed {..}` for a task whose state or standing changes and
+`task-removed {..}` for one that goes, each a task, and last `wait-done
+{wait, tasks, quitting?}`, `wait` being `met`, `failed`, or `timeout`,
+and `quitting: true` when the runner is stopping, so that nothing is
+wanted; then it closes. Each task is its task-info plus `wait`
+(`pending`, `met`, `failed`) and, when it failed, `blocked_by` (the task
+at the root of it, when that is a dep) or `removed: true`, and in
+`wait-done` its `why` (the `why` object). A wait is carried across a
+live upgrade, and the new image sends `tasks` again; a task removed
+before it, whose standing was final, is not in that set.
 
 ## Error codes
 

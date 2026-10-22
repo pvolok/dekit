@@ -11,10 +11,15 @@ depends on starts again right away; see |start/targets| for `veto` and
 if it has not exited after a grace period. `dekit stop '**'` stops every
 task and keeps the runner; |cli/down| stops the runner too.
 
+With `--wait` it returns once the tasks are down (|cli/wait#down|). A task
+that a started task still needs starts right back, so the wait fails at
+once and says who needs it.
+
 :::usage
 
 ```sh
 dekit stop web
+dekit stop db --wait && rm -rf .data/db
 dekit stop +workers
 dekit stop '**'
 ```

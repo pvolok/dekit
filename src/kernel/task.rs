@@ -167,6 +167,18 @@ impl fmt::Display for ExitInfo {
   }
 }
 
+/// Why dekit ended, or is ending, a task's run, where its state alone
+/// doesn't say.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateReason {
+  /// Not ready within its ready timeout: the start failed. On a task
+  /// that is stopping for it, or ended by it.
+  ReadyTimeout,
+  /// Its stop was given up on: the process outlived a hard kill and may
+  /// still run. On an idle task.
+  KillTimeout,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TaskState {
   Idle,
@@ -397,6 +409,10 @@ pub struct TaskHandle {
   /// Not ready within the ready timeout: the stop under way lands as a
   /// failed exit. Only set in `Stopping`.
   pub start_failed: bool,
+  /// Its last stop was given up on: the process outlived a hard kill
+  /// and may still run. Only set in `Idle`; the next state change clears
+  /// it.
+  pub stop_timed_out: bool,
   /// Started when the tasks were last saved: `up` starts it again. Only
   /// on an unpinned task; any verb that pins or unpins it clears it.
   pub saved_pin: bool,
@@ -441,6 +457,75 @@ impl TaskHandle {
     match &self.next {
       Some(next) => next.spec.as_ref(),
       None => self.spec.as_ref(),
+    }
+  }
+
+  /// The state a run is in once its process is up: a job runs until it
+  /// ends, a service without a ready check is ready at once, and one
+  /// with a check runs until the check passes.
+  pub fn started_state(&self) -> TaskState {
+    match (self.kind, self.ready) {
+      (TaskKind::Service, ReadyMode::Immediate) => TaskState::Ready,
+      (TaskKind::Service, ReadyMode::Reported { .. }) | (TaskKind::Job, _) => {
+        TaskState::Running
+      }
+    }
+  }
+
+  /// The run is over and the kernel won't start another by itself:
+  /// exited, done, or stopping after a failed start that its
+  /// `autorestart` won't retry.
+  pub fn has_ended(&self) -> bool {
+    match self.state {
+      TaskState::Exited(_) | TaskState::Done(_) => true,
+      TaskState::Stopping => {
+        // Where the stop of a failed start lands (`land_stop`).
+        let failed = ExitInfo {
+          ready_timeout: true,
+          ..ExitInfo::error()
+        };
+        self.start_failed
+          && matches!(self.exit_state(failed), TaskState::Exited(_))
+      }
+      TaskState::Idle
+      | TaskState::Starting
+      | TaskState::Running
+      | TaskState::Ready
+      | TaskState::Backoff(_) => false,
+    }
+  }
+
+  /// Its run got as far as runs get before they end: ready, or running
+  /// for a job, which is never ready.
+  pub fn is_up(&self) -> bool {
+    match self.kind {
+      TaskKind::Service => self.state == TaskState::Ready,
+      TaskKind::Job => self.state == TaskState::Running,
+    }
+  }
+
+  /// Why dekit ended, or is ending, its run, beyond its state.
+  pub fn reason(&self) -> Option<StateReason> {
+    match self.state {
+      TaskState::Backoff(info)
+      | TaskState::Done(info)
+      | TaskState::Exited(info)
+        if info.ready_timeout =>
+      {
+        Some(StateReason::ReadyTimeout)
+      }
+      TaskState::Stopping if self.start_failed => {
+        Some(StateReason::ReadyTimeout)
+      }
+      TaskState::Idle if self.stop_timed_out => Some(StateReason::KillTimeout),
+      TaskState::Idle
+      | TaskState::Starting
+      | TaskState::Running
+      | TaskState::Ready
+      | TaskState::Stopping
+      | TaskState::Backoff(_)
+      | TaskState::Done(_)
+      | TaskState::Exited(_) => None,
     }
   }
 

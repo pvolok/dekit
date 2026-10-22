@@ -194,7 +194,7 @@ files. Run them through `cmd /c` for now, as in
 ## Ready {#ready}
 
 `ready` holds one check. Until it passes the task is starting, and the
-tasks that depend on it wait.
+tasks that depend on it wait, as `dekit start --wait` and |cli/wait| do.
 
 :::fields kind=config
 - key: tasks.*.ready.log
@@ -242,7 +242,8 @@ a running task and is not supported yet.
 ## Jobs {#jobs}
 
 A job is a task that runs to completion, such as a migration or a build
-step. Tasks that depend on a job start once it exits with 0. A finished job
+step. It is `running` until it exits, then `done`. Tasks that depend on a
+job start once it exits with 0. A finished job
 stays done: it does not run again when a task that needs it restarts, only
 when you start it directly or after the runner stops and starts again. A job
 takes no `ready` and no `autorestart: always`.

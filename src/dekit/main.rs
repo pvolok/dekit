@@ -9,7 +9,11 @@ use crate::{
   attach_client::{AttachEnd, client_main},
   command::Command,
   config::task::is_script,
-  dekit::{rpc_client::rpc_request, server::run_server},
+  dekit::{
+    rpc_client::rpc_request,
+    server::run_server,
+    wait_client::{cli_wait, timeout_ms},
+  },
   js::js_vm::JsVm,
   kernel::{
     kernel::{KILL_WAIT, SAVE_TIMEOUT},
@@ -17,7 +21,7 @@ use crate::{
   },
   protocol::{
     ActResult, RpcRequest, RpcState, RpcWhy, ScreenResult, TaskListResult,
-    rpc::UpgradeResult,
+    WaitFor, rpc::UpgradeResult,
   },
   reload::{ChangeKind, ReloadResult},
   runner::{
@@ -29,9 +33,11 @@ use crate::{
 };
 
 /// Render a wire state (token + optional exit detail) for humans.
-fn human_state(s: &RpcState) -> String {
-  if s.reason.as_deref() == Some("ready_timeout") {
-    return format!("{} (not ready in time)", s.state);
+pub(crate) fn human_state(s: &RpcState) -> String {
+  match s.reason.as_deref() {
+    Some("ready_timeout") => return format!("{} (not ready in time)", s.state),
+    Some("kill_timeout") => return format!("{} (stop timed out)", s.state),
+    _ => (),
   }
   match (s.exit_code, s.signal) {
     (Some(code), _) => format!("{} (code {})", s.state, code),
@@ -637,6 +643,33 @@ async fn attach_loop(
   }
 }
 
+/// Carries out `command` and waits on what it acted on, for what its
+/// verb implies.
+async fn wait_after(
+  runner: &RunnerSpec,
+  command: Command,
+  timeout: Option<&String>,
+  json: bool,
+) -> anyhow::Result<i32> {
+  let start_runner = command.starts_runner();
+  let request = RpcRequest::Wait {
+    target: None,
+    command: Some(command),
+    wait_for: None,
+    timeout_ms: timeout_ms(timeout.map(String::as_str))?,
+  };
+  cli_wait(runner, request, start_runner, json).await
+}
+
+/// Ends the process with a wait's status; 0 returns to finish normally.
+fn exit_with(code: i32) {
+  if code != 0 {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    std::process::exit(code);
+  }
+}
+
 fn arg_target(sub_m: &clap::ArgMatches) -> anyhow::Result<Option<Target>> {
   sub_m
     .get_one::<String>("target")
@@ -721,6 +754,28 @@ pub fn cli() -> ClapCommand {
     Arg::new("runner")
       .help("Runner: host, project, or a path (default: the discovered runner)")
   };
+  // `--wait` on the verbs that start or stop tasks.
+  let wait_args = |command: ClapCommand, until: &'static str| {
+    command
+      .arg(
+        Arg::new("wait")
+          .long("wait")
+          .short('w')
+          .action(clap::ArgAction::SetTrue)
+          .help(until),
+      )
+      .arg(
+        Arg::new("wait-timeout")
+          .long("wait-timeout")
+          .value_name("duration")
+          .requires("wait")
+          .help(
+            "Give up waiting after this long, such as 30s or 5m (exit 124)",
+          ),
+      )
+  };
+  let until_ready = "Exit once the tasks are ready, or done for a job";
+  let until_down = "Exit once the tasks are down";
   // Shared by `spawn` and `run`: a new task from a command line.
   let task_args = |command: ClapCommand| {
     command
@@ -847,9 +902,12 @@ pub fn cli() -> ClapCommand {
             .action(clap::ArgAction::SetTrue)
             .help("Fail if the runner is not running instead of starting it"),
         ),
-      ClapCommand::new("up")
-        .about("Start the runner if needed and the saved and autostart tasks")
-        .arg(runner_ref_arg()),
+      wait_args(
+        ClapCommand::new("up")
+          .about("Start the runner if needed and the saved and autostart tasks")
+          .arg(runner_ref_arg()),
+        until_ready,
+      ),
       ClapCommand::new("down")
         .about("Stop the runner, keeping the tasks for the next up")
         .arg(runner_ref_arg()),
@@ -872,21 +930,55 @@ pub fn cli() -> ClapCommand {
       ClapCommand::new("ls")
         .about("List tasks")
         .arg(target_arg("Task path, glob, or +tag (default: everything)")),
-      ClapCommand::new("start")
-        .about("Start tasks matching a target")
-        .arg(required_target()),
-      ClapCommand::new("stop")
-        .about("Unpin and stop tasks; each restarts if something still needs it")
-        .arg(required_target()),
-      ClapCommand::new("kill")
-        .about("Like stop, but with an immediate hard kill")
-        .arg(required_target()),
-      ClapCommand::new("veto")
-        .about("Stop tasks and keep them stopped until started again")
-        .arg(required_target()),
-      ClapCommand::new("restart")
-        .about("Restart tasks matching a target")
-        .arg(required_target()),
+      wait_args(
+        ClapCommand::new("start")
+          .about("Start tasks matching a target")
+          .arg(required_target()),
+        until_ready,
+      ),
+      wait_args(
+        ClapCommand::new("stop")
+          .about(
+            "Unpin and stop tasks; each restarts if something still needs it",
+          )
+          .arg(required_target()),
+        until_down,
+      ),
+      wait_args(
+        ClapCommand::new("kill")
+          .about("Like stop, but with an immediate hard kill")
+          .arg(required_target()),
+        until_down,
+      ),
+      wait_args(
+        ClapCommand::new("veto")
+          .about("Stop tasks and keep them stopped until started again")
+          .arg(required_target()),
+        until_down,
+      ),
+      wait_args(
+        ClapCommand::new("restart")
+          .about("Restart tasks matching a target")
+          .arg(required_target()),
+        until_ready,
+      ),
+      ClapCommand::new("wait")
+        .about("Wait until tasks are ready, or until they have exited")
+        .arg(required_target())
+        .arg(
+          Arg::new("for")
+            .long("for")
+            .value_name("condition")
+            .value_parser(["ready", "exit"])
+            .default_value("ready")
+            .help("ready: ready, or done for a job; exit: ended, and won't start again by itself"),
+        )
+        .arg(
+          Arg::new("timeout")
+            .long("timeout")
+            .value_name("duration")
+            .help("Give up after this long, such as 30s or 5m (exit 124); 0 checks once"),
+        ),
       ClapCommand::new("rm")
         .about("Remove tasks, killing running ones")
         .arg(required_target()),
@@ -1057,10 +1149,32 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         "rm" => (("task or folder", "tasks and folders"), "Nothing matched."),
         _ => (TASKS, "No tasks matched."),
       };
-      let spawn = command.starts_runner();
-      let result =
-        rpc_request(&runner, RpcRequest::Command(command), spawn).await?;
-      print_acted(result, json, done, nouns, zero)?;
+      if verb != "rm" && sub_m.get_flag("wait") {
+        let timeout = sub_m.get_one::<String>("wait-timeout");
+        exit_with(wait_after(&runner, command, timeout, json).await?);
+      } else {
+        let spawn = command.starts_runner();
+        let result =
+          rpc_request(&runner, RpcRequest::Command(command), spawn).await?;
+        print_acted(result, json, done, nouns, zero)?;
+      }
+    }
+    Some(("wait", sub_m)) => {
+      let target = arg_target(sub_m)?.expect("clap requires target");
+      let (runner, target) = resolve_target(&matches, target)?;
+      let wait_for = match sub_m.get_one::<String>("for").map(String::as_str) {
+        Some("exit") => WaitFor::Exit,
+        _ => WaitFor::Ready,
+      };
+      let request = RpcRequest::Wait {
+        target: Some(target),
+        command: None,
+        wait_for: Some(wait_for),
+        timeout_ms: timeout_ms(
+          sub_m.get_one::<String>("timeout").map(String::as_str),
+        )?,
+      };
+      exit_with(cli_wait(&runner, request, false, json).await?);
     }
     Some(("why", sub_m)) => {
       let target = arg_target(sub_m)?.expect("clap requires target");
@@ -1085,9 +1199,14 @@ pub async fn dekit_main() -> anyhow::Result<()> {
     }
     Some(("up", sub_m)) => {
       let runner = arg_runner(&matches, sub_m)?;
-      let result =
-        rpc_request(&runner, RpcRequest::Command(Command::Up), true).await?;
-      print_acted(result, json, "Started", TASKS, "Nothing to start.")?;
+      if sub_m.get_flag("wait") {
+        let timeout = sub_m.get_one::<String>("wait-timeout");
+        exit_with(wait_after(&runner, Command::Up, timeout, json).await?);
+      } else {
+        let result =
+          rpc_request(&runner, RpcRequest::Command(Command::Up), true).await?;
+        print_acted(result, json, "Started", TASKS, "Nothing to start.")?;
+      }
     }
     Some(("reload", sub_m)) => {
       let runner = arg_runner(&matches, sub_m)?;

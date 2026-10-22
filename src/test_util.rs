@@ -36,10 +36,11 @@ pub fn task(
       space: TaskSpaceId::default_space(),
       path: Some(TaskPath::new(path).unwrap()),
       label: None,
+      kind: TaskKind::Service,
       state: TaskState::Idle,
+      reason: None,
       vt: None,
     },
-    kind: TaskKind::Service,
     spec: Some(spec),
     origin,
   }

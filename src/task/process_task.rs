@@ -1327,7 +1327,7 @@ mod tests {
   use crate::config::task_log::TaskLogConfig;
   use crate::kernel::kernel::Kernel;
   use crate::kernel::kernel_message::{
-    KernelCommand, SpaceSelector, TaskContext,
+    KernelCommand, SpaceSelector, TaskContext, Verb,
   };
   use crate::kernel::task::{TaskId, TaskKind, TaskState};
   use crate::kernel::task_path::TaskPath;
@@ -1391,7 +1391,7 @@ mod tests {
         yaml_path(&log_path)
       ),
     );
-    pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
+    pc.send(KernelCommand::Act(Verb::Start, TaskSelector::Id(id), None));
 
     let kernel_task = tokio::spawn(kernel.run());
 
@@ -1440,7 +1440,7 @@ mod tests {
         yaml_path(&dir.join("{pid}.log"))
       ),
     );
-    pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
+    pc.send(KernelCommand::Act(Verb::Start, TaskSelector::Id(id), None));
 
     let kernel_task = tokio::spawn(kernel.run());
 
@@ -1505,7 +1505,7 @@ mod tests {
           yaml_path(&dir)
         ),
       );
-      pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
+      pc.send(KernelCommand::Act(Verb::Start, TaskSelector::Id(id), None));
     }
 
     let kernel_task = tokio::spawn(kernel.run());
@@ -1513,7 +1513,7 @@ mod tests {
     let mut ids = Vec::new();
     for name in ["by_cmd", "by_sh"] {
       let id = resolve(&pc, name).await;
-      pc.send(KernelCommand::Stop(TaskSelector::Id(id), None));
+      pc.send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(id), None));
       ids.push(id);
     }
 
@@ -1524,7 +1524,7 @@ mod tests {
     }
 
     for id in ids {
-      pc.send(KernelCommand::Kill(TaskSelector::Id(id), None));
+      pc.send(KernelCommand::Act(Verb::Kill, TaskSelector::Id(id), None));
       pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
     }
     pc.send(KernelCommand::Quit);
@@ -1560,6 +1560,7 @@ mod tests {
       vetoed: false,
       killed: false,
       start_failed: false,
+      stop_timed_out: false,
       saved_pin: false,
       attempts: 0,
       last_start_secs_ago: None,
@@ -1654,6 +1655,7 @@ mod tests {
       vetoed: false,
       killed: false,
       start_failed: false,
+      stop_timed_out: false,
       saved_pin: false,
       attempts: 0,
       last_start_secs_ago: None,
@@ -1806,6 +1808,7 @@ mod tests {
       vetoed: false,
       killed: false,
       start_failed: false,
+      stop_timed_out: false,
       saved_pin: false,
       attempts: 1,
       last_start_secs_ago: None,
@@ -1859,7 +1862,7 @@ mod tests {
         panic!("a bug in the task");
       },
     ));
-    pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
+    pc.send(KernelCommand::Act(Verb::Start, TaskSelector::Id(id), None));
     let kernel_task = tokio::spawn(kernel.run());
 
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1913,7 +1916,7 @@ time.sleep(60)
         yaml_path(&script)
       ),
     );
-    pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
+    pc.send(KernelCommand::Act(Verb::Start, TaskSelector::Id(id), None));
     let kernel_task = tokio::spawn(kernel.run());
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2017,6 +2020,7 @@ time.sleep(60)
         vetoed: false,
         killed: false,
         start_failed: false,
+        stop_timed_out: false,
         saved_pin: false,
         attempts: 1,
         last_start_secs_ago: None,

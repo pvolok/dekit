@@ -25,6 +25,11 @@ the runner is not running (|cli|). A runner started any other way
 tasks idle, with their last screens, and starts only what it was asked
 to.
 
+With `--wait` it returns once what it started is ready, or done for a
+job, and fails when one can't get there (|cli/wait|); `--wait-timeout`
+gives up after a while, with status 124. With nothing to start it is met
+at once.
+
 The runner keeps going after you close the terminal; `dekit attach` gets
 you back in. `up` takes a runner like `down`: `host`, `project`, or a path
 to a project root (|cli/runner|).
@@ -33,6 +38,7 @@ to a project root (|cli/runner|).
 
 ```sh
 dekit up
+dekit up --wait --wait-timeout 5m
 dekit up -C ~/src/api
 dekit up host
 ```

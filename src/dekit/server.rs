@@ -25,14 +25,17 @@ use crate::{
     hook::{Hook, watch_idle},
   },
   console::app::console_task_registration,
-  dekit::attach::{Attachment, attach_session},
+  dekit::{
+    attach::{Attachment, attach_session},
+    wait::{WaitConn, WaitParams, wait_session},
+  },
   kernel::{
     kernel::{Kernel, SaveFn},
     kernel_message::{
       KernelCommand, KernelSnapshot, MoveError, RegisterError, ScreenHandle,
-      TaskContext, TaskInfo, TaskSelector,
+      TaskContext, TaskExplain, TaskInfo, TaskSelector,
     },
-    task::{TaskDef, TaskState},
+    task::{StateReason, TaskDef, TaskKind, TaskState},
     task_key::TaskSpaceId,
     task_path::TaskPath,
   },
@@ -92,6 +95,8 @@ pub enum ConnCtl {
   /// outside its select loop.
   Freeze(oneshot::Sender<Option<snap::Connection>>),
   Thaw,
+  /// The runner is exiting: write what is owed, then end.
+  Close,
 }
 
 /// Paused while connections are frozen, so none starts unfrozen; new
@@ -107,6 +112,8 @@ enum AcceptCtl {
 pub struct Connections {
   inner: Mutex<HashMap<u64, UnboundedSender<ConnCtl>>>,
   next: AtomicU64,
+  /// Told when the last connection unregisters.
+  emptied: tokio::sync::Notify,
   /// The accept loop, while one runs.
   accept: Mutex<Option<UnboundedSender<AcceptCtl>>>,
 }
@@ -119,8 +126,12 @@ pub struct ConnReg {
 
 impl Drop for ConnReg {
   fn drop(&mut self) {
-    if let Ok(mut map) = self.ctx.connections.inner.lock() {
+    let connections = &self.ctx.connections;
+    if let Ok(mut map) = connections.inner.lock() {
       map.remove(&self.id);
+      if map.is_empty() {
+        connections.emptied.notify_one();
+      }
     }
   }
 }
@@ -160,6 +171,25 @@ impl Connections {
       }
     }
     replies
+  }
+
+  /// Has every connection write what it owes and end, giving them
+  /// `within` in all: a verdict or a bye sent as the runner stops then
+  /// reaches its client.
+  pub async fn close_all(&self, within: std::time::Duration) {
+    if let Ok(map) = self.inner.lock() {
+      for sender in map.values() {
+        let _ = sender.send(ConnCtl::Close);
+      }
+    }
+    let emptied = async {
+      // A connection that goes between the check and the wait leaves
+      // the permit the wait takes.
+      while self.inner.lock().is_ok_and(|map| !map.is_empty()) {
+        self.emptied.notified().await;
+      }
+    };
+    let _ = tokio::time::timeout(within, emptied).await;
   }
 
   pub fn thaw_all(&self) {
@@ -519,6 +549,12 @@ pub async fn serve(
   }
 
   kernel_handle.await?;
+  // The kernel's last steps may have ended sessions; what they owe their
+  // clients is still to be written.
+  ctx
+    .connections
+    .close_all(std::time::Duration::from_millis(500))
+    .await;
 
   #[cfg(unix)]
   crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()?;
@@ -670,6 +706,42 @@ pub async fn dispatch_connection(
             .await;
             return;
           }
+          Ok(RpcRequest::Wait {
+            target,
+            command,
+            wait_for,
+            timeout_ms,
+          }) => {
+            // Earlier requests are answered before the wait's events
+            // start, as for an attach.
+            while let Some(reply) = replies.join_next().await {
+              if let Ok(reply) = reply && sender.queue_ctl(reply).is_err() {
+                return;
+              }
+            }
+            let Some(client) = hello else {
+              return;
+            };
+            wait_session(
+              &ctx,
+              WaitConn {
+                reg,
+                fd,
+                hello: client,
+                sender,
+                receiver,
+              },
+              request.id,
+              WaitParams {
+                target,
+                command,
+                wait_for,
+                timeout_ms,
+              },
+            )
+            .await;
+            return;
+          }
           Ok(RpcRequest::Upgrade { binary }) => {
             if upgrade.is_some() {
               let error = RpcError::new(codes::BUSY, "an upgrade is in progress");
@@ -735,6 +807,7 @@ pub async fn dispatch_connection(
           let _ = reply.send(carried(fd, hello.as_ref(), receiver.buffered(), &sender, kind));
         }
         Some(ConnCtl::Thaw) => frozen = false,
+        Some(ConnCtl::Close) => closing = true,
         None => break,
       }
     }
@@ -773,6 +846,8 @@ pub async fn finish(
           let _ = reply.send(carried(fd, hello, buffered_input, sender, kind));
         }
         Some(ConnCtl::Thaw) => frozen = false,
+        // Already writing what is owed.
+        Some(ConnCtl::Close) => (),
         None => return,
       },
     }
@@ -786,7 +861,10 @@ pub fn upgrade_result() -> Value {
   serde_json::to_value(result).unwrap_or_default()
 }
 
-pub(crate) fn task_state(state: TaskState) -> RpcState {
+pub(crate) fn task_state(
+  state: TaskState,
+  reason: Option<StateReason>,
+) -> RpcState {
   let (token, info) = match state {
     TaskState::Idle => ("idle", None),
     TaskState::Starting => ("starting", None),
@@ -801,9 +879,54 @@ pub(crate) fn task_state(state: TaskState) -> RpcState {
     state: token.to_string(),
     exit_code: info.and_then(|i| i.code),
     signal: info.and_then(|i| i.signal),
-    reason: info
-      .filter(|i| i.ready_timeout)
-      .map(|_| "ready_timeout".to_string()),
+    reason: reason.map(|reason| {
+      match reason {
+        StateReason::ReadyTimeout => "ready_timeout",
+        StateReason::KillTimeout => "kill_timeout",
+      }
+      .to_string()
+    }),
+  }
+}
+
+pub(crate) fn rpc_task_info(task: &TaskInfo) -> RpcTaskInfo {
+  RpcTaskInfo {
+    id: task.id,
+    path: task.name(),
+    label: task.label.clone(),
+    kind: Some(
+      match task.kind {
+        TaskKind::Service => "service",
+        TaskKind::Job => "job",
+      }
+      .to_string(),
+    ),
+    state: task_state(task.state, task.reason),
+  }
+}
+
+pub(crate) fn rpc_why(explain: TaskExplain) -> RpcWhy {
+  RpcWhy {
+    id: explain.id,
+    path: explain.name,
+    state: task_state(explain.state, explain.reason),
+    wanted: explain.wanted,
+    supported: explain.supported,
+    vetoed: explain.vetoed,
+    pinned: explain.pinned,
+    saved_pin: explain.saved_pin,
+    required_by: explain.required_by,
+    deps: explain
+      .deps
+      .into_iter()
+      .map(|d| RpcWhyDep {
+        path: d.name,
+        state: task_state(d.state, d.reason),
+        wanted: d.wanted,
+        satisfied: d.satisfied,
+      })
+      .collect(),
+    attempts: explain.attempts,
   }
 }
 
@@ -858,7 +981,9 @@ async fn handle_rpc(
   let config = project.config();
   let config = config.as_ref();
   match req {
-    RpcRequest::Attach { .. } | RpcRequest::Upgrade { .. } => {
+    RpcRequest::Attach { .. }
+    | RpcRequest::Wait { .. }
+    | RpcRequest::Upgrade { .. } => {
       Err(RpcError::internal("handled by the connection loop"))
     }
 
@@ -909,16 +1034,7 @@ async fn handle_rpc(
 
     RpcRequest::Ls { target } => {
       let target = target.unwrap_or_else(|| Target::glob("**"));
-      let tasks = list(pc, &target)
-        .await?
-        .into_iter()
-        .map(|t| RpcTaskInfo {
-          id: t.id,
-          path: t.name(),
-          label: t.label,
-          state: task_state(t.state),
-        })
-        .collect();
+      let tasks = list(pc, &target).await?.iter().map(rpc_task_info).collect();
       serde_json::to_value(TaskListResult { tasks }).map_err(RpcError::internal)
     }
 
@@ -926,29 +1042,7 @@ async fn handle_rpc(
       let selector = target.selector().map_err(bad_target)?;
       let explains = pc.explain(selector).await;
       let explain = one(explains, &target)?;
-      let why = RpcWhy {
-        id: explain.id,
-        path: explain.name,
-        state: task_state(explain.state),
-        wanted: explain.wanted,
-        supported: explain.supported,
-        vetoed: explain.vetoed,
-        pinned: explain.pinned,
-        saved_pin: explain.saved_pin,
-        required_by: explain.required_by,
-        deps: explain
-          .deps
-          .into_iter()
-          .map(|d| RpcWhyDep {
-            path: d.name,
-            state: task_state(d.state),
-            wanted: d.wanted,
-            satisfied: d.satisfied,
-          })
-          .collect(),
-        attempts: explain.attempts,
-      };
-      serde_json::to_value(why).map_err(RpcError::internal)
+      serde_json::to_value(rpc_why(explain)).map_err(RpcError::internal)
     }
 
     RpcRequest::Reload { apply } => {
@@ -988,23 +1082,32 @@ mod tests {
     protocol::{Request, client_handshake},
   };
 
-  /// A task backing off says why, as an exited one does.
+  /// A task backing off says why, as an exited one does, and an idle one
+  /// whose stop was given up on says so.
   #[test]
   fn backoff_carries_the_exit_on_the_wire() {
     use crate::kernel::task::ExitInfo;
-    let state = |state| serde_json::to_value(task_state(state)).unwrap();
+    let state =
+      |state, reason| serde_json::to_value(task_state(state, reason)).unwrap();
     assert_eq!(
-      state(TaskState::Backoff(ExitInfo {
-        ready_timeout: true,
-        ..ExitInfo::code(0)
-      })),
+      state(
+        TaskState::Backoff(ExitInfo {
+          ready_timeout: true,
+          ..ExitInfo::code(0)
+        }),
+        Some(StateReason::ReadyTimeout)
+      ),
       serde_json::json!({
         "state": "backoff", "exit_code": 0, "reason": "ready_timeout"
       })
     );
     assert_eq!(
-      state(TaskState::Backoff(ExitInfo::signal(9))),
+      state(TaskState::Backoff(ExitInfo::signal(9)), None),
       serde_json::json!({"state": "backoff", "signal": 9})
+    );
+    assert_eq!(
+      state(TaskState::Idle, Some(StateReason::KillTimeout)),
+      serde_json::json!({"state": "idle", "reason": "kill_timeout"})
     );
   }
 
@@ -1091,6 +1194,146 @@ mod tests {
       ConnReceiver::new(client_read),
       connection,
     )
+  }
+
+  /// A probe whose verdict is in at once reports it, never a timeout,
+  /// though its deadline has passed by the time the verdict is read.
+  #[tokio::test]
+  async fn a_probe_reports_its_verdict_not_a_timeout() {
+    let config = Arc::new(Config::make_default());
+    let mut kernel = Kernel::new();
+    let pc = kernel.context();
+    kernel.register_task(
+      TaskDef {
+        path: Some(TaskPath::new("db").unwrap()),
+        pinned: true,
+        ..Default::default()
+      },
+      |_| Box::new(crate::kernel::task::TargetTask),
+    );
+    let kernel_handle = tokio::spawn(kernel.run());
+    let ctx = ServerCtx::local(pc.clone(), config);
+    for _ in 0..20 {
+      let (mut sender, mut receiver, connection) = serve_duplex(&ctx, None);
+      client_handshake(&mut sender, &mut receiver).await.unwrap();
+      let (method, params) = RpcRequest::Wait {
+        target: Some(Target::glob("db")),
+        command: None,
+        wait_for: None,
+        timeout_ms: Some(0),
+      }
+      .to_wire();
+      sender
+        .send_ctl(CtlMsg::Request(Request {
+          id: 1,
+          method,
+          params,
+        }))
+        .await
+        .unwrap();
+      let done = loop {
+        match timeout(Duration::from_secs(2), receiver.recv_ctl())
+          .await
+          .unwrap()
+          .unwrap()
+        {
+          CtlMsg::Event(event) if event.name == "wait-done" => {
+            break event.params;
+          }
+          _ => (),
+        }
+      };
+      assert_eq!(done["wait"], "met", "{done}");
+      drop(sender);
+      drop(receiver);
+      timeout(Duration::from_secs(2), connection)
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    pc.send(KernelCommand::Quit);
+    timeout(Duration::from_secs(2), kernel_handle)
+      .await
+      .unwrap()
+      .unwrap();
+  }
+
+  /// The next event of a session: its name and params.
+  async fn next_event(
+    receiver: &mut ConnReceiver,
+  ) -> (String, serde_json::Value) {
+    loop {
+      if let CtlMsg::Event(event) =
+        timeout(Duration::from_secs(2), receiver.recv_ctl())
+          .await
+          .unwrap()
+          .unwrap()
+      {
+        return (event.name, event.params);
+      }
+    }
+  }
+
+  /// A task removed while waited on is reported as such, as it last
+  /// was; an exit wait on it is met.
+  #[tokio::test]
+  async fn a_removed_task_is_reported_whole() {
+    let config = Arc::new(Config::make_default());
+    let mut kernel = Kernel::new();
+    let pc = kernel.context();
+    let db = kernel.register_task(
+      TaskDef {
+        path: Some(TaskPath::new("db").unwrap()),
+        pinned: true,
+        ..Default::default()
+      },
+      |_| Box::new(crate::kernel::task::TargetTask),
+    );
+    let kernel_handle = tokio::spawn(kernel.run());
+    let ctx = ServerCtx::local(pc.clone(), config);
+    let (mut sender, mut receiver, connection) = serve_duplex(&ctx, None);
+    client_handshake(&mut sender, &mut receiver).await.unwrap();
+    let (method, params) = RpcRequest::Wait {
+      target: Some(Target::glob("db")),
+      command: None,
+      wait_for: Some(crate::protocol::WaitFor::Exit),
+      timeout_ms: None,
+    }
+    .to_wire();
+    sender
+      .send_ctl(CtlMsg::Request(Request {
+        id: 1,
+        method,
+        params,
+      }))
+      .await
+      .unwrap();
+    let (name, set) = next_event(&mut receiver).await;
+    assert_eq!(name, "tasks");
+    assert_eq!(set["tasks"][0]["wait"], "pending", "{set}");
+
+    pc.send(KernelCommand::Remove(TaskSelector::Id(db), None));
+    let (name, task) = next_event(&mut receiver).await;
+    assert_eq!(name, "task-removed");
+    assert_eq!(task["path"], "db", "{task}");
+    assert_eq!(task["wait"], "met", "{task}");
+    assert_eq!(task["removed"], true, "{task}");
+    let (name, done) = next_event(&mut receiver).await;
+    assert_eq!(name, "wait-done");
+    assert_eq!(done["wait"], "met", "{done}");
+    assert_eq!(done["tasks"][0]["removed"], true, "{done}");
+
+    drop(sender);
+    drop(receiver);
+    timeout(Duration::from_secs(2), connection)
+      .await
+      .unwrap()
+      .unwrap();
+    pc.send(KernelCommand::Quit);
+    timeout(Duration::from_secs(2), kernel_handle)
+      .await
+      .unwrap()
+      .unwrap();
   }
 
   #[tokio::test]

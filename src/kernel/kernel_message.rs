@@ -11,8 +11,8 @@ pub use crate::term::ScreenHandle;
 
 use super::sub_trie::SubMode;
 use super::task::{
-  ExitInfo, NextRun, RestartMode, Task, TaskCmd, TaskDef, TaskId, TaskKind,
-  TaskState,
+  ExitInfo, NextRun, RestartMode, StateReason, Task, TaskCmd, TaskDef, TaskId,
+  TaskKind, TaskState,
 };
 use super::task_key::{TaskKey, TaskSpaceId};
 use super::task_path::TaskPath;
@@ -148,18 +148,10 @@ pub enum KernelCommand {
 
   /// Selector commands resolve the selector and act on the matches in the
   /// same dispatch, so no other message can interleave between the two.
-  /// The ack is answered in that dispatch with the matched-task count.
-  Start(TaskSelector, Ack),
-  /// Pins and starts the selector's matches (the autostart set) and every
-  /// task with a saved pin, clearing the saved pins; a done job is never
-  /// run again. The ack is the size of that set.
-  Up(TaskSelector, Ack),
-  Stop(TaskSelector, Ack),
-  Kill(TaskSelector, Ack),
-  Restart(TaskSelector, Ack),
-  ForceRestart(TaskSelector, Ack),
+  /// The ack is answered in that dispatch with the matched-task count;
+  /// for `up`, the size of its set.
+  Act(Verb, TaskSelector, Ack),
   Unpin(TaskSelector, Ack),
-  Veto(TaskSelector, Ack),
   /// Total: removes matching tasks in any state, killing running ones.
   /// A glob that matches a group or folder, or a folder's id, removes it
   /// with every task and folder under it. The ack counts both.
@@ -205,6 +197,9 @@ pub enum KernelCommand {
   /// Sends `true`/`false` whenever the selected set gains its first active
   /// task or loses its last one.
   WatchActive(TaskSelector, UnboundedSender<bool>),
+  /// Waits until a set of tasks meets a condition (`WaitCond`),
+  /// reporting on the request's channel; dropping the receiver ends it.
+  Wait(Box<WaitRequest>),
 
   // Task reporting
   TaskStarted,
@@ -238,6 +233,115 @@ pub struct DuplicateRequest {
   pub label: Option<String>,
   pub path: Option<TaskPath>,
   pub start: bool,
+}
+
+/// What a wait waits for. A task is *live* when the kernel will run it,
+/// or keep it running, without anyone acting: wanted, not ended
+/// (exited, done, or stopping after a failed start it won't retry), and
+/// each dep satisfied or live.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitCond {
+  /// Satisfied: ready, or done for a job. Fails once a task is neither
+  /// satisfied nor live.
+  Ready,
+  /// No process, and not live; then the last run is judged.
+  Exit,
+  /// No process, and not live, as `Exit`, but the last run is only
+  /// reported. Fails while the task is live: it won't go down by itself.
+  /// For the verbs that stop tasks.
+  Down,
+}
+
+/// A verb that starts or stops the tasks a selector matches, as the
+/// kernel carries it out; a wait can carry one out first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Verb {
+  /// Pins and starts the matches (the autostart set) and every task
+  /// with a saved pin, clearing the saved pins; a done job is never run
+  /// again.
+  Up,
+  Start,
+  Restart,
+  ForceRestart,
+  Stop,
+  Kill,
+  Veto,
+}
+
+impl Verb {
+  /// What the verb's wait is for: the ones that start tasks wait for
+  /// them to be ready, the ones that stop them for them to be down.
+  pub fn wait_cond(self) -> WaitCond {
+    match self {
+      Verb::Up | Verb::Start | Verb::Restart | Verb::ForceRestart => {
+        WaitCond::Ready
+      }
+      Verb::Stop | Verb::Kill | Verb::Veto => WaitCond::Down,
+    }
+  }
+}
+
+/// Which tasks a wait is on, fixed when it begins.
+pub enum WaitOn {
+  /// What the selector matches. For `Ready`, the tasks nobody wants are
+  /// left out, unless none is wanted.
+  Matches(TaskSelector),
+  /// Exactly these, as a wait carried across an upgrade has them.
+  Ids(Vec<TaskId>),
+  /// Carry out the verb on the selector's matches (for `up`, its set),
+  /// then wait on what it acted on, in the same step.
+  Act(Verb, TaskSelector),
+}
+
+pub struct WaitRequest {
+  pub on: WaitOn,
+  pub cond: WaitCond,
+  pub events: UnboundedSender<WaitEvent>,
+}
+
+/// Where a task stands in a wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitMark {
+  Pending,
+  Met,
+  Failed,
+}
+
+/// A task of a wait's set as it is now.
+#[derive(Clone, Debug)]
+pub struct WaitTask {
+  pub info: TaskInfo,
+  pub mark: WaitMark,
+  /// When it failed for a dep: the task at the root of it.
+  pub blocked_by: Option<String>,
+  /// Removed while waited on; `info` is how it last was.
+  pub removed: bool,
+  /// Why it is (not) running, for a failed task still there, in `Done`.
+  pub why: Option<TaskExplain>,
+}
+
+/// How a wait ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitVerdict {
+  Met,
+  Failed,
+}
+
+/// What a wait reports, in this order: `Set` once, after the step it
+/// began in settles; `Changed` for each task whose state or mark
+/// changes; `Done` once, and nothing after it.
+#[derive(Clone, Debug)]
+pub enum WaitEvent {
+  /// The set, in list order.
+  Set(Vec<WaitTask>),
+  Changed(Box<WaitTask>),
+  Done {
+    verdict: WaitVerdict,
+    tasks: Vec<WaitTask>,
+    /// The runner is stopping: nothing is wanted any more.
+    quitting: bool,
+  },
 }
 
 /// A task's new definition, and what the kernel makes of it.
@@ -453,7 +557,6 @@ pub type Reply<T> = tokio::sync::oneshot::Sender<T>;
 #[derive(Clone, Debug)]
 pub struct TaskDescription {
   pub info: TaskInfo,
-  pub kind: TaskKind,
   pub spec: Option<TaskSpec>,
   pub origin: Option<Source>,
 }
@@ -464,7 +567,9 @@ pub struct TaskInfo {
   pub space: TaskSpaceId,
   pub path: Option<TaskPath>,
   pub label: Option<String>,
+  pub kind: TaskKind,
   pub state: TaskState,
+  pub reason: Option<StateReason>,
   pub vt: Option<ScreenHandle>,
 }
 
@@ -491,6 +596,7 @@ pub struct TaskExplain {
   pub id: TaskId,
   pub name: String,
   pub state: TaskState,
+  pub reason: Option<StateReason>,
   pub wanted: bool,
   /// Wanted and every dependency transitively supported and satisfied;
   /// false on a wanted task means it is blocked by a dep below.
@@ -508,6 +614,7 @@ pub struct TaskExplain {
 pub struct DepExplain {
   pub name: String,
   pub state: TaskState,
+  pub reason: Option<StateReason>,
   pub wanted: bool,
   pub satisfied: bool,
 }
@@ -621,6 +728,22 @@ impl TaskContext {
   ) -> tokio::sync::mpsc::UnboundedReceiver<bool> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     self.send(KernelCommand::WatchActive(selector, tx));
+    rx
+  }
+
+  /// Begins a wait; it ends with its `Done` event, or when the receiver
+  /// is dropped.
+  pub fn wait(
+    &self,
+    on: WaitOn,
+    cond: WaitCond,
+  ) -> tokio::sync::mpsc::UnboundedReceiver<WaitEvent> {
+    let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+    self.send(KernelCommand::Wait(Box::new(WaitRequest {
+      on,
+      cond,
+      events,
+    })));
     rx
   }
 

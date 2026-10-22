@@ -7,17 +7,20 @@ use tokio::{
 
 use crate::{
   dekit::server::{
-    ConnCtl, ConnReg, ServerCtx, carried, finish, resolve_screen,
+    ConnCtl, ConnReg, ServerCtx, carried, finish, resolve_screen, task_state,
   },
   kernel::{
     copy_mode::CopyMove,
-    kernel_message::{KernelCommand, ScreenHandle, TaskContext, TaskSelector},
+    kernel_message::{
+      KernelCommand, ScreenHandle, TaskContext, TaskSelector, WaitCond,
+      WaitEvent, WaitOn, WaitTask,
+    },
     task::TaskId,
     task_screen::{ObserverId, ScreenNotify, ScrollUnit, TaskScreenCmd},
   },
   protocol::{
     Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Feature, Msg,
-    ScreenCommand, TermCaps, codes,
+    RpcState, ScreenCommand, TermCaps, codes,
     ctl::{
       CopyEvent, EVENT_COPY, EVENT_SCREEN, Hello, input_of, is_input_event,
     },
@@ -162,17 +165,12 @@ async fn run_attached(
       background: caps.background,
     },
   );
-  let mut until = None;
-  let mut ended = false;
-  if attach.until_exit {
-    // The watch is registered before the state query and both go
-    // through the one kernel queue, so an exit is never missed:
-    // either the query already sees it or the watch reports it.
-    until = Some(pc.watch_active(TaskSelector::Id(task)));
-    ended = !kernel_task_state(pc, task)
-      .await
-      .is_some_and(|state| state.is_active());
-  }
+  // Ends once the task has no process and won't start by itself, so a
+  // task still waiting on its deps is not taken for one that has
+  // finished.
+  let until = attach
+    .until_exit
+    .then(|| pc.wait(WaitOn::Ids(vec![task]), WaitCond::Exit));
   let freeze = FreezeInfo { fd, hello, attach };
   let mut painter = Painter::new(caps);
   let end = session(
@@ -182,7 +180,6 @@ async fn run_attached(
     &vt,
     notifies,
     until,
-    ended,
     resumed,
     &mut sender,
     &mut receiver,
@@ -200,11 +197,8 @@ async fn run_attached(
     let _ = sender.queue_out(cleanup.into());
   }
   let bye = match end {
-    SessionEnd::TaskExited => {
-      // Capture the final state and screen before reaping the task.
-      let state = kernel_task_state(pc, task)
-        .await
-        .map(crate::dekit::server::task_state);
+    SessionEnd::TaskExited(state) => {
+      // The final screen, before the task is reaped.
       let screen = final_screen_text(&vt);
       // A foreground `run` (the only `until_exit` caller) owns its
       // task; the runner reaps it here so a client that dies before
@@ -272,21 +266,33 @@ fn final_screen_text(vt: &ScreenHandle) -> Option<String> {
   }
 }
 
+/// The exit wait's verdict, when it is already in: the set as it ended.
+fn verdict_in(
+  until: &mut UnboundedReceiver<WaitEvent>,
+) -> Option<Vec<WaitTask>> {
+  while let Ok(event) = until.try_recv() {
+    if let WaitEvent::Done { tasks, .. } = event {
+      return Some(tasks);
+    }
+  }
+  None
+}
+
+/// The task's final state, as its exit wait saw it end.
+fn exit_state(tasks: &[WaitTask]) -> Option<RpcState> {
+  tasks
+    .first()
+    .map(|task| task_state(task.info.state, task.info.reason))
+}
+
 enum SessionEnd {
   /// The client went away or closed the session.
   Closed,
-  /// `until_exit`: the attached task's execution finished.
-  TaskExited,
+  /// `until_exit`: the attached task's execution finished, with the
+  /// state its wait for the exit saw it end in.
+  TaskExited(Option<RpcState>),
   /// The console sends the client on to another runner.
   Switch { kind: String, root: String },
-}
-
-async fn kernel_task_state(
-  pc: &TaskContext,
-  id: TaskId,
-) -> Option<crate::kernel::task::TaskState> {
-  let tasks = pc.list_tasks(TaskSelector::Id(id)).await;
-  tasks.into_iter().next().map(|task| task.state)
 }
 
 async fn session(
@@ -295,8 +301,7 @@ async fn session(
   observer: ObserverId,
   vt: &ScreenHandle,
   mut notifies: UnboundedReceiver<ScreenNotify>,
-  mut until: Option<UnboundedReceiver<bool>>,
-  mut ended: bool,
+  mut until: Option<UnboundedReceiver<WaitEvent>>,
   resumed: bool,
   sender: &mut ConnSender,
   receiver: &mut ConnReceiver,
@@ -310,6 +315,9 @@ async fn session(
   let mut batch = Vec::new();
   // Frozen for an upgrade: nothing read or painted until thawed.
   let mut frozen = false;
+  // `until_exit`: the task's execution has finished, and how it ended.
+  let mut ended = false;
+  let mut final_state = None;
   // After an upgrade the client still shows the old kernel's paint, and
   // the first paint of the new one is swept in over it. Paints are held
   // until the screen has been quiet for a moment (the console redraws on
@@ -335,7 +343,7 @@ async fn session(
       if !out.is_empty() {
         let _ = sender.queue_out(out.into());
       }
-      return SessionEnd::TaskExited;
+      return SessionEnd::TaskExited(final_state.take());
     }
     let exit_watch = async {
       match until.as_mut() {
@@ -357,7 +365,19 @@ async fn session(
           ));
         }
         Some(ConnCtl::Thaw) => frozen = false,
-        None => return SessionEnd::Closed,
+        // The runner is exiting, which no freeze outlasts. A verdict the
+        // kernel sent last still counts: the run has ended, not the
+        // session.
+        Some(ConnCtl::Close) | None => {
+          match until.as_mut().and_then(verdict_in) {
+            Some(tasks) => {
+              frozen = false;
+              ended = true;
+              final_state = exit_state(&tasks);
+            }
+            None => return SessionEnd::Closed,
+          }
+        }
       },
       // Painted only once the last paint is written: a client that stops
       // reading gets one catch-up paint when it reads again.
@@ -450,11 +470,14 @@ async fn session(
           return SessionEnd::Closed;
         }
       }
-      active = exit_watch, if !frozen => match active {
-        Some(true) => {}
-        Some(false) => ended = true,
-        // The watch channel closes only when the kernel is shutting
-        // down — that is a session close, not a task exit.
+      next = exit_watch, if !frozen => match next {
+        Some(WaitEvent::Done { tasks, .. }) => {
+          ended = true;
+          final_state = exit_state(&tasks);
+        }
+        Some(WaitEvent::Set { .. } | WaitEvent::Changed(_)) => {}
+        // The wait ends without a verdict only when the kernel is
+        // shutting down: a session close, not a task exit.
         None => return SessionEnd::Closed,
       },
       msg = receiver.recv(), if !frozen => match msg {
@@ -732,6 +755,97 @@ mod tests {
     assert_eq!(bye.as_deref(), Some(codes::TASK_EXITED));
 
     finish(pc, sender, receiver, session, kernel_handle).await;
+  }
+
+  /// The runner quits while a `run` is in the foreground: the kernel's
+  /// last step sends the exit verdict, then the connections are told to
+  /// close, and the session can find both waiting. The run ends with
+  /// its task's state, never as a plain close. Frozen, the session
+  /// leaves the verdict unread, so the close is sure to find it waiting.
+  #[tokio::test]
+  async fn until_exit_keeps_the_verdict_sent_as_the_runner_quits() {
+    use crate::{
+      kernel::{
+        task::{Effects, ExitInfo, Task, TaskCmd},
+        task_screen::{ScreenNotify, TaskScreenCmd},
+      },
+      term::{Frame, ScreenHandle, Size},
+    };
+    use tokio::sync::mpsc::UnboundedSender;
+
+    /// A task with a screen that keeps its observers, as a process
+    /// does; it starts and stops at once.
+    struct ScreenStub {
+      sinks: Vec<UnboundedSender<ScreenNotify>>,
+    }
+    impl Task for ScreenStub {
+      fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
+        match cmd {
+          TaskCmd::Start(_) => fx.started(),
+          TaskCmd::Stop | TaskCmd::Kill => fx.stopped(ExitInfo::code(0)),
+          TaskCmd::Msg(msg) => {
+            if let Ok(cmd) = msg.downcast::<TaskScreenCmd>()
+              && let TaskScreenCmd::Attach { sink, .. } = *cmd
+            {
+              self.sinks.push(sink);
+            }
+          }
+          TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
+        }
+      }
+    }
+
+    let config = Arc::new(Config::make_default());
+    for _ in 0..5 {
+      let mut kernel = Kernel::new();
+      let pc = kernel.context();
+      // Started at once; its stop lands as soon as the quit asks for it.
+      kernel.register_task(
+        TaskDef {
+          path: Some(TaskPath::new("fg").unwrap()),
+          pinned: true,
+          vt: Some(ScreenHandle::new(Frame::empty(Size::default()))),
+          ..TaskDef::default()
+        },
+        |_| Box::new(ScreenStub { sinks: Vec::new() }),
+      );
+      let kernel_handle = tokio::spawn(kernel.run());
+      let ctx = ServerCtx::local(pc.clone(), config.clone());
+      let (sender, mut receiver, session) =
+        attach_through(&ctx, local_hello(), "fg", true, 64 * 1024, None).await;
+      // The ok is written from the session loop: its wait for the exit
+      // is in the kernel's queue ahead of the quit.
+      let attached = timeout(Duration::from_secs(2), async {
+        loop {
+          match receiver.recv().await {
+            Some(Ok(Msg::Ctl(CtlMsg::Response(response)))) => {
+              return response.error.is_none();
+            }
+            Some(Ok(_)) => (),
+            Some(Err(_)) | None => return false,
+          }
+        }
+      })
+      .await
+      .unwrap();
+      assert!(attached);
+      drop(ctx.connections.freeze_all().await);
+      pc.send(KernelCommand::Quit);
+      timeout(Duration::from_secs(2), kernel_handle)
+        .await
+        .unwrap()
+        .unwrap();
+      ctx.connections.close_all(Duration::from_millis(500)).await;
+      let bye = wait_for_bye(&mut receiver).await.expect("a bye");
+      assert_eq!(bye.code, codes::TASK_EXITED);
+      assert_eq!(bye.state.map(|state| state.state).as_deref(), Some("idle"));
+      drop(sender);
+      drop(receiver);
+      timeout(Duration::from_secs(2), session)
+        .await
+        .unwrap()
+        .unwrap();
+    }
   }
 
   #[tokio::test]

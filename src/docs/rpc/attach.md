@@ -15,9 +15,12 @@ the runner quit.
 
 With `until_exit: true` the server also ends the session when the
 attached task's execution finishes, after the final screen state is
-painted, with `bye` (`task_exited`) carrying the task's final `state` and
-final `screen` in optional fields. The runner removes the attached task at
-that point, which is what the foreground `run` verb relies on.
+painted. It has finished when it has no process and won't start by
+itself (|rpc/requests#waits|), so a task still waiting on its deps has
+not. The session ends with `bye` (`task_exited`) carrying the task's
+final `state` and final `screen` in optional fields. The runner removes
+the attached task at that point, which is what the foreground `run` verb
+relies on.
 
 The console's runner selector ends a session with `bye` (`quit`)
 carrying `switch: {kind, root}`: the client connects to that runner

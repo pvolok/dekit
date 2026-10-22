@@ -251,7 +251,10 @@ pub fn server_hello(client: &Hello) -> Result<Hello, Bye> {
     ));
   }
   Ok(Hello {
-    features: vec![crate::protocol::ctl::FEATURE_ATCH2.to_string()],
+    features: vec![
+      crate::protocol::ctl::FEATURE_ATCH2.to_string(),
+      crate::protocol::rpc::FEATURE_WAIT.to_string(),
+    ],
     ..local_hello()
   })
 }
