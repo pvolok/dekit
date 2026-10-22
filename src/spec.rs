@@ -51,7 +51,7 @@ impl TaskSpec {
     match &cfg.cmd {
       Some(CmdConfig::Cmd { cmd }) => spec.set("cmd", Some(strings(cmd))),
       Some(CmdConfig::Script { script }) => {
-        spec.set("script", Some(s(&script.to_string_lossy())))
+        spec.set("script", Some(s(&written_path(script))))
       }
       None => (),
     }
@@ -82,7 +82,7 @@ impl TaskSpec {
             }
             Probe::Http(url) => ("http", s(&url.url)),
             Probe::Cmd { argv } => ("cmd", strings(argv)),
-            Probe::File { path } => ("file", s(&path.to_string_lossy())),
+            Probe::File { path } => ("file", s(&written_path(path))),
           };
           map.insert(s(key), value);
           if *interval != DEFAULT_INTERVAL {
@@ -96,7 +96,7 @@ impl TaskSpec {
       spec.set("ready", Some(Value::Mapping(map)));
     }
     if let Some(cwd) = &cfg.cwd {
-      spec.set("cwd", Some(s(&cwd.to_string_lossy())));
+      spec.set("cwd", Some(s(&written_path(Path::new(cwd)))));
     }
     if let Some(env) = &cfg.env {
       let map = env
@@ -106,10 +106,7 @@ impl TaskSpec {
       spec.set("env", Some(Value::Mapping(map)));
     }
     if let Some(add_path) = &cfg.add_path {
-      let items = add_path
-        .iter()
-        .map(|path| s(&path.to_string_lossy()))
-        .collect();
+      let items = add_path.iter().map(|path| s(&written_path(path))).collect();
       spec.set("add_path", Some(Value::Sequence(items)));
     }
     if let Some(autostart) = cfg.autostart {
@@ -249,10 +246,10 @@ impl TaskSpec {
         map.insert(s("enabled"), Value::Bool(enabled));
       }
       if let Some(dir) = &log.dir {
-        map.insert(s("dir"), s(&dir.to_string_lossy()));
+        map.insert(s("dir"), s(&written_path(dir)));
       }
       if let Some(file) = &log.file {
-        map.insert(s("file"), s(&file.to_string_lossy()));
+        map.insert(s("file"), s(&written_path(file)));
       }
       if let Some(mode) = log.mode {
         let mode = match mode {
@@ -486,6 +483,17 @@ impl Source {
   /// Whether it is a folder's entry: its key ends in `/`.
   pub fn is_folder(&self) -> bool {
     self.key.ends_with('/')
+  }
+}
+
+/// A path as a config writes it: `/` between its parts on every platform,
+/// so a file written on Windows reads the same elsewhere.
+pub fn written_path(path: &Path) -> String {
+  let path = path.to_string_lossy();
+  if cfg!(windows) {
+    path.replace('\\', "/")
+  } else {
+    path.into_owned()
   }
 }
 

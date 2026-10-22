@@ -134,6 +134,7 @@ pub fn line_ready(needle: &str, line: &str) -> bool {
 
 /// Whether an sd_notify datagram says the program is ready: one of its
 /// newline-separated `KEY=VALUE` lines is `READY=1`.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn sd_notify_ready(datagram: &[u8]) -> bool {
   datagram
     .split(|b| *b == b'\n')

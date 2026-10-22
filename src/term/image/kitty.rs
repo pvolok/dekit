@@ -4,6 +4,7 @@
 
 use base64::Engine as _;
 
+#[cfg(unix)]
 use super::store::MAX_IMAGE_BYTES;
 
 /// One command's control data.

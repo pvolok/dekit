@@ -156,8 +156,8 @@ impl Project {
 pub fn relative_path(path: &Path, dir: &Path) -> String {
   match path.strip_prefix(dir) {
     Ok(rest) if rest.as_os_str().is_empty() => ".".to_string(),
-    Ok(rest) => rest.to_string_lossy().into_owned(),
-    Err(_) => path.to_string_lossy().into_owned(),
+    Ok(rest) => crate::spec::written_path(rest),
+    Err(_) => crate::spec::written_path(path),
   }
 }
 

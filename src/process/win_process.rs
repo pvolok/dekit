@@ -131,25 +131,15 @@ impl WinProcess {
         None,
       )?;
 
-      // Build environment block
+      // Build environment block. Names are case-insensitive on Windows:
+      // a setting replaces the inherited spelling, whatever its case.
       let mut env_map: std::collections::HashMap<String, String> =
         env::vars().collect();
-      let term_is_explicit =
-        spec.env.keys().any(|key| key.eq_ignore_ascii_case("TERM"));
-      for (key, value) in &spec.env {
-        if let Some(val) = value {
-          env_map.insert(key.clone(), val.clone());
-        } else {
-          env_map.remove(key);
+      for (key, value) in spec.child_env() {
+        env_map.retain(|k, _| !k.eq_ignore_ascii_case(&key));
+        if let Some(value) = value {
+          env_map.insert(key, value);
         }
-      }
-      if !term_is_explicit {
-        // The child talks to dekit's ConPTY/VT implementation, not directly
-        // to the terminal that launched the runner. In particular, inheriting
-        // TERM=dumb makes full-screen applications such as Neovim suppress
-        // their UI even though this PTY supports xterm-style color and input.
-        env_map.retain(|key, _| !key.eq_ignore_ascii_case("TERM"));
-        env_map.insert("TERM".to_string(), "xterm-256color".to_string());
       }
       let mut env_block: Vec<u16> = Vec::new();
       let mut env_pairs: Vec<(&String, &String)> = env_map.iter().collect();

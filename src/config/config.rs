@@ -768,16 +768,16 @@ mod tests {
     let dir = Path::new("/p");
     let watched = |pattern| {
       let w = Watched::load(dir, pattern);
-      (w.dir.to_string_lossy().into_owned(), w.recursive, w.pattern)
+      (w.dir, w.recursive, w.pattern)
     };
     assert_eq!(watched("a.yaml"), ("/p".into(), false, "/p/a.yaml".into()));
     assert_eq!(
       watched("cfg/*.yaml"),
       ("/p/cfg".into(), false, "/p/cfg/*.yaml".into())
     );
-    assert_eq!(watched("apps/*/tasks.yaml").0, "/p/apps");
+    assert_eq!(watched("apps/*/tasks.yaml").0, Path::new("/p/apps"));
     assert!(watched("apps/*/tasks.yaml").1);
-    assert_eq!(watched("**/tasks.yaml").0, "/p");
+    assert_eq!(watched("**/tasks.yaml").0, Path::new("/p"));
     assert!(watched("**/tasks.yaml").1);
     // A last part `**` matches files at any depth under the directory.
     assert_eq!(

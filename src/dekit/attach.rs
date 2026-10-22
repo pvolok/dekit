@@ -577,11 +577,9 @@ mod tests {
       task_path::TaskPath,
     },
     protocol::{
-      Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request,
+      Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Msg, Request,
       RpcRequest, codes,
-      ctl::{
-        CopyEvent, EVENT_COPY, GeometryParams, Hello, InputDialect, local_hello,
-      },
+      ctl::{GeometryParams, Hello, InputDialect, local_hello},
     },
     term::{
       Geometry, TermEvent,
@@ -927,9 +925,10 @@ mod tests {
     finish(pc, sender, receiver, session, kernel_handle).await;
   }
 
-  /// Reads control messages until the bye.
   /// Reads frames until a `copy` event arrives, returning its text.
+  #[cfg(not(windows))]
   async fn wait_for_copy(receiver: &mut ConnReceiver) -> Option<String> {
+    use crate::protocol::ctl::{CopyEvent, EVENT_COPY};
     timeout(Duration::from_secs(2), async {
       loop {
         match receiver.recv().await {
@@ -1152,7 +1151,7 @@ mod tests {
   #[tokio::test]
   async fn screen_commands_drive_copy_mode_on_a_process() {
     use crate::{
-      protocol::{ScreenCommand, ctl::EVENT_SCREEN, screen},
+      protocol::{Event, ScreenCommand, ctl::EVENT_SCREEN, screen},
       task::process_task::{RunCx, process_task},
     };
 

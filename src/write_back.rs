@@ -366,7 +366,7 @@ fn path_in_file(path: &Path, dir: &Path, root: &Path) -> String {
   if written.as_os_str().is_empty() {
     ".".to_string()
   } else {
-    written.to_string_lossy().into_owned()
+    crate::spec::written_path(&written)
   }
 }
 
@@ -835,7 +835,7 @@ mod tests {
     // In the root: written `cwd: .`, which reads back as the root.
     let build = spec(&format!(
       "{{type: job, cmd: [make], cwd: '{}'}}",
-      root.display()
+      crate::spec::written_path(&root)
     ));
     let live = live_with([
       task(1, "api", api.clone(), Some(source.clone())),

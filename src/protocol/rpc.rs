@@ -308,7 +308,8 @@ mod tests {
   /// Every method and every command is in the requests page.
   #[test]
   fn the_requests_page_names_every_method_and_command() {
-    let page = include_str!("../docs/rpc/requests.md");
+    // CRLF on a Windows checkout.
+    let page = include_str!("../docs/rpc/requests.md").replace("\r\n", "\n");
     for method in METHODS {
       assert!(page.contains(&format!("- cmd: {method}\n")), "{method}");
     }

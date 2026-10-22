@@ -220,7 +220,7 @@ impl ProcessRun {
     }
   }
 
-  #[cfg(test)]
+  #[cfg(all(test, not(windows)))]
   pub fn new(spec: ProcessSpec) -> Self {
     Self {
       spec,
@@ -513,6 +513,7 @@ fn sd_notify_snapshot(
   None
 }
 
+#[cfg(unix)]
 fn has_sd_notify_check(config: &ProcessRun) -> bool {
   matches!(
     config.ready,
