@@ -1,6 +1,6 @@
 [package]
 name = "dekit"
-version = "0.10.2"
+version = "0.10.3"
 description = "Process manager for dev and prod"
 homepage = "https://dekit.run"
 documentation = "https://dekit.run/docs"

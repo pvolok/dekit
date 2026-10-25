@@ -1,5 +1,7 @@
 ## Unreleased
 
+## 0.10.3 - 2026-10-25
+
 - A value tagged `!js` in `dekit.yaml` or a fragment is a JavaScript
   expression, computed when the config loads, as in
   `FIXTURES: !js std.path.join(ctx.dir, "fixtures")`; `ctx` has the
