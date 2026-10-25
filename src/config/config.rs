@@ -6,17 +6,18 @@ use anyhow::{Context, Result, bail};
 use crate::cfg::{CfgCx, CfgDoc, CfgNode, CfgObj};
 use crate::config::folder::{FolderConfig, folder_from_cfg, folder_key};
 use crate::config::hook::{Hook, hook_from_cfg};
+use crate::config::js;
 use crate::config::keymap::KeymapConfig;
 use crate::config::log::LogConfig;
 use crate::config::task::{TaskConfig, parse_task_settings, task_from_cfg};
 use crate::config::tui::TuiConfig;
 use crate::kernel::task::{RestartMode, TaskKind};
 use crate::kernel::task_path::{TaskPath, join};
-use crate::runner::user_config_dir;
+use crate::runner::{RunnerSpec, user_config_dir};
 
 pub(crate) const ROOT_KEYS: &[&str] = &[
-  "kernel", "load", "log", "defaults", "on_init", "on_idle", "tasks", "tui",
-  "keymap",
+  "kernel", "load", "log", "defaults", "vars", "on_init", "on_idle", "tasks",
+  "tui", "keymap",
 ];
 const FRAGMENT_KEYS: &[&str] = &["load", "tasks"];
 /// Root keys that moved to the user config.
@@ -126,6 +127,16 @@ pub struct Config {
   pub agent: Option<Vec<String>>,
 }
 
+/// What one load carries from file to file.
+struct Load {
+  /// The project root, which every file must be in.
+  root: PathBuf,
+  /// The files being loaded, from dekit.yaml down, to catch a cycle.
+  stack: Vec<PathBuf>,
+  task_paths: HashSet<String>,
+  js: js::Scope,
+}
+
 /// An entry under `tasks:`.
 #[derive(Clone, Copy)]
 pub enum Entry<'a> {
@@ -191,23 +202,43 @@ impl Config {
     }
   }
 
-  pub fn load_dir(root: &Path) -> Result<Config> {
-    Config::try_load_dir(root).map_err(|(err, _)| err)
+  /// The config of `runner`'s project, as that runner reads it.
+  pub fn load(runner: &RunnerSpec) -> Result<Config> {
+    Config::try_load(runner).map_err(|(err, _)| err)
   }
 
-  /// `load_dir`, but a config that does not load still says what it was
-  /// read from up to the error, where a fix would be made.
-  pub fn try_load_dir(
-    root: &Path,
+  /// `load`, but a config that does not load still says what it was read
+  /// from up to the error, where a fix would be made.
+  pub fn try_load(
+    runner: &RunnerSpec,
   ) -> std::result::Result<Config, (anyhow::Error, Vec<Watched>)> {
     let mut config = Config::make_default();
-    match config.read_dir(root) {
-      Ok(()) => Ok(config),
+    match config.read_dir(runner) {
+      Ok(()) => {
+        config.runner = Some(runner.clone());
+        Ok(config)
+      }
       Err(err) => Err((err, config.watched)),
     }
   }
 
-  fn read_dir(&mut self, root: &Path) -> Result<()> {
+  /// `load` off the async workers, since the `!js` values run as it
+  /// reads.
+  pub async fn load_blocking(runner: &RunnerSpec) -> Result<Config> {
+    let runner = runner.clone();
+    tokio::task::spawn_blocking(move || Config::load(&runner)).await?
+  }
+
+  /// `load` for a project runner at `root`.
+  #[cfg(test)]
+  pub fn load_dir(root: &Path) -> Result<Config> {
+    Config::load(&RunnerSpec {
+      kind: crate::runner::RunnerKind::Project,
+      root: dunce::canonicalize(root).unwrap_or_else(|_| root.into()),
+    })
+  }
+
+  fn read_dir(&mut self, runner: &RunnerSpec) -> Result<()> {
     // A broken personal config must not keep a runner from starting.
     if let Err(error) = self.load_presentation() {
       self
@@ -215,6 +246,7 @@ impl Config {
         .push(format!("ignoring the user config: {error:#}"));
     }
 
+    let root = &runner.root;
     let root = dunce::canonicalize(root).unwrap_or_else(|_| root.into());
     let path = root.join("dekit.yaml");
     // One made later is the config too.
@@ -222,9 +254,14 @@ impl Config {
     if !path.exists() {
       return Ok(());
     }
-    let mut stack = Vec::new();
-    let mut task_paths = HashSet::new();
-    self.load_file(&root, &path, "", true, &mut stack, &mut task_paths)?;
+    let mut load = Load {
+      root: root.clone(),
+      stack: Vec::new(),
+      task_paths: HashSet::new(),
+      js: js::Scope::new(runner),
+    };
+    self.load_file(&mut load, &path, "", true)?;
+    let task_paths = load.task_paths;
     for task in &self.tasks {
       let path = task.path.as_str();
       if let Some(above) = path
@@ -354,12 +391,10 @@ impl Config {
 
   fn load_file(
     &mut self,
-    project_root: &Path,
+    load: &mut Load,
     path: &Path,
     mount: &str,
     is_root: bool,
-    stack: &mut Vec<PathBuf>,
-    task_paths: &mut HashSet<String>,
   ) -> Result<()> {
     let path = dunce::canonicalize(path)
       .with_context(|| format!("failed to load config {}", path.display()))?;
@@ -371,41 +406,35 @@ impl Config {
         path.display()
       );
     }
-    if !path.starts_with(project_root) {
+    if !path.starts_with(&load.root) {
       bail!(
         "config fragment escapes the project root: {}",
         path.display()
       );
     }
-    if let Some(at) = stack.iter().position(|entry| entry == &path) {
-      let mut cycle = stack[at..]
+    if let Some(at) = load.stack.iter().position(|entry| entry == &path) {
+      let mut cycle = load.stack[at..]
         .iter()
         .map(|p| p.display().to_string())
         .collect::<Vec<_>>();
       cycle.push(path.display().to_string());
       bail!("config load cycle: {}", cycle.join(" -> "));
     }
-    stack.push(path.clone());
+    load.stack.push(path.clone());
     self.watch_file(&path);
-    let children = self
-      .read_file(project_root, &path, mount, is_root, task_paths)
-      .map_err(|error| {
-        anyhow::Error::new(InFile {
-          file: path.clone(),
-          error,
-        })
-      })?;
+    let children =
+      self
+        .read_file(load, &path, mount, is_root)
+        .map_err(|error| {
+          anyhow::Error::new(InFile {
+            file: path.clone(),
+            error,
+          })
+        })?;
     for (child, child_mount) in children {
-      self.load_file(
-        project_root,
-        &child,
-        &child_mount,
-        false,
-        stack,
-        task_paths,
-      )?;
+      self.load_file(load, &child, &child_mount, false)?;
     }
-    stack.pop();
+    load.stack.pop();
     Ok(())
   }
 
@@ -413,15 +442,16 @@ impl Config {
   /// with the path each is mounted at.
   fn read_file(
     &mut self,
-    project_root: &Path,
+    load: &mut Load,
     path: &Path,
     mount: &str,
     is_root: bool,
-    task_paths: &mut HashSet<String>,
   ) -> Result<Vec<(PathBuf, String)>> {
     let dir = path.parent().expect("config path has a parent");
     let cx = CfgCx::new(dir.to_path_buf());
-    let doc = CfgDoc::load(path)?;
+    let mut doc = CfgDoc::load(path)?;
+    // The keys first, so a typo is named as one and not by what a `!js`
+    // under it does.
     let obj = doc.root().as_obj()?;
     if is_root {
       // Presentation settings live in the user config now; warn rather
@@ -435,17 +465,30 @@ impl Config {
         }
       }
       obj.known_keys(ROOT_KEYS)?;
-      let _ = parse_kernel(&obj, &cx)?;
-      self.apply_root(&obj, &cx)?;
+      load.js.read_vars(doc.root().raw(), dir)?;
     } else {
+      if let Some(vars) = obj.get("vars") {
+        bail!(vars.error(
+          "'vars' are set in dekit.yaml, and a fragment reads them as ctx.vars"
+        ));
+      }
       obj.known_keys(FRAGMENT_KEYS)?;
     }
+    // `kernel` is the launcher's, which refuses a tag there.
+    load.js.resolve_keys(doc.value_mut(), dir, |key| {
+      key != "kernel" && key != "vars" && !PRESENTATION_KEYS.contains(&key)
+    })?;
+    let obj = doc.root().as_obj()?;
+    if is_root {
+      let _ = parse_kernel(&obj, &cx)?;
+      self.apply_root(&obj, &cx)?;
+    }
     let file = path
-      .strip_prefix(project_root)
+      .strip_prefix(&load.root)
       .unwrap_or(path)
       .to_string_lossy()
       .replace('\\', "/");
-    self.load_tasks(&obj, &cx, &file, mount, task_paths)?;
+    self.load_tasks(&obj, &cx, &file, mount, &mut load.task_paths)?;
 
     let mut children = Vec::new();
     if let Some(load) = obj.get("load") {
@@ -558,6 +601,11 @@ fn parse_kernel(obj: &CfgObj<'_>, cx: &CfgCx) -> Result<Option<KernelConfig>> {
   let Some(node) = obj.get("kernel") else {
     return Ok(None);
   };
+  if js::has_tag(node.raw()) {
+    bail!(
+      node.error("'kernel' can't use !js: it picks the dekit that runs it")
+    );
+  }
   if node.is_string() {
     return match node.as_str()? {
       "npm" => Ok(Some(KernelConfig::Npm)),
@@ -568,8 +616,7 @@ fn parse_kernel(obj: &CfgObj<'_>, cx: &CfgCx) -> Result<Option<KernelConfig>> {
   }
   let kernel = node.as_obj()?;
   kernel.known_keys(&["path"])?;
-  let path: String = kernel.required("path", cx)?;
-  Ok(Some(KernelConfig::Path(cx.resolve_path(&path))))
+  Ok(Some(KernelConfig::Path(kernel.required("path", cx)?)))
 }
 
 fn parse_load_entry(
@@ -798,7 +845,11 @@ mod tests {
     let root = temp_project("broken-fragment");
     std::fs::write(root.join("dekit.yaml"), "load: [b.yaml]\n").unwrap();
     std::fs::write(root.join("b.yaml"), "tasks: [\n").unwrap();
-    let Err((_, watched)) = Config::try_load_dir(&root) else {
+    let runner = RunnerSpec {
+      kind: crate::runner::RunnerKind::Project,
+      root: root.clone(),
+    };
+    let Err((_, watched)) = Config::try_load(&runner) else {
       panic!("b.yaml is broken");
     };
     let b = dunce::canonicalize(root.join("b.yaml")).unwrap();
@@ -997,6 +1048,185 @@ mod tests {
       let err = load_err(yaml);
       assert!(err.contains(expected), "{yaml}: {err}");
     }
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  fn env<'a>(task: &'a TaskConfig, name: &str) -> &'a str {
+    task.env.as_ref().unwrap()[name].as_deref().unwrap()
+  }
+
+  /// A `!js` value is computed where it is written, from `ctx`: the
+  /// file's directory, the runner, and the vars, read in order.
+  #[test]
+  fn js_values_load_in_place() {
+    let root = temp_project("js");
+    std::fs::create_dir(root.join("web")).unwrap();
+    std::fs::write(
+      root.join("dekit.yaml"),
+      r#"vars:
+  data: !js std.path.join(ctx.runner.root, ".data")
+  db: !js ctx.vars.data + "/db"
+  ports: {api: !js 3000 + 1, web: !js 3000}
+load: [{file: web/tasks.yaml, at: web}]
+defaults:
+  env: {DATA: !js ctx.vars.data}
+tasks:
+  api:
+    cmd: !js '["serve", "--port", String(ctx.vars.ports.api)]'
+    env:
+      FOO_DIR: !js std.path.join(ctx.dir, "foo/bar")
+    scrollback_len: !js 500 * 2
+    autostart: !js false
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+      root.join("web/tasks.yaml"),
+      r#"tasks:
+  dev:
+    cmd: npm run dev
+    env:
+      HERE: !js ctx.dir
+      ROOT: !js ctx.runner.root
+      KIND: !js ctx.runner.kind
+      DB: !js ctx.vars.db
+      PORT: !js String(ctx.vars.ports.web)
+"#,
+    )
+    .unwrap();
+    let config = Config::load_dir(&root).unwrap();
+    let root = dunce::canonicalize(&root).unwrap();
+    let data = root.join(".data").to_string_lossy().into_owned();
+    assert_eq!(
+      config.defaults.env.as_ref().unwrap()["DATA"],
+      Some(data.clone())
+    );
+    let api = &config.tasks[0];
+    assert!(matches!(
+      &api.cmd,
+      Some(crate::config::task::CmdConfig::Cmd { cmd }) if cmd == &["serve", "--port", "3001"]
+    ));
+    assert_eq!(env(api, "FOO_DIR"), root.join("foo/bar").to_string_lossy());
+    assert_eq!(api.scrollback_len, Some(1000));
+    assert_eq!(api.autostart, Some(false));
+    let dev = &config.tasks[1];
+    assert_eq!(dev.path, "web/dev");
+    assert_eq!(env(dev, "HERE"), root.join("web").to_string_lossy());
+    assert_eq!(env(dev, "ROOT"), root.to_string_lossy());
+    assert_eq!(env(dev, "KIND"), "project");
+    assert_eq!(env(dev, "DB"), format!("{data}/db"));
+    assert_eq!(env(dev, "PORT"), "3000");
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn js_errors_name_the_value() {
+    let root = temp_project("js-errors");
+    std::fs::write(root.join("web.yaml"), "vars: {a: 1}\n").unwrap();
+    let load_err = |yaml: &str| {
+      std::fs::write(root.join("dekit.yaml"), yaml).unwrap();
+      match Config::load_dir(&root) {
+        Ok(_) => panic!("expected an error for {yaml}"),
+        Err(err) => format!("{err:#}"),
+      }
+    };
+    for (yaml, expected) in [
+      (
+        "tasks:\n  api: {cmd: !js dri}\n",
+        "!js: ReferenceError: dri is not defined at <config>.tasks.api.cmd",
+      ),
+      (
+        "tasks:\n  api: {cmd: x, autostart: !js \"'yes'\"}\n",
+        "expected bool at <config>.tasks.api.autostart",
+      ),
+      // A var sees only the ones before it.
+      (
+        "vars:\n  a: !js ctx.vars.b\n  b: 1\n",
+        "!js: returned undefined, which is not data at <config>.vars.a",
+      ),
+      ("vars: [1]\n", "expected object at <config>.vars"),
+      ("vars: !js '[1]'\n", "expected object at <config>.vars"),
+      (
+        "load: [web.yaml]\n",
+        "'vars' are set in dekit.yaml, and a fragment reads them as ctx.vars",
+      ),
+      ("kernel: !js \"'npm'\"\n", "'kernel' can't use !js"),
+      ("kernel: {path: !js ctx.dir}\n", "'kernel' can't use !js"),
+      (
+        "tasks:\n  api: {cmd: !shell x}\n",
+        "unknown tag !shell; the one tag dekit reads is !js at <config>.tasks.api.cmd",
+      ),
+      (
+        "tasks:\n  api: {cmd: !js [x]}\n",
+        "!js takes an expression, written as a string, at <config>.tasks.api.cmd",
+      ),
+      (
+        "tasks:\n  api:\n    cmd: !js\n",
+        "!js has no expression at <config>.tasks.api.cmd",
+      ),
+      (
+        "tasks:\n  ? !js \"'api'\"\n  : {cmd: x}\n",
+        "a key can't have a tag at <config>.tasks",
+      ),
+      // A typo is named as one, whatever is under it.
+      (
+        "tsks:\n  api: {cmd: !js dri}\n",
+        "unknown field 'tsks' at <config>; did you mean 'tasks'?",
+      ),
+      (
+        "tasks:\n  api: {cmd: x, cwd: <CONFIG_DIR>/api}\n",
+        "'<CONFIG_DIR>' is not supported: a relative path is from the file's \
+         directory already at <config>.tasks.api.cwd",
+      ),
+    ] {
+      let err = load_err(yaml);
+      assert!(err.contains(expected), "{yaml}: {err}");
+    }
+    // The launcher reads `kernel` alone, and refuses it the same way.
+    std::fs::write(root.join("dekit.yaml"), "kernel: !js \"'npm'\"\n").unwrap();
+    let err = format!("{:#}", Config::load_kernel(&root).unwrap_err());
+    assert!(err.contains("'kernel' can't use !js"), "{err}");
+    let _ = std::fs::remove_dir_all(root);
+  }
+
+  /// `load`, the hooks, and `vars` as one expression take `!js` too; the
+  /// presentation keys dekit.yaml ignores are not evaluated; `ctx.runner`
+  /// is the runner that loads.
+  #[test]
+  fn js_values_under_load_hooks_and_a_host_runner() {
+    let root = temp_project("js-keys");
+    std::fs::write(
+      root.join("dekit.yaml"),
+      r#"vars: !js '{kind: ctx.runner.kind}'
+load: [!js '"web" + ".yaml"']
+on_idle: {command: start, target: !js '"+" + ctx.vars.kind'}
+tui: {theme: !js dri}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+      root.join("web.yaml"),
+      "tasks:\n  web: {cmd: x, env: {KIND: !js ctx.runner.kind}}\n",
+    )
+    .unwrap();
+    let runner = RunnerSpec {
+      kind: crate::runner::RunnerKind::Host,
+      root: dunce::canonicalize(&root).unwrap(),
+    };
+    let config = Config::load(&runner).unwrap();
+    assert_eq!(config.runner.as_ref(), Some(&runner));
+    assert_eq!(env(&config.tasks[0], "KIND"), "host");
+    match &config.on_idle {
+      Some(Hook::Command(crate::command::Command::Start { target })) => {
+        assert_eq!(target.to_string(), "+host")
+      }
+      _ => panic!("on_idle is not a start"),
+    }
+    assert!(
+      config.warnings.iter().any(|w| w.contains("'tui'")),
+      "{:?}",
+      config.warnings
+    );
     let _ = std::fs::remove_dir_all(root);
   }
 }

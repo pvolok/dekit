@@ -23,7 +23,7 @@ impl LogConfig {
       self.level = Some(level);
     }
     if let Some(file) = log_obj.get("file") {
-      self.file = Some(cx.resolve_path(file.as_str()?));
+      self.file = Some(cx.path(&file)?);
     }
 
     Ok(())

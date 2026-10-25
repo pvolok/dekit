@@ -48,20 +48,29 @@ impl Project {
   }
 
   /// Sees a change each time a file the config on disk is read from
-  /// changes, or the base does; the files are watched from the first
-  /// call on.
-  pub fn changes(&self) -> watch::Receiver<u64> {
-    let mut watch = self.watch();
-    if watch.is_none() {
-      match ConfigWatch::new(self.changes.clone()) {
-        Ok(mut started) => {
-          started.set(&self.config().watched);
-          *watch = Some(started);
-        }
-        Err(err) => log::warn!("Can't watch the config for changes: {err}"),
-      }
-    }
+  /// changes, or the base does. The files are watched from the first
+  /// call on, set up off the async workers: the system's watcher can take
+  /// seconds to start while its daemon is busy, and the caller's loop
+  /// must not wait for it.
+  pub fn changes(self: &Arc<Self>) -> watch::Receiver<u64> {
+    let project = self.clone();
+    tokio::task::spawn_blocking(move || project.start_watch());
     self.changes.subscribe()
+  }
+
+  /// Watches what the config is read from, once.
+  fn start_watch(&self) {
+    let mut watch = self.watch();
+    if watch.is_some() {
+      return;
+    }
+    match ConfigWatch::new(self.changes.clone()) {
+      Ok(mut started) => {
+        started.set(&self.config().watched);
+        *watch = Some(started);
+      }
+      Err(err) => log::warn!("Can't watch the config for changes: {err}"),
+    }
   }
 
   /// `load` off the async workers: it reads and parses files and walks
@@ -125,10 +134,10 @@ impl Project {
   /// as that got when it does not load.
   pub fn load(&self) -> anyhow::Result<Config> {
     let current = self.config();
-    let Some(runner) = current.runner.clone() else {
+    let Some(runner) = &current.runner else {
       anyhow::bail!("this runner has no project to reload");
     };
-    let loaded = Config::try_load_dir(&runner.root);
+    let loaded = Config::try_load(runner);
     let mut watch = self.watch();
     if let Some(watch) = watch.as_mut() {
       watch.set(match &loaded {
@@ -136,9 +145,7 @@ impl Project {
         Err((_, watched)) => watched,
       });
     }
-    let mut config = loaded.map_err(|(err, _)| err)?;
-    config.runner = Some(runner);
-    Ok(config)
+    loaded.map_err(|(err, _)| err)
   }
 
   /// The config a reload carried out, and the base it leaves.

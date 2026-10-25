@@ -15,7 +15,7 @@ use lib::protocol::{
   ctl::{GeometryParams, InputDialect},
 };
 use lib::runner::socket::connect_socket;
-use lib::term::{Geometry, TermEvent, key::Key};
+use lib::term::{Geometry, Size, TermEvent, key::Key, screen::Screen};
 
 mod common;
 use common::{DEKIT, TestRunner, stderr_of as stderr, task_line, wait_until};
@@ -58,25 +58,35 @@ impl TestRunner {
   }
 }
 
-/// The ticker prints its own pid first; `screen` shows the task's terminal.
+/// The ticker prints its own pid with every tick, so it is on the screen
+/// however far the ticks have scrolled; `screen` shows the task's terminal.
 fn child_pid(runner: &TestRunner) -> u32 {
   pid_of(runner, "ticker")
 }
 
 fn pid_of(runner: &TestRunner, task: &str) -> u32 {
   let screen = runner.ok(&["screen", task]);
+  // The line being written when the screen is taken can be cut short;
+  // the longest pid line is whole.
   screen
     .lines()
-    .find_map(|line| line.trim().strip_prefix("pid ")?.trim().parse().ok())
+    .filter_map(|line| line.trim().strip_prefix("pid "))
+    .map(str::trim)
+    .max_by_key(|pid| pid.len())
+    .and_then(|pid| pid.parse().ok())
     .unwrap_or_else(|| panic!("{task} printed no pid: {screen}"))
 }
 
 fn last_tick(runner: &TestRunner) -> Option<u64> {
-  let screen = runner.ok(&["screen", "ticker"]);
-  screen
+  last_tick_in(&runner.ok(&["screen", "ticker"]))
+}
+
+/// The newest tick a screen's text shows.
+fn last_tick_in(text: &str) -> Option<u64> {
+  text
     .lines()
     .filter_map(|line| line.trim().strip_prefix("tick ")?.trim().parse().ok())
-    .last()
+    .max()
 }
 
 #[tokio::test]
@@ -88,15 +98,19 @@ async fn upgrade_keeps_child_client_and_identity() {
     "--",
     "sh",
     "-c",
-    "echo pid $$; i=0; while true; do echo tick $i; i=$((i+1)); sleep 0.1; done",
+    "i=0; while true; do echo pid $$; echo tick $i; i=$((i+1)); sleep 0.1; done",
   ]);
   wait_until("first ticks", || last_tick(&runner).is_some_and(|t| t >= 2));
   let pid_before = child_pid(&runner);
   let record_before = runner.record();
 
   // An attached client, driven over the wire like the terminal client.
-  let (mut sender, mut receiver) = attach(&runner, "ticker").await;
-  assert!(saw(&mut receiver, b"tick").await, "attach paints before");
+  let (mut sender, receiver) = attach(&runner, "ticker").await;
+  let mut shown = Shown::new(receiver);
+  assert!(
+    shown.until(|text| text.contains("tick")).await,
+    "attach paints before"
+  );
 
   let tick_before = last_tick(&runner).unwrap();
   let out = runner.upgrade();
@@ -122,15 +136,22 @@ async fn upgrade_keeps_child_client_and_identity() {
   let ls = runner.ok(&["ls"]);
   assert!(ls.contains("ticker") && ls.contains("ready"), "{ls}");
 
-  // The attached client is still attached: it gets the repaint, and its
-  // input still reaches the child (Ctrl-C ends the loop).
-  assert!(saw(&mut receiver, b"tick").await, "attach paints after");
+  // The attached client is still attached: it gets the repaint, which
+  // brings in the ticks since, and its input still reaches the child
+  // (Ctrl-C ends the loop).
+  assert!(
+    shown
+      .until(|text| last_tick_in(text) > Some(tick_before))
+      .await,
+    "attach paints after:\n{}",
+    shown.text()
+  );
   send_key(&mut sender, "<C-c>").await;
   wait_until("child exit after Ctrl-C", || {
     runner.ok(&["ls"]).contains("exited")
   });
   drop(sender);
-  drop(receiver);
+  drop(shown);
 
   runner.stop();
 }
@@ -335,25 +356,57 @@ async fn attach(
   (sender, receiver)
 }
 
-/// Reads `Out` frames until one contains `needle`.
-async fn saw(receiver: &mut ConnReceiver, needle: &[u8]) -> bool {
-  tokio::time::timeout(Duration::from_secs(5), async {
-    let mut out = Vec::new();
-    loop {
-      match receiver.recv().await {
-        Some(Ok(Msg::Out(bytes))) => {
-          out.extend_from_slice(&bytes);
-          if out.windows(needle.len()).any(|w| w == needle) {
-            return true;
-          }
-        }
-        Some(Ok(Msg::Ctl(_))) => (),
-        Some(Err(_)) | None => return false,
-      }
+/// What an attached client shows: its frames, fed to a terminal of the
+/// attach's geometry. The bytes themselves say little: the paint after a
+/// resume sweeps the screen in cells, and a paint sends what changed, so
+/// a word on the screen is rarely whole in them.
+struct Shown {
+  receiver: ConnReceiver,
+  screen: Screen,
+}
+
+impl Shown {
+  const WIDTH: u16 = 80;
+  const HEIGHT: u16 = 24;
+
+  fn new(receiver: ConnReceiver) -> Self {
+    let size = Size {
+      height: Self::HEIGHT,
+      width: Self::WIDTH,
+    };
+    Self {
+      receiver,
+      screen: Screen::new(size, 0),
     }
-  })
-  .await
-  .unwrap_or(false)
+  }
+
+  /// Reads frames until the screen's text satisfies `shows`, or 10
+  /// seconds pass.
+  async fn until(&mut self, shows: impl Fn(&str) -> bool) -> bool {
+    tokio::time::timeout(Duration::from_secs(10), async {
+      loop {
+        if shows(&self.text()) {
+          return true;
+        }
+        match self.receiver.recv().await {
+          Some(Ok(Msg::Out(bytes))) => self.screen.process(&bytes),
+          Some(Ok(Msg::Ctl(_))) => (),
+          Some(Err(_)) | None => return false,
+        }
+      }
+    })
+    .await
+    .unwrap_or(false)
+  }
+
+  /// The screen's text, a line per row.
+  fn text(&self) -> String {
+    let frame = self.screen.frame();
+    (0..Self::HEIGHT)
+      .map(|row| frame.row_text(row, 0, Self::WIDTH))
+      .collect::<Vec<_>>()
+      .join("\n")
+  }
 }
 
 async fn send_key(sender: &mut ConnSender, spec: &str) {

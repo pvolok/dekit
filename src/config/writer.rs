@@ -2744,6 +2744,19 @@ defaults:
       &[set("b", "cwd", "z"), rename("a", "c")],
       "x: &c [a]\ntasks:\n  c:\n    cmd: *c\n  b:\n    cmd: y\n    cwd: z\n",
     );
+    // A `!js` value is never replaced by what it computed.
+    assert_eq!(
+      refused(
+        "tasks:\n  a:\n    cmd: !js ctx.dir\n",
+        &[set("a", "cwd", "y")]
+      ),
+      "task a uses a tag"
+    );
+    check(
+      "vars:\n  d: !js ctx.dir\ntasks:\n  a:\n    cmd: !js '[ctx.vars.d]'\n  b:\n    cmd: y\n",
+      &[set("b", "cwd", "z")],
+      "vars:\n  d: !js ctx.dir\ntasks:\n  a:\n    cmd: !js '[ctx.vars.d]'\n  b:\n    cmd: y\n    cwd: z\n",
+    );
     // Removing an anchor could break its aliases.
     assert_eq!(
       refused(

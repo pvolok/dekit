@@ -209,7 +209,7 @@ fn parse_task_settings_unchecked(
 ) -> Result<TaskConfig> {
   let mut p = TaskConfig::default();
   if let Some(cwd) = obj.get("cwd") {
-    p.cwd = Some(cx.resolve_path(cwd.as_str()?).into_os_string());
+    p.cwd = Some(cx.path(&cwd)?.into_os_string());
   }
   p.env = obj.optional("env", cx)?;
   p.add_path = obj.optional("add_path", cx)?;
@@ -336,7 +336,7 @@ fn cmd_from_cfg(node: &CfgNode<'_>, cx: &CfgCx) -> Result<CmdConfig> {
       cmd: argv_from_cfg(&cmd)?,
     }),
     (None, Some(script)) => {
-      let path = cx.resolve_path(script.as_str()?);
+      let path = cx.path(&script)?;
       if !is_script(&path) {
         bail!(script.error("script must be a .js or .mjs file"));
       }

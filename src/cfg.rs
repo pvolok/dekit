@@ -43,7 +43,7 @@ impl Display for CfgPath {
 
 /// Context provided during config loading.
 pub struct CfgCx {
-  /// Parent directory of the config file, for resolving `<CONFIG_DIR>`.
+  /// Parent directory of the config file, which relative paths are from.
   pub config_dir: PathBuf,
 }
 
@@ -52,15 +52,24 @@ impl CfgCx {
     Self { config_dir }
   }
 
-  /// A path from the config: relative to its directory, or under a
-  /// `<CONFIG_DIR>` prefix. Without `.` and `..` steps, taken as written,
-  /// so a path compares equal however it is written: `.` is the directory
-  /// itself, and `../api` from `web` is `api`.
-  pub fn resolve_path(&self, path: &str) -> PathBuf {
-    let path = match path.strip_prefix("<CONFIG_DIR>") {
-      Some(rest) => self.config_dir.join(rest.trim_start_matches(['/', '\\'])),
-      None => self.config_dir.join(path),
-    };
+  /// The path `node` holds, relative to the config's directory.
+  pub fn path(&self, node: &CfgNode<'_>) -> Result<PathBuf> {
+    let path = node.as_str()?;
+    if path.starts_with("<CONFIG_DIR>") {
+      bail!(node.error(
+        "'<CONFIG_DIR>' is not supported: a relative path is from the \
+         file's directory already"
+      ));
+    }
+    Ok(self.resolve_path(path))
+  }
+
+  /// A path from the config, relative to its directory. Without `.` and
+  /// `..` steps, taken as written, so a path compares equal however it is
+  /// written: `.` is the directory itself, and `../api` from `web` is
+  /// `api`.
+  fn resolve_path(&self, path: &str) -> PathBuf {
+    let path = self.config_dir.join(path);
     let mut resolved = PathBuf::new();
     for component in path.components() {
       match (component, resolved.components().next_back()) {
@@ -94,6 +103,11 @@ impl CfgDoc {
   pub fn load(path: &Path) -> Result<Self> {
     let content = std::fs::read_to_string(path)?;
     Ok(Self::from_value(serde_yaml::from_str(&content)?))
+  }
+
+  /// The tree, to change before it is parsed, as `!js` values are.
+  pub fn value_mut(&mut self) -> &mut Value {
+    &mut self.resolved
   }
 
   /// Root node of the resolved tree, ready for parsing.
@@ -456,7 +470,7 @@ impl FromCfg for f64 {
 
 impl FromCfg for PathBuf {
   fn from_cfg(node: &CfgNode<'_>, cx: &CfgCx) -> Result<Self> {
-    Ok(cx.resolve_path(node.as_str()?))
+    cx.path(node)
   }
 }
 
@@ -510,7 +524,6 @@ mod tests {
     assert_eq!(cx.resolve_path("."), Path::new("/p"));
     assert_eq!(cx.resolve_path("./a/./b"), Path::new("/p/a/b"));
     assert_eq!(cx.resolve_path("/q/."), Path::new("/q"));
-    assert_eq!(cx.resolve_path("<CONFIG_DIR>/."), Path::new("/p"));
     assert_eq!(cx.resolve_path("../q/../r"), Path::new("/r"));
     assert_eq!(cx.resolve_path("/../.."), Path::new("/"));
     let relative = CfgCx::new(PathBuf::from("p"));

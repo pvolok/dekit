@@ -29,6 +29,9 @@ use crate::task::config_tasks::{config_base, config_specs, dep_indexes};
 pub struct WritePlan {
   pub items: Vec<WriteItem>,
   root: PathBuf,
+  /// The runner of the config planned from, which reads it again after a
+  /// write.
+  runner: Option<crate::runner::RunnerSpec>,
 }
 
 #[derive(Clone, Debug)]
@@ -344,6 +347,7 @@ pub fn plan(
   WritePlan {
     items,
     root: root.to_path_buf(),
+    runner: config.runner.clone(),
   }
 }
 
@@ -540,8 +544,7 @@ pub fn write(plan: &WritePlan) -> Vec<(String, String)> {
   }
   // As a fresh start takes it: deps on what the config lacks fail there.
   if !before.is_empty()
-    && let Err(err) =
-      Config::load_dir(&plan.root).and_then(|config| dep_indexes(&config))
+    && let Err(err) = load_again(plan).and_then(|config| dep_indexes(&config))
   {
     for (path, old) in before {
       let undone = match old {
@@ -556,6 +559,14 @@ pub fn write(plan: &WritePlan) -> Vec<(String, String)> {
     failed.extend(written.iter().map(|item| (item.path.clone(), why.clone())));
   }
   failed
+}
+
+/// The config as the runner of `plan` reads it.
+fn load_again(plan: &WritePlan) -> anyhow::Result<Config> {
+  match &plan.runner {
+    Some(runner) => Config::load(runner),
+    None => anyhow::bail!("the config has no runner to read it"),
+  }
 }
 
 /// After a write, by the writer or an agent: each entry that reads back

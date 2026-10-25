@@ -2,6 +2,7 @@ pub mod config;
 pub mod duration;
 pub mod folder;
 pub mod hook;
+pub mod js;
 pub mod keymap;
 pub mod legacy;
 pub mod log;

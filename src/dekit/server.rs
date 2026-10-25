@@ -267,8 +267,7 @@ async fn run_locked(
   lock_guard: &lockfile::LockFileGuard,
 ) -> anyhow::Result<()> {
   let working_dir = runner.root.clone();
-  let mut config = Config::load_dir(&working_dir)?;
-  config.runner = Some(runner.clone());
+  let config = Config::load_blocking(runner).await?;
   let keymap = config.keymap.build();
   let config = Arc::new(config);
   let project = Project::new(config.clone());

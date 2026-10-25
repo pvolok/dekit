@@ -162,9 +162,7 @@ fn parse_log_config(
       file: None,
       mode: None,
     })),
-    Value::String(dir) => {
-      Ok(Some(TaskLogConfig::with_dir(cx.resolve_path(dir))))
-    }
+    Value::String(_) => Ok(Some(TaskLogConfig::with_dir(cx.path(node)?))),
     Value::Mapping(_) => {
       let obj = node.as_obj()?;
       obj.known_keys(&["enabled", "dir", "file", "mode", "append"])?;
@@ -172,12 +170,12 @@ fn parse_log_config(
       let enabled = obj.default("enabled", true, cx)?;
 
       let dir = match obj.get("dir") {
-        Some(dir) if !dir.is_null() => Some(cx.resolve_path(dir.as_str()?)),
+        Some(dir) if !dir.is_null() => Some(cx.path(&dir)?),
         _ => None,
       };
 
       let file = match obj.get("file") {
-        Some(file) if !file.is_null() => Some(cx.resolve_path(file.as_str()?)),
+        Some(file) if !file.is_null() => Some(cx.path(&file)?),
         _ => None,
       };
 

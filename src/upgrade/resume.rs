@@ -65,7 +65,7 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
   let paths = runner_paths(&runner)?;
   let log_level = args.log_level.as_deref();
   if args.check {
-    return check(&snapshot, &runner, log_level);
+    return check(&snapshot, &runner, log_level).await;
   }
   // Only the process that wrote the snapshot holds what it names.
   if std::process::id() != snapshot.pid {
@@ -73,7 +73,7 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
   }
 
   // From here this process is the runner.
-  let (config, _logger) = resumed_config(&runner, log_level);
+  let (config, _logger) = resumed_config(&runner, log_level).await;
   let project = Project::new(config.clone());
   print_warnings(&config.warnings);
   log::info!(
@@ -174,7 +174,7 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
 /// the switch: it loads what resume loads, builds what resume builds, and
 /// restores the graph with tasks that never start. Nothing inherited is
 /// touched.
-fn check(
+async fn check(
   snapshot: &snap::Snapshot,
   runner: &RunnerSpec,
   log_level: Option<&str>,
@@ -187,7 +187,7 @@ fn check(
       snapshot.pid
     );
   }
-  let (config, _logger) = resumed_config(runner, log_level);
+  let (config, _logger) = resumed_config(runner, log_level).await;
   check_graph(snapshot, &Project::new(config))?;
   println!("ok {}", snapshot.pid);
   Ok(())
@@ -197,18 +197,18 @@ fn check(
 /// snapshot's, so a dekit.yaml that does not load, or log settings that
 /// don't work, fall back to the defaults with a warning rather than keep
 /// the runner from going on: the check finds what the resume will.
-fn resumed_config(
+async fn resumed_config(
   runner: &RunnerSpec,
   log_level: Option<&str>,
 ) -> (Arc<Config>, Option<crate::logging::LoggerHandle>) {
-  let mut config = Config::load_dir(&runner.root).unwrap_or_else(|err| {
+  let mut config = Config::load_blocking(runner).await.unwrap_or_else(|err| {
     let mut config = Config::make_default();
+    config.runner = Some(runner.clone());
     config
       .warnings
       .push(format!("ignoring dekit.yaml: {err:#}"));
     config
   });
-  config.runner = Some(runner.clone());
   let logger = match init_logging(&config, log_level, &runner.root) {
     Ok(logger) => logger,
     Err(err) => {

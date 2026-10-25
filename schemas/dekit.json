@@ -46,6 +46,10 @@
       "$ref": "#/$defs/taskSettings",
       "unevaluatedProperties": false
     },
+    "vars": {
+      "type": "object",
+      "description": "Values for !js to read as ctx.vars, in order."
+    },
     "log": {
       "type": "object",
       "additionalProperties": false,

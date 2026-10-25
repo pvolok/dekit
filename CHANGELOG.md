@@ -1,5 +1,11 @@
 ## Unreleased
 
+- A value tagged `!js` in `dekit.yaml` or a fragment is a JavaScript
+  expression, computed when the config loads, as in
+  `FIXTURES: !js std.path.join(ctx.dir, "fixtures")`; `ctx` has the
+  file's `dir`, the `runner`, and the `vars`
+- `vars:` in `dekit.yaml` names values that `!js` reads as `ctx.vars`, in
+  order
 - `dekit wait <target>` waits until tasks are ready, or with `--for exit`
   until they have exited, and exits 0, 1 for a failure, or 124 when
   `--timeout` runs out; `--timeout 0` checks once

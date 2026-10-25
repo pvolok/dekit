@@ -27,6 +27,18 @@ pub fn init(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
   Ok(())
 }
 
+/// The `std` a `!js` config value sees: what reads nothing and has no
+/// effects, so a config loads the same wherever and whenever it does.
+pub fn init_config(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
+  let obj = Object::new(ctx.clone())?;
+  let path = path::init(ctx.clone())?;
+  // It reads the working directory.
+  path.remove("resolve")?;
+  obj.set("path", path)?;
+  ctx.globals().set("std", obj)?;
+  Ok(())
+}
+
 pub(crate) fn register_lazy<'js>(
   obj: &Object<'js>,
   name: &str,

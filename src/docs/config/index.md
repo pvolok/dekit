@@ -1,14 +1,15 @@
 ---
 title: Config
 summary: dekit.yaml, its fragments, and the user config.yaml.
-related: [config/tasks, config/load, config/kernel, config/hooks, config/user]
+related: [config/tasks, config/load, config/js, config/kernel, config/hooks, config/user]
 ---
 
 A project is the nearest `dekit.yaml` in the current directory or above.
 It lists the tasks (|config/tasks|) and can pull in more files
-(|config/load|), pin a dekit version (|config/kernel|), and run hooks
-(|config/hooks|). Key bindings and TUI settings are yours, not the
-project's: they live in the user config (|config/user|).
+(|config/load|), compute values in JavaScript (|config/js|), pin a dekit
+version (|config/kernel|), and run hooks (|config/hooks|). Key bindings
+and TUI settings are yours, not the project's: they live in the user
+config (|config/user|).
 
 Relative paths resolve from the file that declares them.
 
@@ -36,6 +37,9 @@ on_idle: {command: down}
 - key: defaults
   type: object
   desc: Task settings shared by every task, such as `cwd`, `env`, `autorestart`, or `stop`. A task's own value wins. Not `type` or `ready`.
+- key: vars
+  type: object
+  desc: Values for `!js` to read as `ctx.vars`, in order (|config/js#vars|).
 - key: load
   type: "(string | {file, at})[]"
   desc: More files with tasks, as globs (|config/load|).

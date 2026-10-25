@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use notify::event::Flag;
 use notify::{
   Event, EventHandler, EventKind, PollWatcher, RecursiveMode, Watcher,
 };
@@ -22,6 +23,8 @@ pub struct ConfigWatch {
   /// Each directory watched, and whether deeper too.
   dirs: Vec<(PathBuf, bool)>,
   wanted: Arc<Mutex<Wanted>>,
+  #[cfg(test)]
+  seen: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 /// What a change has to touch to count.
@@ -55,6 +58,9 @@ impl Wanted {
 struct Changed {
   wanted: Arc<Mutex<Wanted>>,
   changes: Arc<watch::Sender<u64>>,
+  /// Every path an event named, for a test to tell what has arrived.
+  #[cfg(test)]
+  seen: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl EventHandler for Changed {
@@ -63,11 +69,20 @@ impl EventHandler for Changed {
       Ok(event) => event,
       Err(err) => return log::debug!("Config watch: {err}"),
     };
+    #[cfg(test)]
+    self
+      .seen
+      .lock()
+      .unwrap()
+      .extend(event.paths.iter().cloned());
     if matches!(event.kind, EventKind::Access(_)) {
       return;
     }
     let wanted = Wanted::lock(&self.wanted);
-    if event.paths.iter().any(|path| wanted.counts(path)) {
+    // A rescan notice means events were lost, a change maybe among them.
+    if event.attrs.flag() == Some(Flag::Rescan)
+      || event.paths.iter().any(|path| wanted.counts(path))
+    {
       self.changes.send_modify(|n| *n = n.wrapping_add(1));
     }
   }
@@ -76,24 +91,55 @@ impl EventHandler for Changed {
 impl ConfigWatch {
   /// Bumps `changes` on each change to what it is `set` to watch.
   pub fn new(changes: Arc<watch::Sender<u64>>) -> notify::Result<Self> {
-    let wanted = Arc::new(Mutex::new(Wanted::default()));
-    let handler = Changed {
-      wanted: wanted.clone(),
-      changes,
-    };
-    let watcher: Box<dyn Watcher + Send> =
+    Self::with(changes, |handler| {
       match notify::recommended_watcher(handler.clone()) {
-        Ok(watcher) => Box::new(watcher),
+        Ok(watcher) => Ok(Box::new(watcher)),
         Err(err) => {
           log::warn!("Polling the config for changes: {err}");
           let config = notify::Config::default().with_poll_interval(POLL_EVERY);
-          Box::new(PollWatcher::new(handler, config)?)
+          Ok(Box::new(PollWatcher::new(handler, config)?))
         }
-      };
+      }
+    })
+  }
+
+  /// `new`, but looking at the files every `every` whatever the system
+  /// offers, and at their contents: a test can't wait on the system's
+  /// notifications, which take seconds when its daemon is busy, and a
+  /// write within the second of the last look leaves the modification
+  /// time as it was.
+  #[cfg(test)]
+  fn polling(
+    changes: Arc<watch::Sender<u64>>,
+    every: Duration,
+  ) -> notify::Result<Self> {
+    Self::with(changes, |handler| {
+      let config = notify::Config::default()
+        .with_poll_interval(every)
+        .with_compare_contents(true);
+      Ok(Box::new(PollWatcher::new(handler, config)?))
+    })
+  }
+
+  fn with(
+    changes: Arc<watch::Sender<u64>>,
+    watcher: impl FnOnce(Changed) -> notify::Result<Box<dyn Watcher + Send>>,
+  ) -> notify::Result<Self> {
+    let wanted = Arc::new(Mutex::new(Wanted::default()));
+    #[cfg(test)]
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let watcher = watcher(Changed {
+      wanted: wanted.clone(),
+      changes,
+      #[cfg(test)]
+      seen: seen.clone(),
+    })?;
     Ok(ConfigWatch {
       watcher,
       dirs: Vec::new(),
       wanted,
+      #[cfg(test)]
+      seen,
     })
   }
 
@@ -153,11 +199,43 @@ impl ConfigWatch {
 
 #[cfg(test)]
 mod tests {
-  use std::time::Duration;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::time::{Duration, Instant};
 
   use super::*;
   use crate::config::config::Config;
+  use crate::runner::RunnerSpec;
   use crate::test_util::TempDir;
+
+  /// How often the tests' watches look at the files.
+  const POLL: Duration = Duration::from_millis(20);
+
+  /// Whether a change is reported in time.
+  async fn changed(rx: &mut watch::Receiver<u64>) -> bool {
+    tokio::time::timeout(Duration::from_secs(10), rx.changed())
+      .await
+      .is_ok()
+  }
+
+  /// Waits until the watch has reported all it will of what was written
+  /// so far: a file that does not count is written under `root`, and its
+  /// event means a look since the write, which took in the earlier ones.
+  async fn delivered(watch: &ConfigWatch, root: &Path) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let root = dunce::canonicalize(root).unwrap();
+    let marker =
+      root.join(format!(".sync{}", N.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&marker, "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !watch.seen.lock().unwrap().contains(&marker) {
+      assert!(
+        Instant::now() < deadline,
+        "no event for {}",
+        marker.display()
+      );
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  }
 
   /// A change to a file the config is read from, or a new one its `load`
   /// pattern matches, is seen; one to any other file is not.
@@ -175,25 +253,20 @@ mod tests {
     let config = Config::load_dir(&root).unwrap();
 
     let (changes, mut rx) = watch::channel(0);
-    let mut watch = ConfigWatch::new(Arc::new(changes)).unwrap();
+    let mut watch = ConfigWatch::polling(Arc::new(changes), POLL).unwrap();
     watch.set(&config.watched);
     // Whatever the setup itself stirred up.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    delivered(&watch, &root).await;
     rx.mark_unchanged();
 
-    let changed = async |rx: &mut watch::Receiver<u64>| {
-      tokio::time::timeout(Duration::from_secs(5), rx.changed())
-        .await
-        .is_ok()
-    };
     std::fs::write(root.join("notes.txt"), "x").unwrap();
     std::fs::write(root.join("cfg/notes.txt"), "x").unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    delivered(&watch, &root).await;
     assert!(!rx.has_changed().unwrap(), "not what the config reads");
 
     std::fs::write(root.join("cfg/c.yaml"), "tasks: {}\n").unwrap();
     assert!(changed(&mut rx).await, "a new fragment");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    delivered(&watch, &root).await;
     rx.mark_unchanged();
     // As editors save: a new file renamed over the old one.
     std::fs::write(root.join(".dekit.yaml.tmp"), "tasks: {}\n").unwrap();
@@ -211,13 +284,16 @@ mod tests {
     let dir = TempDir::new("watch-later");
     std::fs::write(dir.0.join("dekit.yaml"), "load: ['gen/*.yaml']\n").unwrap();
     let root = dunce::canonicalize(&dir.0).unwrap();
-    let watched = |root: &Path| match Config::try_load_dir(root) {
+    let watched = |root: &Path| match Config::try_load(&RunnerSpec {
+      kind: crate::runner::RunnerKind::Project,
+      root: root.to_path_buf(),
+    }) {
       Ok(config) => config.watched,
       Err((_, watched)) => watched,
     };
 
     let (changes, mut rx) = watch::channel(0);
-    let mut watch = ConfigWatch::new(Arc::new(changes)).unwrap();
+    let mut watch = ConfigWatch::polling(Arc::new(changes), POLL).unwrap();
     watch.set(&watched(&root));
     // The project root, besides the user config's directory.
     assert!(
@@ -226,19 +302,14 @@ mod tests {
       watch.dirs
     );
     assert!(!watch.dirs.iter().any(|(dir, _)| *dir == root.join("gen")));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    delivered(&watch, &root).await;
     rx.mark_unchanged();
 
-    let changed = async |rx: &mut watch::Receiver<u64>| {
-      tokio::time::timeout(Duration::from_secs(5), rx.changed())
-        .await
-        .is_ok()
-    };
     std::fs::create_dir(root.join("gen")).unwrap();
     assert!(changed(&mut rx).await, "gen made");
     watch.set(&watched(&root));
     assert!(watch.dirs.contains(&(root.join("gen"), false)));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    delivered(&watch, &root).await;
     rx.mark_unchanged();
     std::fs::write(root.join("gen/a.yaml"), "tasks: {}\n").unwrap();
     assert!(changed(&mut rx).await, "a fragment in it");
