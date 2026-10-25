@@ -299,9 +299,15 @@ mod tests {
     assert_eq!(eval("Object.create(null)"), Ok(yaml("{}")));
     assert_eq!(eval("`${ctx.dir}/x` // a comment"), Ok(yaml("/p/x")));
     assert_eq!(eval("ctx.vars.n * 3"), Ok(yaml("6")));
+    // `join` uses the OS separator, so the expected value is built the
+    // same way.
+    let joined = std::path::Path::new("/p")
+      .join("a")
+      .to_string_lossy()
+      .into_owned();
     assert_eq!(
       eval("std.path.join(ctx.runner.root, 'a')"),
-      Ok(yaml("/p/a"))
+      Ok(Yaml::String(joined))
     );
   }
 
