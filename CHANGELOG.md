@@ -1,5 +1,9 @@
 ## Unreleased
 
+- The console shows a service as `STARTING` until its ready check
+  passes, and a task winding down as `STOPPING`, instead of `UP`; a
+  group's count takes only the tasks that are up
+
 ## 0.10.3 - 2026-10-25
 
 - A value tagged `!js` in `dekit.yaml` or a fragment is a JavaScript

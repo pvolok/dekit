@@ -39,7 +39,7 @@ impl TaskView {
   }
 
   pub fn is_up(&self) -> bool {
-    self.status.is_active()
+    self.status.is_up(self.kind)
   }
 
   /// Ended badly: a non-zero exit, or not ready in time.

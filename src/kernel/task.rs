@@ -208,6 +208,15 @@ impl TaskState {
       | TaskState::Exited(_) => false,
     }
   }
+
+  /// The run got as far as runs get before they end: ready, or running
+  /// for a job, which is never ready.
+  pub fn is_up(&self, kind: TaskKind) -> bool {
+    match kind {
+      TaskKind::Service => *self == TaskState::Ready,
+      TaskKind::Job => *self == TaskState::Running,
+    }
+  }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -492,15 +501,6 @@ impl TaskHandle {
       | TaskState::Running
       | TaskState::Ready
       | TaskState::Backoff(_) => false,
-    }
-  }
-
-  /// Its run got as far as runs get before they end: ready, or running
-  /// for a job, which is never ready.
-  pub fn is_up(&self) -> bool {
-    match self.kind {
-      TaskKind::Service => self.state == TaskState::Ready,
-      TaskKind::Job => self.state == TaskState::Running,
     }
   }
 

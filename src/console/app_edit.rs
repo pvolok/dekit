@@ -352,7 +352,7 @@ impl App {
       Some((_, Node::Task(task))) => RemoveTaskModal {
         target: Target::Id(task.id),
         what: format!("task {}", task.name()),
-        running: task.is_up(),
+        running: task.status.is_active(),
       },
       Some((path, Node::Group(group))) => RemoveTaskModal {
         target: Target::glob(path.as_str()),
@@ -360,7 +360,7 @@ impl App {
           0 => format!("{} {path}/", group_noun(group)),
           n => format!("{} {path}/ and its {n} tasks", group_noun(group)),
         },
-        running: group.up > 0,
+        running: self.state.tasks.any_active(path),
       },
       None => return,
     };
@@ -384,18 +384,18 @@ impl App {
     };
     let (title, items) = match selected {
       Some((path, Node::Task(task))) => {
-        let up = task.is_up();
+        let active = task.status.is_active();
         let own = self.state.config.own.contains(&task.id);
         let edited = self.state.config.edited.contains(&task.id);
         let mut items = vec![
-          if up {
+          if active {
             item("Stop", Action::StopTask)
           } else {
             item("Start", Action::StartTask)
           },
           item("Restart", Action::RestartTask),
           item("Force restart", Action::ForceRestartTask),
-          item("Kill", Action::KillTask).enabled(up),
+          item("Kill", Action::KillTask).enabled(active),
           item("Edit…", Action::ShowEditTask).separated(),
           item("Duplicate…", Action::ShowDuplicateTask),
           item("Copy command", Action::CopyTaskCommand),
@@ -414,7 +414,8 @@ impl App {
       Some((path, Node::Group(group))) => {
         let items = vec![
           item("Start all", Action::StartTask),
-          item("Stop all", Action::StopTask).enabled(group.up > 0),
+          item("Stop all", Action::StopTask)
+            .enabled(self.state.tasks.any_active(path)),
           item("Restart all", Action::RestartTask),
           item("Add a task here…", Action::ShowAddTask).separated(),
           if group.collapsed {

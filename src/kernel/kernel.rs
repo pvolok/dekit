@@ -1753,7 +1753,9 @@ impl Graph {
         // stayed up ends the backoff; one that never got ready counts,
         // however long it ran.
         let uptime = task.last_start.map(|t| now.duration_since(t));
-        if task.is_up() && uptime.is_some_and(|t| t > BACKOFF_RESET) {
+        if task.state.is_up(task.kind)
+          && uptime.is_some_and(|t| t > BACKOFF_RESET)
+        {
           task.attempts = 0;
         }
         self.land_exit(task_id, info);

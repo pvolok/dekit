@@ -12,7 +12,7 @@ use crate::console::{
 };
 use crate::kernel::{
   task::{TaskId, TaskState},
-  task_path::TaskPath,
+  task_path::{TaskPath, is_at_or_under},
 };
 use crate::term::grid::Rect;
 
@@ -398,6 +398,15 @@ impl TaskTree {
     self.nodes.values().filter_map(|node| match node {
       Node::Task(task) => Some(task),
       Node::Group(_) => None,
+    })
+  }
+
+  /// A task at or under `path` has a process, up or not: a stop or a
+  /// removal would end it.
+  pub fn any_active(&self, path: &TaskPath) -> bool {
+    self.iter().any(|task| {
+      task.status.is_active()
+        && is_at_or_under(task.path.as_str(), path.as_str())
     })
   }
 
@@ -941,7 +950,7 @@ mod tests {
       Some(Node::Group(group)) => Some((group.len(), group.up, group.failed)),
       Some(Node::Task(_)) | None => None,
     };
-    tree.set_status(TaskId(1), TaskState::Running);
+    tree.set_status(TaskId(1), TaskState::Ready);
     tree.set_status(TaskId(2), TaskState::Exited(ExitInfo::code(1)));
     assert_eq!(counts(&tree), Some((2, 1, 1)));
 
@@ -949,6 +958,33 @@ mod tests {
     assert_eq!(counts(&tree), Some((1, 1, 0)));
     tree.remove(TaskId(1));
     assert_eq!(counts(&tree), None);
+  }
+
+  /// A service is up once its ready check passes, a job while it runs;
+  /// either is active from its start until it has stopped.
+  #[test]
+  fn counts_a_service_up_once_ready() {
+    let mut tree = tree(&["web/api", "web/worker", "webhook"]);
+    if let Some(task) = tree.task_mut(TaskId(2)) {
+      task.kind = crate::kernel::task::TaskKind::Job;
+    }
+    let web = TaskPath::new("web").unwrap();
+    let up = |tree: &TaskTree| match tree.nodes.get("web") {
+      Some(Node::Group(group)) => Some(group.up),
+      Some(Node::Task(_)) | None => None,
+    };
+    tree.set_status(TaskId(3), TaskState::Running);
+    assert!(!tree.any_active(&web), "webhook is not under web");
+
+    tree.set_status(TaskId(1), TaskState::Running);
+    assert_eq!(up(&tree), Some(0), "waiting on its ready check");
+    assert!(tree.any_active(&web));
+    tree.set_status(TaskId(2), TaskState::Running);
+    assert_eq!(up(&tree), Some(1), "the job");
+    tree.set_status(TaskId(1), TaskState::Ready);
+    assert_eq!(up(&tree), Some(2));
+    tree.set_status(TaskId(1), TaskState::Stopping);
+    assert_eq!(up(&tree), Some(1));
   }
 
   #[test]

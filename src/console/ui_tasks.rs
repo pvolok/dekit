@@ -199,6 +199,16 @@ fn task_status(
   if task.is_up() {
     return (Cow::from(" UP "), theme.up);
   }
+  match task.status {
+    TaskState::Starting | TaskState::Running | TaskState::Ready => {
+      return (Cow::from(" STARTING "), theme.pending);
+    }
+    TaskState::Stopping => return (Cow::from(" STOPPING "), theme.pending),
+    TaskState::Idle
+    | TaskState::Backoff(_)
+    | TaskState::Done(_)
+    | TaskState::Exited(_) => (),
+  }
   let color = match (task.failed(), task.exit_code()) {
     (true, _) => theme.failed,
     (false, Some(_)) => theme.done,
@@ -240,4 +250,46 @@ fn group_status(
     theme.down
   };
   (Cow::from(format!(" {}/{} ", group.up, group.len())), color)
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Arc;
+
+  use super::*;
+  use crate::kernel::{
+    kernel_message::ScreenHandle, task::TaskId, task_path::TaskPath,
+  };
+  use crate::term::{Frame, Size};
+
+  fn label(kind: TaskKind, status: TaskState) -> String {
+    let task = TaskView {
+      id: TaskId(1),
+      label: None,
+      path: Arc::new(TaskPath::new("api").unwrap()),
+      kind,
+      status,
+      vt: ScreenHandle::new(Frame::empty(Size::default())),
+      present: None,
+    };
+    task_status(&task, &Theme::dark().tasks)
+      .0
+      .trim()
+      .to_string()
+  }
+
+  /// A service is UP once its ready check passes, not when it spawns.
+  #[test]
+  fn labels_a_task_by_how_far_its_run_got() {
+    use TaskKind::{Job, Service};
+    assert_eq!(label(Service, TaskState::Starting), "STARTING");
+    assert_eq!(label(Service, TaskState::Running), "STARTING");
+    assert_eq!(label(Service, TaskState::Ready), "UP");
+    assert_eq!(label(Job, TaskState::Starting), "STARTING");
+    assert_eq!(label(Job, TaskState::Running), "UP");
+    assert_eq!(label(Service, TaskState::Stopping), "STOPPING");
+    assert_eq!(label(Service, TaskState::Idle), "DOWN");
+    let exited = TaskState::Exited(ExitInfo::code(1));
+    assert_eq!(label(Service, exited), "DOWN (1)");
+  }
 }

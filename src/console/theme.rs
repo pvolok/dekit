@@ -61,6 +61,8 @@ pub struct TaskListTheme {
   /// The `/` or `/…` after a group name.
   pub mark: Rgb,
   pub up: Rgb,
+  /// On its way up or down: STARTING, STOPPING.
+  pub pending: Rgb,
   pub down: Rgb,
   /// Ended with code 0: DONE, DOWN (0).
   pub done: Rgb,
@@ -133,6 +135,7 @@ impl Theme {
       tasks: TaskListTheme {
         mark: Rgb(0x91, 0x98, 0xa1),
         up: Rgb(0x56, 0xd3, 0x64),
+        pending: Rgb(0xe3, 0xb3, 0x41),
         down: Rgb(0xa3, 0xac, 0xb8),
         done: Rgb(0x79, 0xc0, 0xff),
         failed: Rgb(0xff, 0xa1, 0x98),
@@ -193,6 +196,7 @@ impl Theme {
       tasks: TaskListTheme {
         mark: Rgb(0x59, 0x63, 0x6e),
         up: Rgb(0x1a, 0x7f, 0x37),
+        pending: Rgb(0x9a, 0x67, 0x00),
         down: Rgb(0x59, 0x63, 0x6e),
         done: Rgb(0x09, 0x69, 0xda),
         failed: Rgb(0xd1, 0x24, 0x2f),
