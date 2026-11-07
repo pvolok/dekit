@@ -9,6 +9,7 @@ use crate::config::config::{Config, KernelConfig};
 pub mod datagram;
 pub mod kill;
 pub mod lockfile;
+pub mod projects;
 pub mod recent;
 pub mod socket;
 pub mod spawn;
@@ -180,6 +181,14 @@ pub fn home_dir() -> Option<PathBuf> {
   std::env::var_os("HOME")
     .or_else(|| std::env::var_os("USERPROFILE"))
     .map(PathBuf::from)
+}
+
+/// The user config, `config.yaml` in the user config dir, canonical as
+/// far as the dir exists.
+pub fn user_config_file() -> anyhow::Result<PathBuf> {
+  let dir = user_config_dir()?;
+  let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+  Ok(dir.join("config.yaml"))
 }
 
 pub fn user_config_dir() -> anyhow::Result<PathBuf> {

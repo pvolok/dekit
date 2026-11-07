@@ -17,6 +17,9 @@ A command looks upward from the current directory for `dekit.yaml`, then
 for a git repository, then for a `package.json`. A `dekit.yaml` wins even
 when another marker is closer. `-C <dir>` names the root explicitly.
 
+The console's runner list (`<P>`) also shows the projects you list in
+the user config (|config/user|, |cli/project|), whether they run or not.
+
 `up`, `start`, `restart`, `run`, `spawn`, and `attach` start the runner
 when it is not running. The runner then starts only what the command
 asks for; |cli/runner/start| starts it and nothing else.

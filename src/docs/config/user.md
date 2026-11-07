@@ -1,12 +1,12 @@
 ---
 title: User config
-summary: Key bindings and TUI settings in the user config.yaml, shared by every project.
-related: [config, cli/attach]
+summary: Key bindings, TUI settings, and your projects in the user config.yaml, shared by every project.
+related: [config, cli/attach, cli/project]
 order: 50
 ---
 
-Key bindings and TUI settings are yours, so they live in your user config
-rather than in `dekit.yaml`: `~/.config/dekit/config.yaml`
+Key bindings, TUI settings, and the list of your projects are yours, so
+they live in your user config rather than in `dekit.yaml`: `~/.config/dekit/config.yaml`
 (`$XDG_CONFIG_HOME/dekit/config.yaml` when that is set,
 `%APPDATA%\dekit\config.yaml` on Windows). A runner reads it when it
 starts. If the file has an error, dekit warns and skips that part.
@@ -47,6 +47,32 @@ keymap:
   default: auto
   desc: Console colors. `auto` follows the terminal's background (asked with OSC 11, else `COLORFGBG`), and is dark when neither says.
 :::
+
+## Projects
+
+`projects` lists the projects you switch between, so the console's
+runner list (`<P>`) can show them and open one whether or not its runner
+is up. An entry is a project root, or a dir and `/*` for every dir in it:
+
+```yaml
+projects:
+  - ~/dev/*
+  - ~/oss/mprocs
+```
+
+Hidden dirs are left out. Entries are absolute or start with `~/`; the
+home dir itself is `"~"`, quoted, since a bare `~` is YAML's null. A
+project goes by its folder's name. |cli/project/list| shows what the
+list comes to.
+
+:::fields kind=config
+- key: projects.*
+  type: string
+  desc: A project root, or `dir/*` for every dir in `dir`.
+:::
+
+In the console, `<P>` lists the current runner, then the projects, then
+the other running runners.
 
 ## Agent
 
@@ -126,7 +152,7 @@ show-main-menu (the
 menu under the `dekit` badge, also by clicking it), detach, quit (stops
 the runner without saving, like |cli/runner/stop|),
 `{action: show-runner-select, tab: open}` to open a project from any
-directory, `{action: switch-runner, kind: project, root: /abs/path}` to
+directory (`tab` is `projects`, `recent`, or `open`), `{action: switch-runner, kind: project, root: /abs/path}` to
 move the attachment to another runner's console, and
 `{action: command, command: {...}}` to run any command from
 |config/hooks|.

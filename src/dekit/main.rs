@@ -709,12 +709,10 @@ fn runner_from_ref(runner: &Runner) -> anyhow::Result<RunnerSpec> {
       None => anyhow::bail!("unknown runner '{}'", name),
     },
     Runner::Path(path) => {
-      let path = match path.strip_prefix("~/") {
-        Some(rest) => match crate::runner::home_dir() {
-          Some(home) => home.join(rest),
-          None => anyhow::bail!("HOME (or USERPROFILE) is not set"),
-        },
-        None => PathBuf::from(path),
+      let home = crate::runner::home_dir();
+      let Some(path) = crate::runner::projects::untilde(path, home.as_deref())
+      else {
+        anyhow::bail!("HOME (or USERPROFILE) is not set");
       };
       RunnerSpec::project(&path)
     }
@@ -722,6 +720,68 @@ fn runner_from_ref(runner: &Runner) -> anyhow::Result<RunnerSpec> {
       anyhow::bail!("remote runners are not available yet: {}", url)
     }
   }
+}
+
+/// `dekit project`: the user config's `projects:` list.
+fn project_command(sub_m: &clap::ArgMatches, json: bool) -> anyhow::Result<()> {
+  let Some(("list", _)) = sub_m.subcommand() else {
+    anyhow::bail!("expected a subcommand after `dekit project` (list)");
+  };
+  let listed = crate::runner::projects::read()?;
+  let running: Vec<PathBuf> = lockfile::list_runners()?
+    .into_iter()
+    .filter(|info| info.is_running && info.contents.kind == RunnerKind::Project)
+    .map(|info| PathBuf::from(info.contents.root))
+    .collect();
+  if json {
+    let list: Vec<_> = listed
+      .projects
+      .iter()
+      .map(|project| {
+        serde_json::json!({
+          "name": project.name,
+          "root": project.root,
+          "running": running.contains(&project.root),
+          "from": project.from,
+        })
+      })
+      .collect();
+    println!(
+      "{}",
+      serde_json::json!({ "projects": list, "warnings": listed.warnings })
+    );
+    return Ok(());
+  }
+  if listed.projects.is_empty() {
+    println!(
+      "No projects are listed. Add roots, or '~/dev/*' for every dir in ~/dev, to `projects:` in the user config."
+    );
+  }
+  let name_w = (listed.projects.iter())
+    .map(|project| project.name.width())
+    .max()
+    .unwrap_or(0);
+  for project in &listed.projects {
+    let state = if running.contains(&project.root) {
+      "running"
+    } else {
+      "stopped"
+    };
+    let from = (project.from.as_ref())
+      .map(|from| format!("  (from {from})"))
+      .unwrap_or_default();
+    let pad = name_w - project.name.width();
+    println!(
+      "{}{}  {state:7}  {}{from}",
+      project.name,
+      " ".repeat(pad),
+      listed.tilde(&project.root),
+    );
+  }
+  for warning in &listed.warnings {
+    eprintln!("warning: {warning}");
+  }
+  Ok(())
 }
 
 /// Runner selection for `dekit runner` subcommands: an explicit runner
@@ -989,6 +1049,10 @@ pub fn cli() -> ClapCommand {
         .about("Print the current screen of a task")
         .arg(Arg::new("target").required(true).help("Task path")),
       runner_command,
+      ClapCommand::new("project")
+        .about("List your projects, from the user config")
+        .subcommands([ClapCommand::new("list")
+          .about("List the known projects, running or not")]),
       ClapCommand::new("kernel")
         .about("Inspect kernel selection and manage the user default")
         .subcommands([
@@ -1450,6 +1514,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         );
       }
     },
+    Some(("project", sub_m)) => project_command(sub_m, json)?,
     Some(("kernel", sub_m)) => match sub_m.subcommand() {
       Some(("status", _)) => {
         let runner = resolve_runner(&matches)?;

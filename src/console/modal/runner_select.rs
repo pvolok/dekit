@@ -13,7 +13,9 @@ use crate::console::{
 use crate::runner::{
   RunnerKind, RunnerSpec, home_dir,
   lockfile::{self, now_secs},
-  project_marker, recent,
+  project_marker,
+  projects::{self, Project},
+  recent,
 };
 use crate::term::{
   CursorStyle, Grid,
@@ -29,7 +31,7 @@ use crate::console::widgets::border::{
 };
 
 /// The runners this machine knows, in three tabs: `switch` lists the
-/// running ones, `recent` the projects opened before, and `open` walks
+/// user's projects and the running runners, `recent` the projects opened before, and `open` walks
 /// the file system. Picking one moves the attachment that picked to that
 /// runner's console, starting the runner when it is not up.
 pub struct RunnerSelectModal {
@@ -65,11 +67,18 @@ impl RunnerSelectModal {
       log::warn!("Cannot list recent projects: {err:#}");
       Vec::new()
     });
+    let listed = projects::read().map_or_else(
+      |err| {
+        log::warn!("Cannot list your projects: {err:#}");
+        Vec::new()
+      },
+      |listed| listed.projects,
+    );
     RunnerSelectModal {
       tab,
       switch: Picker::new(
-        switch_items(&found, current),
-        "No runners are running.",
+        switch_items(&found, &listed, current),
+        "No projects are listed or running.",
         error,
       ),
       recent: Picker::new(
@@ -96,33 +105,49 @@ struct RunnerItem {
   current: bool,
 }
 
-/// The running runners: the current one first, then by name.
+/// The current runner, the user's projects in their order, running or
+/// not, then the other running runners by name.
 fn switch_items(
   found: &[lockfile::RunnerInfo],
+  listed: &[Project],
   current: Option<&RunnerSpec>,
 ) -> Vec<RunnerItem> {
-  let mut items: Vec<RunnerItem> = found
-    .iter()
-    .filter(|info| info.is_running)
-    .map(|info| {
-      let record = &info.contents;
-      let spec = record.spec();
-      RunnerItem {
-        name: runner_name(&spec),
-        current: current == Some(&spec),
-        kind: spec.kind,
-        root: record.root.clone(),
-        tail: format!("v{}", record.version),
-        running: true,
-      }
+  let item = |spec: RunnerSpec| {
+    let record = (found.iter())
+      .find(|info| info.is_running && info.contents.spec() == spec)
+      .map(|info| &info.contents);
+    RunnerItem {
+      name: runner_name(&spec),
+      current: current == Some(&spec),
+      root: spec.root.to_string_lossy().into_owned(),
+      kind: spec.kind,
+      tail: record.map_or_else(String::new, |r| format!("v{}", r.version)),
+      running: record.is_some(),
+    }
+  };
+  let listed: Vec<RunnerSpec> = (listed.iter())
+    .map(|project| RunnerSpec {
+      kind: RunnerKind::Project,
+      root: project.root.clone(),
     })
     .collect();
-  items.sort_by(|a, b| {
-    b.current
-      .cmp(&a.current)
-      .then_with(|| a.name.cmp(&b.name))
-      .then_with(|| a.root.cmp(&b.root))
-  });
+  let is_current = |spec: &RunnerSpec| current == Some(spec);
+  let mut others: Vec<RunnerItem> = (found.iter())
+    .filter(|info| info.is_running)
+    .map(|info| info.contents.spec())
+    .filter(|spec| !is_current(spec) && !listed.contains(spec))
+    .map(item)
+    .collect();
+  others.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.root.cmp(&b.root)));
+  let mut items: Vec<RunnerItem> =
+    current.cloned().map(item).into_iter().collect();
+  items.extend(
+    listed
+      .into_iter()
+      .filter(|spec| !is_current(spec))
+      .map(item),
+  );
+  items.extend(others);
   items
 }
 
@@ -943,5 +968,71 @@ mod tests {
     };
     assert!(matches!(modal.handle_mouse(&click), ModalResult::Keep));
     assert_eq!(modal.tab, RunnerTab::Open);
+  }
+
+  fn running(
+    kind: RunnerKind,
+    root: &Path,
+    version: &str,
+  ) -> lockfile::RunnerInfo {
+    lockfile::RunnerInfo {
+      contents: lockfile::RunnerRecord {
+        schema: 1,
+        protocol: 1,
+        kind,
+        owner: lockfile::OwnerInfo {
+          pid: 1,
+          start_time: 0,
+          sid: 1,
+        },
+        socket: String::new(),
+        root: root.to_string_lossy().into_owned(),
+        started_at: 0,
+        version: version.to_string(),
+        binary: String::new(),
+        warnings: Vec::new(),
+      },
+      is_running: true,
+    }
+  }
+
+  #[test]
+  fn switch_lists_current_projects_then_other_runners() {
+    let temp = TempDir::new("switch-projects");
+    let home = dunce::canonicalize(&temp.0).unwrap();
+    for dir in ["dev/api", "dev/web", "other", "host"] {
+      std::fs::create_dir_all(home.join(dir)).unwrap();
+    }
+    let listed = projects::parse_for_test("projects:\n  - ~/dev/*\n", &home);
+    let current = RunnerSpec {
+      kind: RunnerKind::Project,
+      root: home.join("dev/web"),
+    };
+    let found = [
+      running(RunnerKind::Project, &home.join("dev/api"), "0.10.3"),
+      running(RunnerKind::Project, &home.join("other"), "0.10.2"),
+      running(RunnerKind::Host, &home.join("host"), "0.10.3"),
+      running(RunnerKind::Project, &home.join("dev/web"), "0.10.3"),
+    ];
+    let items = switch_items(&found, &listed.projects, Some(&current));
+    let rows: Vec<(&str, bool, &str)> = (items.iter())
+      .map(|item| (item.name.as_str(), item.running, item.tail.as_str()))
+      .collect();
+    assert_eq!(
+      rows,
+      [
+        ("web", true, "v0.10.3"),
+        ("api", true, "v0.10.3"),
+        ("host", true, "v0.10.3"),
+        ("other", true, "v0.10.2"),
+      ]
+    );
+    assert!(items[0].current);
+
+    let items = switch_items(&found[1..2], &listed.projects, None);
+    let rows: Vec<(&str, bool)> = (items.iter())
+      .map(|item| (item.name.as_str(), item.running))
+      .collect();
+    assert_eq!(rows, [("api", false), ("web", false), ("other", true)]);
   }
 }

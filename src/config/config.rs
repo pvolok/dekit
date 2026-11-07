@@ -13,7 +13,7 @@ use crate::config::task::{TaskConfig, parse_task_settings, task_from_cfg};
 use crate::config::tui::TuiConfig;
 use crate::kernel::task::{RestartMode, TaskKind};
 use crate::kernel::task_path::{TaskPath, join};
-use crate::runner::{RunnerSpec, user_config_dir};
+use crate::runner::{RunnerSpec, user_config_file};
 
 pub(crate) const ROOT_KEYS: &[&str] = &[
   "kernel", "load", "log", "defaults", "vars", "on_init", "on_idle", "tasks",
@@ -22,7 +22,7 @@ pub(crate) const ROOT_KEYS: &[&str] = &[
 const FRAGMENT_KEYS: &[&str] = &["load", "tasks"];
 /// Root keys that moved to the user config.
 pub(crate) const PRESENTATION_KEYS: &[&str] = &["tui", "keymap"];
-const USER_KEYS: &[&str] = &["tui", "keymap", "agent"];
+const USER_KEYS: &[&str] = &["tui", "keymap", "agent", "projects"];
 
 /// Where a change can change a config: a directory, whether what is
 /// deeper under it counts too, and what a changed path there must match.
@@ -332,11 +332,13 @@ impl Config {
 
   fn load_presentation(&mut self) -> Result<()> {
     // No user config dir (HOME/XDG unset) means no user config to load.
-    let Ok(dir) = user_config_dir() else {
+    let Ok(path) = user_config_file() else {
       return Ok(());
     };
-    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
-    let path = dir.join("config.yaml");
+    let dir = path
+      .parent()
+      .expect("the user config is in a dir")
+      .to_owned();
     // Watched like dekit.yaml: an edit to it is a change to the config,
     // and one made later is the config too.
     self.watch_file(&path);

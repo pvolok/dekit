@@ -3,6 +3,10 @@
 - The console shows a service as `STARTING` until its ready check
   passes, and a task winding down as `STOPPING`, instead of `UP`; a
   group's count takes only the tasks that are up
+- `projects:` in the user config lists your projects: roots, and
+  `~/projects/*` for every dir in a folder. The console's `switch` tab (`<P>`)
+  shows them, running or not
+- `dekit project list` shows what the list comes to
 
 ## 0.10.3 - 2026-10-25
 
