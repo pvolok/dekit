@@ -57,6 +57,9 @@ pub struct Grid {
   /// Images composed into this grid from other frames (a UI grid),
   /// shared with the frames published of it.
   extra_images: Arc<ImageTable>,
+  /// The lines this grid logs (`dekit logs`); only a task's main screen
+  /// has one.
+  log: Option<LineLog>,
 
   /// For a grid drawn as a UI: where its cursor shows.
   pub cursor_pos: Option<Pos>,
@@ -99,6 +102,7 @@ impl Grid {
       placeholder_slots: Vec::new(),
       dropped_images: Vec::new(),
       extra_images: Arc::default(),
+      log: None,
       cursor_pos: None,
       cursor_style: CursorStyle::Default,
     }
@@ -722,6 +726,7 @@ impl Grid {
     let to_history = full_screen && self.history.capacity() > 0;
     let width = self.size.width;
     for _ in 0..count {
+      self.log_scroll_off(top, bottom);
       // The top row moves to the bottom and is blanked there, reused when
       // nothing else holds it.
       self.rows[top..=bottom].rotate_left(1);
@@ -768,6 +773,13 @@ impl Grid {
     }
     self.rotate_down(top, bottom, count, style);
     self.shift_placements(top as u16, bottom as u16, count as i64);
+    // Logged rows inside the region move down with it.
+    if let Some(log) = &mut self.log {
+      let frontier = usize::from(log.frontier);
+      if frontier > top && frontier <= bottom {
+        log.frontier = (frontier + count).min(bottom + 1) as u16;
+      }
+    }
   }
 
   /// Moves rows `top..=bottom` down by `count`, blank rows entering at
@@ -909,38 +921,189 @@ impl Grid {
     row.used_len(|id| styles.get(id).is_visible_blank())
   }
 
-  /// The text of the logical line live row `row` ends: the rows that
-  /// wrapped into it (and the history line the first row continues),
-  /// then the row itself, trailing blanks trimmed. Cut at
-  /// `MAX_LINE_TEXT` bytes.
-  pub fn line_text(&self, row: u16) -> String {
-    let row = usize::from(row).min(self.rows.len().saturating_sub(1));
-    let mut first = row;
+  // Log lines
+
+  /// Starts logging lines, from the cursor's line on.
+  pub fn enable_log(&mut self) {
+    self.log = Some(LineLog::default());
+    self.anchor_log();
+  }
+
+  /// After rows moved under the log (a reflow, a restore): what is above
+  /// the cursor's line counts as logged, and the part of that line in
+  /// history is its prefix.
+  fn anchor_log(&mut self) {
+    let first = self.line_start(self.pos.row);
+    let in_history = (first == 0 && self.history.is_open())
+      .then(|| self.history.last().map(|line| line.text.clone()))
+      .flatten();
+    let Some(log) = &mut self.log else {
+      return;
+    };
+    log.frontier = first;
+    if let Some(text) = in_history {
+      log.prefix = text;
+    } else if first > 0 {
+      log.prefix.clear();
+    }
+  }
+
+  /// The cursor leaves its row with a newline: the line it ends is
+  /// logged, unless it already was.
+  pub fn log_newline(&mut self) {
+    let row = self.pos.row;
+    let text = match &self.log {
+      Some(log) if row >= log.frontier => self.log_text(&log.prefix, row),
+      _ => return,
+    };
+    if let Some(log) = &mut self.log {
+      log.push(text);
+      log.frontier = row + 1;
+    }
+  }
+
+  /// The screen was cleared: everything on it is new.
+  pub fn log_restart(&mut self) {
+    if let Some(log) = &mut self.log {
+      log.frontier = 0;
+      log.prefix.clear();
+    }
+  }
+
+  /// The cursor's line, when it is not logged yet and has text.
+  pub fn open_log_line(&self) -> Option<String> {
+    let log = self.log.as_ref()?;
+    let row = self.pos.row;
+    if row < log.frontier {
+      return None;
+    }
+    let text = self.log_text(&log.prefix, row);
+    (!text.is_empty()).then_some(text)
+  }
+
+  /// Logs the open line as it is (the program exited).
+  pub fn finish_log_line(&mut self) {
+    let Some(text) = self.open_log_line() else {
+      return;
+    };
+    if let Some(log) = &mut self.log {
+      log.push(text);
+      log.frontier = self.pos.row + 1;
+    }
+  }
+
+  /// Looks for `needle` in each line logged from now on, and in the line
+  /// under way now and whenever `log_check_open` is called, until it is
+  /// seen (`take_found`). `None` stops looking.
+  pub fn look_for(&mut self, needle: Option<String>) {
+    if let Some(log) = &mut self.log {
+      log.wanted = needle.filter(|needle| !needle.is_empty());
+      log.found = false;
+    }
+    self.log_check_open();
+  }
+
+  /// Checks the line under way for the needle: a carriage return may be
+  /// about to overwrite it, or the output paused there.
+  pub fn log_check_open(&mut self) {
+    if self.log.as_ref().is_none_or(|log| log.wanted.is_none()) {
+      return;
+    }
+    if let Some(text) = self.open_log_line()
+      && let Some(log) = &mut self.log
+    {
+      log.check(&text);
+    }
+  }
+
+  /// Whether the needle was seen since the last take.
+  pub fn take_found(&mut self) -> bool {
+    self
+      .log
+      .as_mut()
+      .is_some_and(|log| std::mem::take(&mut log.found))
+  }
+
+  /// Moves the lines logged so far to `out`.
+  pub fn take_log_lines(&mut self, out: &mut Vec<String>) {
+    if let Some(log) = &mut self.log {
+      out.append(&mut log.lines);
+    }
+  }
+
+  /// Takes over what the log of `old`, the grid this one replaces (a
+  /// reset), still owes: its lines not taken yet, and what it looks for.
+  pub fn carry_log(&mut self, old: &mut Grid) {
+    if let (Some(log), Some(old)) = (&mut self.log, &mut old.log) {
+      log.lines = std::mem::take(&mut old.lines);
+      log.wanted = old.wanted.take();
+      log.found = old.found;
+    }
+  }
+
+  /// Row `top` is about to leave the region: logged when no one logged
+  /// it, else the frontier moves up with the rows.
+  fn log_scroll_off(&mut self, top: usize, bottom: usize) {
+    let Grid {
+      log: Some(log),
+      rows,
+      tables,
+      ..
+    } = self
+    else {
+      return;
+    };
+    let frontier = usize::from(log.frontier);
+    if frontier > top {
+      if frontier <= bottom + 1 {
+        log.frontier -= 1;
+      }
+      return;
+    }
+    let row = &rows[top];
+    if row.wrapped() {
+      // The line goes on below: keep its start.
+      if log.prefix.len() < MAX_LOG_LINE {
+        row.push_text(0..row.cols(), &tables.graphemes, &mut log.prefix);
+      }
+      return;
+    }
+    let mut text = std::mem::take(&mut log.prefix);
+    row.push_text(0..row.cols(), &tables.graphemes, &mut text);
+    trim_log_text(&mut text);
+    // Blank rows no one wrote to are not lines.
+    if !text.is_empty() {
+      log.push(text);
+    }
+  }
+
+  /// The first row of the logical line live row `row` is on.
+  fn line_start(&self, row: u16) -> u16 {
+    let mut first = usize::from(row).min(self.rows.len() - 1);
     while first > 0 && self.rows[first - 1].wrapped() {
       first -= 1;
     }
+    first as u16
+  }
+
+  /// The text of the logical line live row `row` ends: `prefix` (its
+  /// start, scrolled off) when the line starts at the top, then the rows
+  /// that wrapped into it and the row itself.
+  fn log_text(&self, prefix: &str, row: u16) -> String {
+    let row = row.min(self.size.height - 1);
+    let first = self.line_start(row);
     let mut out = String::new();
-    if first == 0
-      && self.history.is_open()
-      && let Some(line) = self.history.last()
-    {
-      out.push_str(&line.text);
+    if first == 0 {
+      out.push_str(prefix);
     }
     for r in first..=row {
-      if out.len() >= MAX_LINE_TEXT {
+      if out.len() >= MAX_LOG_LINE {
         break;
       }
-      let row = &self.rows[r];
+      let row = &self.rows[usize::from(r)];
       row.push_text(0..row.cols(), &self.tables.graphemes, &mut out);
     }
-    if out.len() > MAX_LINE_TEXT {
-      let mut cut = MAX_LINE_TEXT;
-      while !out.is_char_boundary(cut) {
-        cut -= 1;
-      }
-      out.truncate(cut);
-    }
-    out.truncate(out.trim_end().len());
+    trim_log_text(&mut out);
     out
   }
 
@@ -1653,6 +1816,7 @@ impl Grid {
     }
     self.view_offset = self.view_offset.min(self.max_scrollback());
     self.refresh_view();
+    self.anchor_log();
   }
 
   /// Where each classic placement's top-left cell is in the logical
@@ -1912,8 +2076,54 @@ fn default_tabs_like(old: &[bool], width: u16) -> Vec<bool> {
     .collect()
 }
 
-/// The most of a logical line a ready check looks at.
-const MAX_LINE_TEXT: usize = 4096;
+/// What a grid logs: each line once, as it was when the cursor left it
+/// with a newline, or as it scrolled off when no one had logged it.
+#[derive(Clone, Debug, Default)]
+struct LineLog {
+  /// Rows above this one are logged; edits there do not reach the log.
+  frontier: u16,
+  /// The start of the open line, already scrolled off the top.
+  prefix: String,
+  lines: Vec<String>,
+  /// What a ready check waits to see in a line.
+  wanted: Option<String>,
+  /// The needle was seen; it is no longer looked for.
+  found: bool,
+}
+
+impl LineLog {
+  fn push(&mut self, text: String) {
+    self.check(&text);
+    self.prefix.clear();
+    self.lines.push(text);
+  }
+
+  fn check(&mut self, text: &str) {
+    if self
+      .wanted
+      .as_ref()
+      .is_some_and(|needle| text.contains(needle))
+    {
+      self.wanted = None;
+      self.found = true;
+    }
+  }
+}
+
+/// The most of a logical line the log keeps.
+const MAX_LOG_LINE: usize = 16 * 1024;
+
+/// Cuts a log line at `MAX_LOG_LINE` bytes and trims trailing blanks.
+fn trim_log_text(text: &mut String) {
+  if text.len() > MAX_LOG_LINE {
+    let mut cut = MAX_LOG_LINE;
+    while !text.is_char_boundary(cut) {
+      cut -= 1;
+    }
+    text.truncate(cut);
+  }
+  text.truncate(text.trim_end().len());
+}
 
 /// Blanks a row in place when nothing else holds it, else replaces it:
 /// a row shared with a frame would be copied only to be overwritten.
@@ -2264,7 +2474,7 @@ mod tests {
         .is_filler()
     );
     assert!(grid.drawing_row(0).unwrap().wrapped());
-    assert_eq!(grid.line_text(1), "abc");
+    assert_eq!(grid.log_text("", 1), "abc");
     // ...a glyph there stays, and the line goes on past it.
     let mut grid = Grid::new(size, 0);
     write(&mut grid, 0, "abcd");
@@ -2273,7 +2483,7 @@ mod tests {
     assert_eq!(grid.pos(), Pos { row: 1, col: 0 });
     assert_eq!(text(&grid, 0), "abcd");
     assert!(grid.drawing_row(0).unwrap().wrapped());
-    assert_eq!(grid.line_text(1), "abcd");
+    assert_eq!(grid.log_text("", 1), "abcd");
   }
 
   fn placement(row: u64, col: u16) -> Placement {
@@ -2403,12 +2613,13 @@ mod tests {
     write(&mut grid, 0, "abcd");
     grid.row_mut(0).wrap(true);
     write(&mut grid, 1, "ef");
-    assert_eq!(grid.line_text(1), "abcdef");
-    assert_eq!(grid.line_text(0), "abcd");
-    // The first row continues an open history line.
+    assert_eq!(grid.log_text("", 1), "abcdef");
+    assert_eq!(grid.log_text("", 0), "abcd");
+    // The start of a line that scrolled off still counts.
+    grid.enable_log();
     grid.scroll_up(1, StyleId::DEFAULT);
     assert!(grid.history().is_open());
-    assert_eq!(grid.line_text(0), "abcdef");
+    assert_eq!(grid.open_log_line().as_deref(), Some("abcdef"));
   }
 
   /// Every logical line (history and screen rows joined by their wrap

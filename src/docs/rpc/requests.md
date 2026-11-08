@@ -30,6 +30,8 @@ the same.
   desc: "Params `{binary}`; result `{version}` from the new binary once it has taken over."
 - cmd: wait
   desc: "Params `{target?, command?, for?, timeout_ms?}`; result `{}`, or `{matched}` for a command, then the connection is a wait session (|rpc/requests#waits|). Feature `wait`."
+- cmd: logs
+  desc: "Params `{targets?, follow?, lines?, since_ms?}`, default every task (`**`); result `{tasks, records}`, then with `follow` the connection carries new records (|rpc/requests#logs|). Feature `logs`."
 :::
 
 A target is written as on the command line (|start/targets|): a path, a
@@ -143,6 +145,31 @@ at the root of it, when that is a dep) or `removed: true`, and in
 `wait-done` its `why` (the `why` object). A wait is carried across a
 live upgrade, and the new image sends `tasks` again; a task removed
 before it, whose standing was final, is not in that set.
+
+## Logs {#logs}
+
+`logs` reads what tasks logged: the lines dekit took from their output
+(|cli/logs|), and when they started and exited. `targets` is a list of
+targets, and the tasks are every task any of them matches; none is
+`no_match`. The result's `tasks` are their paths, in list order, and
+its `records` the last `lines` of what they logged (every one kept, by
+default), only those logged within the last `since_ms` if
+given, in the order they were logged; without `follow`, the lines the
+tasks are writing come last, as `open` records, unless `lines` is 0.
+
+A record is `{seq?, time_ms?, task, kind, ...}`: `seq` orders records
+across the runner's tasks, `time_ms` is when it was logged (ms since the
+Unix epoch), and `task` is the task's path as in task-info. `kind` is
+`line {text}`, `open {text}`, `started`, `exited {code?, signal?}`, or
+`dropped {count}`; `open` and `dropped` have no `seq` or `time_ms`.
+
+With `follow`, like `wait`, it is the last request on its connection.
+After the response, each batch of new records comes as a `logs
+{records}` event. The set is matched again as tasks are added, removed,
+renamed or retagged: a task that joins shows what it logs from then on.
+A client that reads too slowly for a task's log (it keeps 10,000
+records) first gets a `dropped` record for it. The session ends with a
+bye: `quit` when the runner stops, `upgrade` when it is replaced live.
 
 ## Error codes
 

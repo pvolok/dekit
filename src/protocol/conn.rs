@@ -254,6 +254,7 @@ pub fn server_hello(client: &Hello) -> Result<Hello, Bye> {
     features: vec![
       crate::protocol::ctl::FEATURE_ATCH2.to_string(),
       crate::protocol::rpc::FEATURE_WAIT.to_string(),
+      crate::protocol::rpc::FEATURE_LOGS.to_string(),
     ],
     ..local_hello()
   })

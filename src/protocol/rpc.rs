@@ -64,6 +64,21 @@ pub enum RpcRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u64>,
   },
+  /// What tasks logged: the last `lines` records of the tasks `targets`
+  /// match (all of them by default), from `since_ms` ago on. With
+  /// `follow`, the connection then carries new records for the rest of
+  /// it, as the set changes.
+  Logs {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    targets: Vec<Target>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    follow: bool,
+    /// None is every record kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lines: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    since_ms: Option<u64>,
+  },
   /// Replace the runner live with the given binary.
   /// The reply comes from the new binary after activation, as
   /// `{version}`; `unsupported` where live replacement is not available,
@@ -77,6 +92,7 @@ pub enum RpcRequest {
 /// instead of `invalid_params`. Kept in sync with the enum by tests.
 const METHODS: &[&str] = &[
   "command", "ls", "why", "screen", "attach", "reload", "upgrade", "wait",
+  "logs",
 ];
 
 impl RpcRequest {
@@ -293,6 +309,61 @@ pub struct RpcWhyDep {
   pub satisfied: bool,
 }
 
+/// Feature `logs`: the server takes the `logs` method.
+pub const FEATURE_LOGS: &str = "logs";
+
+/// Event of a `logs` session with `follow`, server to client.
+pub const EVENT_LOGS: &str = "logs";
+
+/// Result of `logs`, and params of its `logs` events: records in the
+/// order they were logged. The result also names the tasks read, in list
+/// order.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LogsResult {
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub tasks: Vec<String>,
+  pub records: Vec<RpcLogRecord>,
+}
+
+/// One record of a task's log. `seq` orders records across the runner's
+/// tasks; `time_ms` is when it was logged, in ms since the Unix epoch.
+/// Both are absent from an `open` line (a snapshot's line under way) and
+/// from `dropped`. `task` is the task's path, as `path` in task-info.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RpcLogRecord {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub seq: Option<u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub time_ms: Option<u64>,
+  pub task: String,
+  #[serde(flatten)]
+  pub kind: RpcLogKind,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RpcLogKind {
+  Line {
+    text: String,
+  },
+  /// The line the task is writing, not logged yet.
+  Open {
+    text: String,
+  },
+  Started,
+  Exited {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signal: Option<i32>,
+  },
+  /// A follower fell behind: this many of the task's records were
+  /// dropped before it read them.
+  Dropped {
+    count: u64,
+  },
+}
+
 /// Result of `upgrade`, from the binary that took over.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct UpgradeResult {
@@ -480,6 +551,18 @@ mod tests {
         wait_for: None,
         timeout_ms: Some(90_000),
       },
+      RpcRequest::Logs {
+        targets: Vec::new(),
+        follow: false,
+        lines: Some(100),
+        since_ms: None,
+      },
+      RpcRequest::Logs {
+        targets: vec![Target::glob("web/*"), Target::tag("db")],
+        follow: true,
+        lines: None,
+        since_ms: Some(600_000),
+      },
     ]
   }
 
@@ -519,6 +602,11 @@ mod tests {
       (
         "wait",
         r#"{"command":{"command":"restart","target":"api"},"timeout_ms":90000}"#,
+      ),
+      ("logs", r#"{"lines":100}"#),
+      (
+        "logs",
+        r#"{"follow":true,"since_ms":600000,"targets":["web/*","+db"]}"#,
       ),
     ];
     let samples = samples();
@@ -682,6 +770,53 @@ mod tests {
       serde_json::to_string(&stopped).unwrap(),
       r#"{"state":"idle","reason":"kill_timeout"}"#
     );
+
+    let record = |seq, kind| RpcLogRecord {
+      seq,
+      time_ms: seq.map(|seq| 1_794_000_000_000 + seq),
+      task: "web".to_string(),
+      kind,
+    };
+    let logs = LogsResult {
+      tasks: vec!["web".to_string()],
+      records: vec![
+        record(Some(1), RpcLogKind::Started),
+        record(
+          Some(2),
+          RpcLogKind::Line {
+            text: "listening".to_string(),
+          },
+        ),
+        record(
+          Some(3),
+          RpcLogKind::Exited {
+            code: Some(1),
+            signal: None,
+          },
+        ),
+        record(None, RpcLogKind::Dropped { count: 120 }),
+        record(
+          None,
+          RpcLogKind::Open {
+            text: "50%".to_string(),
+          },
+        ),
+      ],
+    };
+    let json = serde_json::to_string(&logs).unwrap();
+    assert_eq!(
+      json,
+      concat!(
+        r#"{"tasks":["web"],"records":["#,
+        r#"{"seq":1,"time_ms":1794000000001,"task":"web","kind":"started"},"#,
+        r#"{"seq":2,"time_ms":1794000000002,"task":"web","kind":"line","text":"listening"},"#,
+        r#"{"seq":3,"time_ms":1794000000003,"task":"web","kind":"exited","code":1},"#,
+        r#"{"task":"web","kind":"dropped","count":120},"#,
+        r#"{"task":"web","kind":"open","text":"50%"}"#,
+        r#"]}"#,
+      )
+    );
+    assert_eq!(serde_json::from_str::<LogsResult>(&json).unwrap(), logs);
   }
 
   #[test]

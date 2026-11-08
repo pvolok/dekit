@@ -29,12 +29,14 @@ pub fn watch_idle(
   hook: Hook,
   console: TaskSender,
 ) {
-  let mut watch = pc.watch_active(selector);
+  let mut watch = pc.watch_set(vec![selector]);
   let pc = pc.clone();
   let config = config.clone();
   tokio::spawn(async move {
-    while let Some(active) = watch.recv().await {
-      if !active {
+    let mut active = false;
+    while let Some(set) = watch.recv().await {
+      let was = std::mem::replace(&mut active, set.iter().any(|t| t.active));
+      if was && !active {
         hook.run(&pc, &config, &console);
       }
     }

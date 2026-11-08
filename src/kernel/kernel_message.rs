@@ -9,6 +9,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub use crate::term::ScreenHandle;
 
+use super::logs::LogStore;
 use super::sub_trie::SubMode;
 use super::task::{
   ExitInfo, NextRun, RestartMode, StateReason, Task, TaskCmd, TaskDef, TaskId,
@@ -194,9 +195,10 @@ pub enum KernelCommand {
 
   SubscribePath(TaskKey, SubMode),
   UnsubscribePath(TaskKey, SubMode),
-  /// Sends `true`/`false` whenever the selected set gains its first active
-  /// task or loses its last one.
-  WatchActive(TaskSelector, UnboundedSender<bool>),
+  /// Sends the tasks the selectors match at once, and again whenever
+  /// that changes: a task joins or leaves, is renamed, or becomes active
+  /// or idle. Dropping the receiver ends it.
+  WatchSet(Vec<TaskSelector>, UnboundedSender<Vec<SetTask>>),
   /// Waits until a set of tasks meets a condition (`WaitCond`),
   /// reporting on the request's channel; dropping the receiver ends it.
   Wait(Box<WaitRequest>),
@@ -298,6 +300,15 @@ pub struct WaitRequest {
   pub on: WaitOn,
   pub cond: WaitCond,
   pub events: UnboundedSender<WaitEvent>,
+}
+
+/// A task of a watched set (`WatchSet`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetTask {
+  pub id: TaskId,
+  pub name: String,
+  /// Starting, running, ready, stopping, or in backoff (coming back).
+  pub active: bool,
 }
 
 /// Where a task stands in a wait.
@@ -622,6 +633,7 @@ pub struct DepExplain {
 #[derive(Clone)]
 pub struct TaskContext {
   next_task_id: Arc<AtomicUsize>,
+  logs: Arc<LogStore>,
   sender: UnboundedSender<KernelMessage>,
   pub task_id: TaskId,
 }
@@ -629,14 +641,21 @@ pub struct TaskContext {
 impl TaskContext {
   pub fn new(
     next_task_id: Arc<AtomicUsize>,
+    logs: Arc<LogStore>,
     task_id: TaskId,
     sender: UnboundedSender<KernelMessage>,
   ) -> Self {
     Self {
       next_task_id,
+      logs,
       sender,
       task_id,
     }
+  }
+
+  /// The runner's log store.
+  pub fn logs(&self) -> &Arc<LogStore> {
+    &self.logs
   }
 
   #[cfg(test)]
@@ -722,12 +741,14 @@ impl TaskContext {
     self.send(KernelCommand::SubscribePath(key, mode));
   }
 
-  pub fn watch_active(
+  /// The tasks `selectors` match, each once and in list order, now and
+  /// after each change (`KernelCommand::WatchSet`).
+  pub fn watch_set(
     &self,
-    selector: TaskSelector,
-  ) -> tokio::sync::mpsc::UnboundedReceiver<bool> {
+    selectors: Vec<TaskSelector>,
+  ) -> tokio::sync::mpsc::UnboundedReceiver<Vec<SetTask>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    self.send(KernelCommand::WatchActive(selector, tx));
+    self.send(KernelCommand::WatchSet(selectors, tx));
     rx
   }
 

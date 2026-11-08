@@ -590,7 +590,7 @@ impl App {
             let selector = target
               .selector()
               .map_err(|_| format!("No agent task at {path}"))?;
-            let mut active = pc.watch_active(selector);
+            let mut watch = pc.watch_set(vec![selector]);
             let add = Command::Add {
               target,
               spec,
@@ -608,7 +608,14 @@ impl App {
               app.state.scope = Scope::Term;
             });
             // Its edits are checked once it ends, or is removed.
-            while active.recv().await == Some(true) {}
+            let mut started = false;
+            while let Some(set) = watch.recv().await {
+              let active = set.iter().any(|t| t.active);
+              if started && !active {
+                break;
+              }
+              started |= active;
+            }
             let mut failed = Vec::new();
             write_back::written(&pc, &project, &plan, &mut failed).await;
             Ok::<_, String>(failed)

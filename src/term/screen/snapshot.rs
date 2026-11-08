@@ -642,9 +642,9 @@ impl Screen {
       images,
       pending_image: None,
       events: Vec::new(),
-      line_tap: false,
-      finished_lines: Vec::new(),
     };
+    // Lines above the cursor's were logged before the restart.
+    restored.grid.enable_log();
     // An unfinished sequence cannot complete or emit anything on its own,
     // so replaying it only rebuilds the parser state.
     let pending = snap::from_base64(&saved.pending_input)?;

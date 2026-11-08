@@ -13,6 +13,7 @@ use crate::error::ResultLogger;
 use crate::kernel::kernel_message::{
   KernelCommand, TaskContext, TaskRegistration, TaskSelector, TaskUpdate,
 };
+use crate::kernel::logs::RecordKind;
 use crate::kernel::task::{
   ExitInfo, NextRun, ReadyMode, RestartMode, Run, STOP_TIMEOUT, TaskCmd,
   TaskDef, TaskId,
@@ -461,38 +462,23 @@ impl Instance {
     }
   }
 
-  /// Checks the lines the screen finished since the last output, and the
-  /// line so far, against the log ready check; true when this makes the
-  /// instance ready.
-  fn log_ready(
-    &mut self,
-    ready: &Option<ReadyConfig>,
-    task_screen: &mut TaskScreen,
-    lines: &mut Vec<String>,
-    also: Option<&str>,
-  ) -> bool {
-    let Some(ReadyConfig {
-      check: ReadyCheck::Log(needle),
-      ..
-    }) = ready
-    else {
-      return false;
-    };
-    if self.ready_sent {
-      // Nothing left to look for in the lines.
-      task_screen.set_line_tap(false);
+  /// Has the screen look for the log ready check's text, unless the
+  /// instance is ready already.
+  fn look_for_ready(&self, ready: &Option<ReadyConfig>, screen: &mut Screen) {
+    let needle = log_needle(ready).filter(|_| !self.ready_sent);
+    screen.look_for(needle.cloned());
+  }
+
+  /// True when this makes the instance ready: the screen saw the log ready
+  /// check's text, or `seen` says it was seen before.
+  fn log_ready(&mut self, screen: &mut Screen, seen: bool) -> bool {
+    let found = screen.take_found() || seen;
+    if !found || self.ready_sent {
       return false;
     }
-    lines.clear();
-    task_screen.take_finished_lines(lines);
-    let found = also.is_some_and(|line| line_ready(needle, line))
-      || lines.iter().any(|line| line_ready(needle, line))
-      || line_ready(needle, &task_screen.screen().cursor_line_text());
-    if found {
-      self.ready_sent = true;
-      task_screen.set_line_tap(false);
-    }
-    found
+    screen.look_for(None);
+    self.ready_sent = true;
+    true
   }
 }
 
@@ -511,6 +497,17 @@ fn sd_notify_snapshot(
   _sd_notify: Option<&DatagramSocket>,
 ) -> Option<snap::SdNotifySocket> {
   None
+}
+
+/// The text a log ready check waits for.
+fn log_needle(ready: &Option<ReadyConfig>) -> Option<&String> {
+  match ready {
+    Some(ReadyConfig {
+      check: ReadyCheck::Log(needle),
+      ..
+    }) => Some(needle),
+    _ => None,
+  }
 }
 
 #[cfg(unix)]
@@ -569,17 +566,6 @@ fn sd_notify_spec<'a>(
   _sd_notify: &mut Option<DatagramSocket>,
 ) -> Result<Cow<'a, ProcessSpec>, String> {
   Ok(Cow::Borrowed(&config.spec))
-}
-
-/// Whether the ready check reads the lines the screen finishes.
-fn watches_lines(config: &ProcessRun) -> bool {
-  matches!(
-    config.ready,
-    Some(ReadyConfig {
-      check: ReadyCheck::Log(_),
-      ..
-    })
-  )
 }
 
 fn snapshot(
@@ -697,9 +683,8 @@ async fn process_main(
 ) {
   let mut task_screen =
     TaskScreen::new(ctx.task_id, screen, handle, config.mouse_scroll_speed);
-  task_screen.set_line_tap(watches_lines(&config));
   let mut screen_effects: Vec<TaskScreenEffect> = Vec::new();
-  let mut finished_lines: Vec<String> = Vec::new();
+  let mut log_lines: Vec<String> = Vec::new();
 
   // The child must not outlive this future (it panicked, or the kernel
   // went away): one that ignores SIGHUP survives the PTY's hangup.
@@ -752,16 +737,15 @@ async fn process_main(
         instance.stdout_eof = saved.stdout_eof;
         instance.ready_sent = saved.ready_sent;
         instance.stop_sent = saved.stop_sent;
+        let screen = task_screen.screen_mut();
+        instance.look_for_ready(&config.ready, screen);
         // An older binary saved the line it had not searched yet; the
         // screen itself carries the rest.
         let line = snap::from_base64(&saved.ready_line).unwrap_or_default();
         let line = String::from_utf8_lossy(&line);
-        if instance.log_ready(
-          &config.ready,
-          &mut task_screen,
-          &mut finished_lines,
-          Some(&line),
-        ) {
+        let seen = log_needle(&config.ready)
+          .is_some_and(|needle| line_ready(needle, &line));
+        if instance.log_ready(screen, seen) {
           ctx.send(KernelCommand::TaskReady);
         }
         probe = start_probe(&config, &instance, sd_notify.as_ref());
@@ -778,7 +762,7 @@ async fn process_main(
         log::error!("Failed to adopt child {}: {err}", saved.pid);
         // No process to wait for: without this report the task would
         // stay active forever.
-        ctx.send(KernelCommand::TaskStopped(ExitInfo::error()));
+        stopped(&ctx, &mut task_screen, ExitInfo::error());
       }
     }
   }
@@ -790,7 +774,7 @@ async fn process_main(
       && let Some(info) = instance.exit_info
       && process.take().is_some()
     {
-      ctx.send(KernelCommand::TaskStopped(info));
+      stopped(&ctx, &mut task_screen, info);
     }
 
     enum Next {
@@ -861,7 +845,7 @@ async fn process_main(
                   .process(message.as_bytes(), &mut screen_effects)
                   .await;
                 screen_effects.clear();
-                ctx.send(KernelCommand::TaskStopped(ExitInfo::error()));
+                stopped(&ctx, &mut task_screen, ExitInfo::error());
                 continue;
               }
             }
@@ -873,7 +857,7 @@ async fn process_main(
                 .process(message.as_bytes(), &mut screen_effects)
                 .await;
               screen_effects.clear();
-              ctx.send(KernelCommand::TaskStopped(ExitInfo::error()));
+              stopped(&ctx, &mut task_screen, ExitInfo::error());
               continue;
             }
           };
@@ -883,8 +867,7 @@ async fn process_main(
               instance.stdout_eof = false;
               instance.ready_sent = false;
               instance.stop_sent = false;
-              // The ready check looks at the new instance's lines.
-              task_screen.set_line_tap(watches_lines(&config));
+              instance.look_for_ready(&config.ready, task_screen.screen_mut());
               probe = start_probe(&config, &instance, sd_notify.as_ref());
               update_log_observer(
                 &mut task_screen,
@@ -901,6 +884,7 @@ async fn process_main(
                 .process(message.as_bytes(), &mut screen_effects)
                 .await;
               screen_effects.clear();
+              stopped(&ctx, &mut task_screen, ExitInfo::error());
             }
           }
         }
@@ -988,14 +972,13 @@ async fn process_main(
         task_screen
           .process(&read_buf[..n], &mut screen_effects)
           .await;
-        if instance.log_ready(
-          &config.ready,
-          &mut task_screen,
-          &mut finished_lines,
-          None,
-        ) {
+        if instance.log_ready(task_screen.screen_mut(), false) {
           ctx.send(KernelCommand::TaskReady);
         }
+        task_screen.take_log_lines(&mut log_lines);
+        let open = task_screen.screen().open_log_line();
+        let lines = log_lines.drain(..).map(RecordKind::Line);
+        ctx.logs().push(ctx.task_id, lines, open);
         apply_effects(
           &mut screen_effects,
           &mut process,
@@ -1094,15 +1077,27 @@ fn start_instance(
   task_screen.reset_screen(run.scrollback_len, run.mouse_scroll_speed);
   match spawn_native(ctx, spec, size) {
     Ok(spawned) => {
+      ctx.logs().push(ctx.task_id, [RecordKind::Started], None);
       ctx.send(KernelCommand::TaskStarted);
       Ok(spawned)
     }
     Err(err) => {
       log::warn!("Process spawn error: {:#}", err);
-      ctx.send(KernelCommand::TaskStopped(ExitInfo::error()));
       Err(spawn_error_message(spec, &err))
     }
   }
+}
+
+/// Reports that the program is gone (or never started): its last line
+/// and the exit go to the log first.
+fn stopped(ctx: &TaskContext, task_screen: &mut TaskScreen, info: ExitInfo) {
+  task_screen.screen_mut().finish_log_line();
+  let mut lines = Vec::new();
+  task_screen.take_log_lines(&mut lines);
+  let records = lines.into_iter().map(RecordKind::Line);
+  let records = records.chain([RecordKind::Exited(info)]);
+  ctx.logs().push(ctx.task_id, records, None);
+  ctx.send(KernelCommand::TaskStopped(info));
 }
 
 /// What the task's screen shows when its program could not start.
@@ -1838,7 +1833,61 @@ mod tests {
       assert!(Instant::now() < deadline, "task stayed active");
       tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    // Its exit is logged before the kernel hears of it.
+    let tail = pc.logs().tail(&[TaskId(1)], usize::MAX, None);
+    assert_eq!(kinds(&tail), [RecordKind::Exited(ExitInfo::error())]);
 
+    pc.send(KernelCommand::Quit);
+    tokio::time::timeout(Duration::from_secs(2), kernel_task)
+      .await
+      .expect("timed out waiting for kernel to quit")
+      .unwrap();
+  }
+
+  /// What the task logged so far, once `done` says it's all there.
+  async fn logged(
+    pc: &TaskContext,
+    id: TaskId,
+    done: impl Fn(&crate::kernel::logs::Tail) -> bool,
+  ) -> crate::kernel::logs::Tail {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+      let tail = pc.logs().tail(&[id], usize::MAX, None);
+      if done(&tail) {
+        return tail;
+      }
+      assert!(Instant::now() < deadline, "never logged it");
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  }
+
+  fn kinds(tail: &crate::kernel::logs::Tail) -> Vec<RecordKind> {
+    tail.records.iter().map(|r| r.kind.clone()).collect()
+  }
+
+  #[tokio::test]
+  async fn a_task_logs_its_start_and_its_lines() {
+    let kernel = Kernel::new();
+    let pc = kernel.context();
+    let id = spawn_process_task(
+      &pc,
+      "talker",
+      r#"{cmd: [sh, -c, 'printf "one\ntwo\rTWO\nlast"; sleep 5']}"#,
+    );
+    pc.send(KernelCommand::Act(Verb::Start, TaskSelector::Id(id), None));
+    let kernel_task = tokio::spawn(kernel.run());
+
+    let tail = logged(&pc, id, |tail| !tail.open.is_empty()).await;
+    let line = |text: &str| RecordKind::Line(text.to_string());
+    assert_eq!(
+      kinds(&tail),
+      [RecordKind::Started, line("one"), line("TWO")]
+    );
+    assert_eq!(tail.open, [(id, "last".to_string())]);
+
+    // A removed task's log goes with it.
+    pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
+    logged(&pc, id, |tail| tail.records.is_empty()).await;
     pc.send(KernelCommand::Quit);
     tokio::time::timeout(Duration::from_secs(2), kernel_task)
       .await
@@ -1848,6 +1897,32 @@ mod tests {
 
   async fn state_of(pc: &TaskContext, id: TaskId) -> TaskState {
     pc.list_tasks(TaskSelector::Id(id)).await[0].state
+  }
+
+  #[tokio::test]
+  async fn a_log_ready_check_sees_text_erased_in_place() {
+    let kernel = Kernel::new();
+    let pc = kernel.context();
+    let id = spawn_process_task(
+      &pc,
+      "server",
+      r#"{cmd: [sh, -c, 'printf "listening\r\033[Kwatching"; sleep 5'], ready: {log: listening}}"#,
+    );
+    pc.send(KernelCommand::Act(Verb::Start, TaskSelector::Id(id), None));
+    let kernel_task = tokio::spawn(kernel.run());
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while state_of(&pc, id).await != TaskState::Ready {
+      assert!(Instant::now() < deadline, "the task never got ready");
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
+    logged(&pc, id, |tail| tail.records.is_empty()).await;
+    pc.send(KernelCommand::Quit);
+    tokio::time::timeout(Duration::from_secs(2), kernel_task)
+      .await
+      .expect("timed out waiting for kernel to quit")
+      .unwrap();
   }
 
   #[tokio::test]

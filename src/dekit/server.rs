@@ -27,7 +27,8 @@ use crate::{
   console::app::console_task_registration,
   dekit::{
     attach::{Attachment, attach_session},
-    wait::{WaitConn, WaitParams, wait_session},
+    logs::{LogsParams, logs, logs_session},
+    wait::{WaitParams, wait_session},
   },
   kernel::{
     kernel::{Kernel, SaveFn},
@@ -86,6 +87,15 @@ impl ServerCtx {
       runner: None,
     })
   }
+}
+
+/// A connection a session (`wait`, `logs` with `follow`) took over.
+pub struct SessionConn {
+  pub reg: ConnReg,
+  pub fd: Option<i32>,
+  pub hello: Hello,
+  pub sender: ConnSender,
+  pub receiver: ConnReceiver,
 }
 
 pub enum ConnCtl {
@@ -723,7 +733,7 @@ pub async fn dispatch_connection(
             };
             wait_session(
               &ctx,
-              WaitConn {
+              SessionConn {
                 reg,
                 fd,
                 hello: client,
@@ -736,6 +746,41 @@ pub async fn dispatch_connection(
                 command,
                 wait_for,
                 timeout_ms,
+              },
+            )
+            .await;
+            return;
+          }
+          Ok(RpcRequest::Logs {
+            targets,
+            follow: true,
+            lines,
+            since_ms,
+          }) => {
+            // Earlier requests are answered before the records start, as
+            // for a wait.
+            while let Some(reply) = replies.join_next().await {
+              if let Ok(reply) = reply && sender.queue_ctl(reply).is_err() {
+                return;
+              }
+            }
+            let Some(client) = hello else {
+              return;
+            };
+            logs_session(
+              &ctx,
+              SessionConn {
+                reg,
+                fd,
+                hello: client,
+                sender,
+                receiver,
+              },
+              request.id,
+              LogsParams {
+                targets,
+                lines,
+                since_ms,
               },
             )
             .await;
@@ -851,6 +896,14 @@ pub async fn finish(
       },
     }
   }
+}
+
+/// A server-to-client event of a session.
+pub(crate) fn event<T: serde::Serialize>(name: &str, params: &T) -> CtlMsg {
+  CtlMsg::Event(crate::protocol::Event {
+    name: name.to_string(),
+    params: serde_json::to_value(params).expect("event params serialize"),
+  })
 }
 
 pub fn upgrade_result() -> Value {
@@ -982,8 +1035,23 @@ async fn handle_rpc(
   match req {
     RpcRequest::Attach { .. }
     | RpcRequest::Wait { .. }
+    | RpcRequest::Logs { follow: true, .. }
     | RpcRequest::Upgrade { .. } => {
       Err(RpcError::internal("handled by the connection loop"))
+    }
+
+    RpcRequest::Logs {
+      targets,
+      follow: false,
+      lines,
+      since_ms,
+    } => {
+      let params = LogsParams {
+        targets,
+        lines,
+        since_ms,
+      };
+      logs(pc, params).await
     }
 
     RpcRequest::Command(command) => {
@@ -1077,7 +1145,7 @@ mod tests {
 
   use super::*;
   use crate::{
-    kernel::kernel::Kernel,
+    kernel::{kernel::Kernel, task::TaskId},
     protocol::{Request, client_handshake},
   };
 
@@ -1333,6 +1401,243 @@ mod tests {
       .await
       .unwrap()
       .unwrap();
+  }
+
+  /// A kernel with a target task at each of `paths`, served in-process.
+  fn logs_fixture(
+    paths: &[&str],
+  ) -> (Arc<ServerCtx>, Vec<TaskId>, tokio::task::JoinHandle<()>) {
+    let mut kernel = Kernel::new();
+    let pc = kernel.context();
+    let ids = paths
+      .iter()
+      .map(|path| {
+        kernel.register_task(
+          TaskDef {
+            path: Some(TaskPath::new(*path).unwrap()),
+            ..Default::default()
+          },
+          |_| Box::new(crate::kernel::task::TargetTask),
+        )
+      })
+      .collect();
+    let kernel_handle = tokio::spawn(kernel.run());
+    let ctx = ServerCtx::local(pc, Arc::new(Config::make_default()));
+    (ctx, ids, kernel_handle)
+  }
+
+  fn log(ctx: &ServerCtx, task: TaskId, texts: &[&str], open: Option<&str>) {
+    use crate::kernel::logs::RecordKind;
+    let lines = texts.iter().map(|t| RecordKind::Line(t.to_string()));
+    ctx.pc.logs().push(task, lines, open.map(str::to_string));
+  }
+
+  async fn request(sender: &mut ConnSender, id: u64, request: RpcRequest) {
+    let (method, params) = request.to_wire();
+    let request = CtlMsg::Request(Request { id, method, params });
+    sender.send_ctl(request).await.unwrap();
+  }
+
+  async fn response(
+    receiver: &mut ConnReceiver,
+  ) -> Result<serde_json::Value, RpcError> {
+    match timeout(Duration::from_secs(2), receiver.recv_ctl())
+      .await
+      .unwrap()
+      .unwrap()
+    {
+      CtlMsg::Response(response) => match response.error {
+        Some(error) => Err(error),
+        None => Ok(response.result.unwrap_or_default()),
+      },
+      msg => panic!("unexpected {msg:?}"),
+    }
+  }
+
+  /// `(task, kind, text or count)` for each record.
+  fn logged(result: &serde_json::Value) -> Vec<String> {
+    let records = result["records"].as_array().unwrap();
+    let detail = |r: &serde_json::Value| match r["kind"].as_str().unwrap() {
+      "dropped" => r["count"].to_string(),
+      _ => r["text"].as_str().unwrap_or_default().to_string(),
+    };
+    records
+      .iter()
+      .map(|r| {
+        format!(
+          "{} {} {}",
+          r["task"].as_str().unwrap(),
+          r["kind"].as_str().unwrap(),
+          detail(r)
+        )
+      })
+      .map(|line| line.trim_end().to_string())
+      .collect()
+  }
+
+  async fn quit(ctx: &ServerCtx, kernel_handle: tokio::task::JoinHandle<()>) {
+    ctx.pc.send(KernelCommand::Quit);
+    timeout(Duration::from_secs(2), kernel_handle)
+      .await
+      .unwrap()
+      .unwrap();
+  }
+
+  #[tokio::test]
+  async fn logs_answers_with_the_last_records_then_the_open_lines() {
+    let (ctx, ids, kernel_handle) = logs_fixture(&["web", "db", "other"]);
+    log(&ctx, ids[0], &["w1", "w2"], None);
+    log(&ctx, ids[1], &["d1"], Some("d-open"));
+    log(&ctx, ids[2], &["o1"], None);
+    log(&ctx, ids[0], &["w3"], Some("w-open"));
+
+    let (mut sender, mut receiver, connection) = serve_duplex(&ctx, None);
+    client_handshake(&mut sender, &mut receiver).await.unwrap();
+    let logs = |targets: Vec<Target>, lines| RpcRequest::Logs {
+      targets,
+      follow: false,
+      lines,
+      since_ms: None,
+    };
+    request(
+      &mut sender,
+      1,
+      logs(vec![Target::glob("web"), Target::glob("db")], Some(2)),
+    )
+    .await;
+    let result = response(&mut receiver).await.unwrap();
+    assert_eq!(
+      logged(&result),
+      [
+        "db line d1",
+        "web line w3",
+        "web open w-open",
+        "db open d-open"
+      ]
+    );
+    assert_eq!(result["records"][0]["seq"], 3, "{result}");
+    assert!(result["records"][0]["time_ms"].is_u64(), "{result}");
+
+    // Every task by default; `lines: 0` leaves out the open ones too.
+    request(&mut sender, 2, logs(Vec::new(), None)).await;
+    assert_eq!(logged(&response(&mut receiver).await.unwrap()).len(), 7);
+    request(&mut sender, 3, logs(Vec::new(), Some(0))).await;
+    assert!(logged(&response(&mut receiver).await.unwrap()).is_empty());
+
+    request(&mut sender, 4, logs(vec![Target::glob("nope")], None)).await;
+    let error = response(&mut receiver).await.unwrap_err();
+    assert_eq!(error.code, codes::NO_MATCH);
+
+    drop(sender);
+    drop(receiver);
+    timeout(Duration::from_secs(2), connection)
+      .await
+      .unwrap()
+      .unwrap();
+    quit(&ctx, kernel_handle).await;
+  }
+
+  #[tokio::test]
+  async fn following_logs_sends_new_records_as_the_set_changes() {
+    let (ctx, ids, kernel_handle) = logs_fixture(&["web/a", "db"]);
+    log(&ctx, ids[0], &["before"], Some("open"));
+    log(&ctx, ids[1], &["db-before"], None);
+
+    let (mut sender, mut receiver, connection) = serve_duplex(&ctx, None);
+    client_handshake(&mut sender, &mut receiver).await.unwrap();
+    request(
+      &mut sender,
+      1,
+      RpcRequest::Logs {
+        targets: vec![Target::glob("web/*")],
+        follow: true,
+        lines: None,
+        since_ms: None,
+      },
+    )
+    .await;
+    // The backlog, without the open line: it's logged when it's done.
+    let backlog = response(&mut receiver).await.unwrap();
+    assert_eq!(logged(&backlog), ["web/a line before"]);
+
+    log(&ctx, ids[1], &["db-after"], None);
+    log(&ctx, ids[0], &["after"], None);
+    let (name, batch) = next_event(&mut receiver).await;
+    assert_eq!(name, "logs");
+    assert_eq!(logged(&batch), ["web/a line after"]);
+
+    // A task added where the glob looks joins the set.
+    let b = ctx.pc.register(
+      TaskDef {
+        path: Some(TaskPath::new("web/b").unwrap()),
+        ..Default::default()
+      },
+      Box::new(|_| Box::new(crate::kernel::task::TargetTask)),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let batch = loop {
+      log(&ctx, b, &["b1"], None);
+      let next = timeout(Duration::from_millis(20), receiver.recv_ctl()).await;
+      if let Ok(Ok(CtlMsg::Event(event))) = next {
+        break event.params;
+      }
+      assert!(std::time::Instant::now() < deadline, "web/b never joined");
+    };
+    assert_eq!(logged(&batch)[0], "web/b line b1");
+
+    // More than a ring holds between two reads.
+    let many: Vec<String> = (0..crate::kernel::logs::RING_LEN + 1)
+      .map(|i| i.to_string())
+      .collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    log(&ctx, ids[0], &many, None);
+    let (_, batch) = next_event(&mut receiver).await;
+    let batch = logged(&batch);
+    assert_eq!(batch[0], "web/a dropped 1");
+    assert_eq!(batch[1], "web/a line 1");
+    assert_eq!(batch.len(), crate::kernel::logs::RING_LEN + 1);
+
+    drop(sender);
+    drop(receiver);
+    timeout(Duration::from_secs(2), connection)
+      .await
+      .unwrap()
+      .unwrap();
+    quit(&ctx, kernel_handle).await;
+  }
+
+  /// The log store doesn't survive an upgrade: a following client is
+  /// told so by the next image.
+  #[tokio::test]
+  async fn an_upgrade_ends_a_logs_session_with_a_bye() {
+    let (ctx, _, kernel_handle) = logs_fixture(&["web"]);
+    let (mut sender, mut receiver, connection) = serve_duplex(&ctx, None);
+    client_handshake(&mut sender, &mut receiver).await.unwrap();
+    request(
+      &mut sender,
+      1,
+      RpcRequest::Logs {
+        targets: Vec::new(),
+        follow: true,
+        lines: None,
+        since_ms: None,
+      },
+    )
+    .await;
+    response(&mut receiver).await.unwrap();
+
+    let reply = ctx.connections.freeze_all().await.pop().unwrap();
+    let frozen = timeout(Duration::from_secs(2), reply)
+      .await
+      .expect("froze in time")
+      .unwrap()
+      .expect("carried");
+    assert!(matches!(frozen.kind, snap::ConnectionKind::Rpc { .. }));
+    let owed = snap::from_base64(&frozen.buffered_output).unwrap();
+    let owed = String::from_utf8_lossy(&owed);
+    assert!(owed.contains(r#""code":"upgrade""#), "{owed}");
+    connection.abort();
+    quit(&ctx, kernel_handle).await;
   }
 
   #[tokio::test]

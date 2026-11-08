@@ -10,6 +10,7 @@ use crate::{
   command::Command,
   config::task::is_script,
   dekit::{
+    logs_client::{LogsArgs, cli_logs},
     rpc_client::rpc_request,
     server::run_server,
     wait_client::{cli_wait, timeout_ms},
@@ -694,6 +695,31 @@ fn resolve_target(
   Ok((runner, target.without_runner()))
 }
 
+/// `resolve_target` for each of the `target` args, which must all be on
+/// one runner; none is the discovered runner.
+fn resolve_targets(
+  matches: &clap::ArgMatches,
+  sub_m: &clap::ArgMatches,
+) -> anyhow::Result<(RunnerSpec, Vec<Target>)> {
+  let mut runner = None;
+  let mut targets = Vec::new();
+  for arg in sub_m.get_many::<String>("target").into_iter().flatten() {
+    let (on, target) = resolve_target(matches, arg.parse()?)?;
+    match &runner {
+      Some(first) if *first != on => {
+        anyhow::bail!("the targets are on different runners")
+      }
+      _ => runner = Some(on),
+    }
+    targets.push(target);
+  }
+  let runner = match runner {
+    Some(runner) => runner,
+    None => resolve_runner(matches)?,
+  };
+  Ok((runner, targets))
+}
+
 fn runner_from_ref(runner: &Runner) -> anyhow::Result<RunnerSpec> {
   match runner {
     Runner::Name(name) => match RunnerKind::from_name(name) {
@@ -1048,6 +1074,40 @@ pub fn cli() -> ClapCommand {
       ClapCommand::new("screen")
         .about("Print the current screen of a task")
         .arg(Arg::new("target").required(true).help("Task path")),
+      ClapCommand::new("logs")
+        .about("Print what tasks logged, and with -f follow it")
+        .arg(
+          Arg::new("target")
+            .num_args(0..)
+            .help("Task paths, globs, or +tags (default: everything)"),
+        )
+        .arg(
+          Arg::new("follow")
+            .long("follow")
+            .short('f')
+            .action(clap::ArgAction::SetTrue)
+            .help("Keep printing new lines until Ctrl-C"),
+        )
+        .arg(
+          Arg::new("lines")
+            .long("lines")
+            .short('n')
+            .value_name("count")
+            .default_value("100")
+            .help("How many of the last lines to print first, or all"),
+        )
+        .arg(
+          Arg::new("since")
+            .long("since")
+            .value_name("duration")
+            .help("Only lines logged within this long, such as 10m or 2h"),
+        )
+        .arg(
+          Arg::new("no-prefix")
+            .long("no-prefix")
+            .action(clap::ArgAction::SetTrue)
+            .help("Leave out the task name before each line"),
+        ),
       runner_command,
       ClapCommand::new("project")
         .about("List your projects, from the user config")
@@ -1260,6 +1320,28 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         // Reset terminal attributes after printing
         println!("{}", crate::term::vt::emit::SGR_RESET);
       }
+    }
+    Some(("logs", sub_m)) => {
+      let (runner, targets) = resolve_targets(&matches, sub_m)?;
+      let lines = match sub_m.get_one::<String>("lines").map(String::as_str) {
+        Some("all") | None => None,
+        Some(count) => Some(count.parse().map_err(|_| {
+          anyhow!("--lines takes a count or `all`, not `{count}`")
+        })?),
+      };
+      let since_ms = (sub_m.get_one::<String>("since"))
+        .map(|since| crate::config::duration::parse_duration(since))
+        .transpose()?
+        .map(|since| since.as_millis() as u64);
+      let args = LogsArgs {
+        targets,
+        follow: sub_m.get_flag("follow"),
+        lines,
+        since_ms,
+        prefix: !sub_m.get_flag("no-prefix"),
+        json,
+      };
+      cli_logs(&runner, args).await?;
     }
     Some(("up", sub_m)) => {
       let runner = arg_runner(&matches, sub_m)?;

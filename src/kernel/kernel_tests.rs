@@ -2078,6 +2078,7 @@ async fn reserved_task_controls_its_space() {
     .register_task(provider_def, |_| Box::new(crate::kernel::task::TargetTask));
   let provider_pc = TaskContext::new(
     kernel.graph.next_task_id.clone(),
+    kernel.graph.logs.clone(),
     provider,
     kernel.sender.clone(),
   );
@@ -2115,66 +2116,153 @@ async fn reserved_task_controls_its_space() {
   handle.await.unwrap();
 }
 
-#[tokio::test]
-async fn active_watch_reports_transitions_only() {
-  let mut fx = Fixture::new();
-  let a = fx.add("a", path_def("a"));
-  let b = fx.add("b", path_def("b"));
-  let handle = fx.run();
-
-  let mut watch = fx.pc.watch_active(TaskSelector::all());
-  fx.flush().await;
-  assert!(watch.try_recv().is_err(), "no report without a transition");
-
-  fx.pc
-    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
-  fx.pc
-    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(b), None));
-  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
-  assert_eq!(fx.recv().await, ("b", RecordedCmd::Start));
-  assert_eq!(watch.recv().await, Some(true));
-
-  fx.pc
-    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
-  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
-  fx.flush().await;
-  assert!(watch.try_recv().is_err(), "one task is still active");
-
-  fx.pc
-    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(b), None));
-  assert_eq!(fx.recv().await, ("b", RecordedCmd::Stop));
-  assert_eq!(watch.recv().await, Some(false));
-
-  fx.quit(handle).await;
+/// Registers a recording task with the kernel already running.
+fn add_live(fx: &Fixture, name: &'static str, def: TaskDef) -> TaskId {
+  let tx = fx.tx.clone();
+  fx.pc.register(
+    def,
+    Box::new(move |ctx| Box::new(RecordingTask { name, tx, ctx })),
+  )
 }
 
-/// A watch sees a task move out of what it selects.
-#[tokio::test]
-async fn active_watch_sees_a_move() {
-  let mut fx = Fixture::new();
-  let a = fx.add("a", path_def("web/a"));
-  let handle = fx.run();
-
-  let glob =
-    TaskSelector::Glob(SpaceSelector::default_space(), "web/**".into());
-  let mut watch = fx.pc.watch_active(glob);
-  fx.pc
-    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
-  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
-  assert_eq!(watch.recv().await, Some(true));
-
+async fn move_task(pc: &TaskContext, from: &str, to: &str) {
   let (reply, rx) = tokio::sync::oneshot::channel();
-  fx.pc.send(KernelCommand::Move(
+  pc.send(KernelCommand::Move(
     MoveTask {
       space: TaskSpaceId::default_space(),
-      from: TaskPath::new("web/a").unwrap(),
-      to: TaskPath::new("a").unwrap(),
+      from: TaskPath::new(from).unwrap(),
+      to: TaskPath::new(to).unwrap(),
       place: Place::Last,
     },
     reply,
   ));
   assert_eq!(rx.await.unwrap(), Ok(1));
-  assert_eq!(watch.recv().await, Some(false));
+}
+
+/// The set as `(name, active)` pairs.
+fn names(set: Vec<SetTask>) -> Vec<(String, bool)> {
+  set.into_iter().map(|t| (t.name, t.active)).collect()
+}
+
+async fn next_set(
+  watch: &mut UnboundedReceiver<Vec<SetTask>>,
+) -> Vec<(String, bool)> {
+  let set = tokio::time::timeout(Duration::from_secs(1), watch.recv())
+    .await
+    .expect("timed out waiting for the set")
+    .expect("set watch closed");
+  names(set)
+}
+
+fn set(tasks: &[(&str, bool)]) -> Vec<(String, bool)> {
+  tasks.iter().map(|(n, a)| (n.to_string(), *a)).collect()
+}
+
+#[tokio::test]
+async fn a_set_watch_reports_activity_changes() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", path_def("a"));
+  let b = fx.add("b", path_def("b"));
+  let handle = fx.run();
+
+  let mut watch = fx.pc.watch_set(vec![TaskSelector::all()]);
+  assert_eq!(
+    next_set(&mut watch).await,
+    set(&[("a", false), ("b", false)])
+  );
+
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  assert_eq!(
+    next_set(&mut watch).await,
+    set(&[("a", true), ("b", false)])
+  );
+
+  // A restart is active throughout: nothing to report.
+  fx.pc
+    .send(KernelCommand::Act(Verb::Restart, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  fx.flush().await;
+  assert!(watch.try_recv().is_err(), "a restart was reported");
+
+  fx.pc
+    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
+  assert_eq!(
+    next_set(&mut watch).await,
+    set(&[("a", false), ("b", false)])
+  );
+  let _ = b;
+
+  fx.quit(handle).await;
+}
+
+#[tokio::test]
+async fn a_set_watch_follows_its_selectors() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", path_def("web/a"));
+  let api = TaskDef {
+    spec: Some(crate::spec::TaskSpec::with_cmd(vec!["api".into()])),
+    ..tagged_def("api", "backend")
+  };
+  fx.add("api", api);
+  fx.add("other", path_def("other"));
+  let handle = fx.run();
+
+  let web = TaskSelector::Glob(SpaceSelector::default_space(), "web/**".into());
+  let backend =
+    TaskSelector::Tag(SpaceSelector::default_space(), "backend".into());
+  let mut watch = fx.pc.watch_set(vec![web.clone(), backend, web]);
+  // The union, each task once.
+  assert_eq!(
+    next_set(&mut watch).await,
+    set(&[("web/a", false), ("api", false)])
+  );
+
+  // Added where the glob looks.
+  let b = add_live(&fx, "b", path_def("web/b"));
+  assert_eq!(
+    next_set(&mut watch).await,
+    set(&[("web/a", false), ("web/b", false), ("api", false)])
+  );
+
+  // Renamed: still in, under its new name.
+  move_task(&fx.pc, "web/b", "web/c").await;
+  assert_eq!(
+    next_set(&mut watch).await,
+    set(&[("web/a", false), ("web/c", false), ("api", false)])
+  );
+
+  // Moved out of the glob.
+  move_task(&fx.pc, "web/a", "a").await;
+  assert_eq!(
+    next_set(&mut watch).await,
+    set(&[("web/c", false), ("api", false)])
+  );
+
+  // Retagged: out of the tag.
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  let mut retag = update(Vec::new(), "api");
+  retag.tags = Vec::new();
+  fx.pc.send(KernelCommand::Update(
+    TaskSelector::Glob(SpaceSelector::default_space(), "api".into()),
+    retag,
+    tx,
+  ));
+  assert_eq!(rx.await.unwrap(), Ok(1));
+  assert_eq!(next_set(&mut watch).await, set(&[("web/c", false)]));
+
+  fx.pc.send(KernelCommand::Remove(TaskSelector::Id(b), None));
+  assert_eq!(next_set(&mut watch).await, set(&[]));
+
+  // Changes elsewhere aren't reported.
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  fx.flush().await;
+  assert!(watch.try_recv().is_err(), "a change outside was reported");
 
   fx.quit(handle).await;
 }
@@ -2317,6 +2405,7 @@ async fn second_freeze_is_refused_and_reports_still_apply() {
   // driving (no restart command goes out).
   let task_ctx = TaskContext::new(
     std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(100)),
+    std::sync::Arc::default(),
     a,
     fx.pc.sender_for_tests(),
   );
@@ -2465,6 +2554,7 @@ async fn a_late_answer_to_an_earlier_freeze_is_ignored() {
   let handle = fx.run();
   let task_ctx = TaskContext::new(
     std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(100)),
+    std::sync::Arc::default(),
     a,
     fx.pc.sender_for_tests(),
   );

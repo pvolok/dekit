@@ -67,7 +67,7 @@ fn wide_chars() {
   feed(&mut s, "abc\u{6d4b}".as_bytes());
   assert_eq!(row_text(&s, 0), "abc");
   assert_eq!(row_text(&s, 1), "\u{6d4b}");
-  assert_eq!(s.grid().line_text(1), "abc\u{6d4b}");
+  assert_eq!(s.open_log_line().as_deref(), Some("abc\u{6d4b}"));
   s.set_size(2, 8);
   assert_eq!(row_text(&s, 0), "abc\u{6d4b}");
   assert_eq!(s.cursor_position(), (0, 5));
@@ -76,7 +76,7 @@ fn wide_chars() {
   feed(&mut s, "abcd\x1b[1;4H\u{6d4b}".as_bytes());
   assert_eq!(row_text(&s, 0), "abcd");
   assert_eq!(row_text(&s, 1), "\u{6d4b}");
-  assert_eq!(s.grid().line_text(1), "abcd\u{6d4b}");
+  assert_eq!(s.open_log_line().as_deref(), Some("abcd\u{6d4b}"));
 }
 
 #[test]
@@ -477,20 +477,6 @@ fn history_and_view() {
 }
 
 #[test]
-fn finished_lines_are_reported() {
-  let mut s = screen(20, 3);
-  s.set_line_tap(true);
-  feed(&mut s, b"\x1b[32mlistening\x1b[0m on :3000\r\npartial");
-  let mut lines = Vec::new();
-  s.take_finished_lines(&mut lines);
-  assert_eq!(lines, vec!["listening on :3000".to_string()]);
-  assert_eq!(s.cursor_line_text(), "partial");
-  feed(&mut s, b" line\x1bE");
-  s.take_finished_lines(&mut lines);
-  assert_eq!(lines.last().map(String::as_str), Some("partial line"));
-}
-
-#[test]
 fn oversized_osc_aborts() {
   let mut s = screen(10, 2);
   feed(&mut s, b"\x1b]0;");
@@ -728,7 +714,7 @@ mod snapshot_tests {
     screen.set_size(2, 8);
     restored.set_size(2, 8);
     assert_eq!(state(&restored), state(&screen));
-    assert_eq!(restored.grid().line_text(0), "abc\u{6d4b}");
+    assert_eq!(restored.open_log_line().as_deref(), Some("abc\u{6d4b}"));
 
     // In scrollback too: the line comes back whole when the screen grows.
     let mut screen = Screen::new(size, 10);
@@ -737,7 +723,7 @@ mod snapshot_tests {
     screen.set_size(6, 8);
     restored.set_size(6, 8);
     assert_eq!(state(&restored), state(&screen));
-    assert_eq!(restored.grid().line_text(0), "abc\u{6d4b}");
+    assert_eq!(row_text(&restored, 0), "abc\u{6d4b}");
   }
 
   #[test]
@@ -870,21 +856,6 @@ fn shift_left_and_right_ignore_origin_mode() {
 }
 
 #[test]
-fn lines_overwritten_by_a_carriage_return_are_still_reported() {
-  let mut s = screen(20, 3);
-  s.set_line_tap(true);
-  feed(&mut s, b"ready\rbusy \r\nnext\r\n");
-  let mut lines = Vec::new();
-  s.take_finished_lines(&mut lines);
-  assert_eq!(lines, vec!["ready", "busy", "next"]);
-  // A bare CR at the start of a line reports nothing.
-  feed(&mut s, b"\r\rx\r\n");
-  lines.clear();
-  s.take_finished_lines(&mut lines);
-  assert_eq!(lines, vec!["x"]);
-}
-
-#[test]
 fn a_cluster_stops_growing_at_a_bound() {
   let mut s = screen(10, 2);
   let mut text = String::from("a");
@@ -903,21 +874,6 @@ fn a_cluster_stops_growing_at_a_bound() {
     frame.tables.graphemes.len() <= crate::term::unicode::MAX_CLUSTER_BYTES
   );
   assert_eq!(s.cursor_position(), (0, 1));
-}
-
-#[test]
-fn finished_lines_are_whole_logical_lines() {
-  let mut s = screen(10, 3);
-  s.set_line_tap(true);
-  feed(&mut s, b"listening on http://localhost:3000 (pid 1)");
-  assert_eq!(
-    s.cursor_line_text(),
-    "listening on http://localhost:3000 (pid 1)"
-  );
-  feed(&mut s, b"\r\n");
-  let mut lines = Vec::new();
-  s.take_finished_lines(&mut lines);
-  assert_eq!(lines, vec!["listening on http://localhost:3000 (pid 1)"]);
 }
 
 #[test]
@@ -1001,4 +957,235 @@ fn dynamic_colors_survive_a_snapshot() {
   assert_eq!(colors.bg, Some(Rgb(0x10, 0x20, 0x30)));
   assert_eq!(colors.fg, None);
   assert!(colors.reverse);
+}
+
+mod log_lines {
+  use super::*;
+
+  fn logged(s: &mut Screen) -> Vec<String> {
+    let mut out = Vec::new();
+    s.take_log_lines(&mut out);
+    out
+  }
+
+  #[test]
+  fn a_newline_logs_the_line_it_ends() {
+    let mut s = screen(20, 3);
+    feed(&mut s, b"\x1b[32mlistening\x1b[0m on :3000\r\npartial");
+    assert_eq!(logged(&mut s), ["listening on :3000"]);
+    assert_eq!(s.open_log_line().as_deref(), Some("partial"));
+    // NEL and IND end lines too.
+    feed(&mut s, b" line\x1bE\x1b[1Gind\x1bD");
+    assert_eq!(logged(&mut s), ["partial line", "ind"]);
+  }
+
+  #[test]
+  fn repeated_and_blank_lines_are_all_logged() {
+    let mut s = screen(20, 5);
+    feed(&mut s, b"same\r\nsame\r\n\r\n  same\r\n");
+    assert_eq!(logged(&mut s), ["same", "same", "", "  same"]);
+  }
+
+  #[test]
+  fn a_progress_bar_logs_its_last_frame() {
+    let mut s = screen(20, 3);
+    feed(&mut s, b"build  10%\rbuild  50%\rbuild 100%\r\ndone\r\n");
+    assert_eq!(logged(&mut s), ["build 100%", "done"]);
+  }
+
+  #[test]
+  fn a_needle_overwritten_in_place_is_found() {
+    let mut s = screen(30, 3);
+    s.look_for(Some("listening".into()));
+    let spinner = b"\r\x1b[Kstarting".repeat(200);
+    feed(&mut s, &spinner);
+    assert!(!s.take_found());
+    feed(&mut s, b"\r\x1b[Klistening\r\x1b[Kwatching");
+    assert!(s.take_found());
+    // Found once: no longer looked for.
+    feed(&mut s, b"\r\nlistening\r\n");
+    assert!(!s.take_found());
+  }
+
+  #[test]
+  fn a_needle_is_found_in_logged_lines_and_the_line_under_way() {
+    let mut s = screen(20, 3);
+    s.look_for(Some("ready".into()));
+    feed(&mut s, b"booting\r\nre");
+    assert!(!s.take_found());
+    feed(&mut s, b"ady");
+    assert!(s.take_found());
+
+    // Each logged line is checked, though gone from the screen by now.
+    s.look_for(Some("db up".into()));
+    feed(&mut s, b"\r\ndb up\r\n1\r\n2\r\n3\r\n");
+    assert!(s.take_found());
+
+    // Looking starts with the line under way, and goes on across RIS.
+    feed(&mut s, b"port 80");
+    s.look_for(Some("port".into()));
+    assert!(s.take_found());
+    s.look_for(Some("again".into()));
+    feed(&mut s, b"\x1bcagain");
+    assert!(s.take_found());
+
+    s.look_for(Some("x".into()));
+    s.look_for(None);
+    feed(&mut s, b"x\r\n");
+    assert!(!s.take_found());
+  }
+
+  #[test]
+  fn a_status_line_logs_what_replaced_it() {
+    // Cargo: the bar is cleared and overwritten by each finished step.
+    let mut s = screen(30, 3);
+    feed(&mut s, b"   Compiling a\r\nBuilding [=>  ] 1/3");
+    feed(&mut s, b"\r\x1b[K   Compiling b\r\nBuilding [==> ] 2/3");
+    feed(&mut s, b"\r\x1b[2K");
+    s.finish_log_line();
+    assert_eq!(logged(&mut s), ["   Compiling a", "   Compiling b"]);
+  }
+
+  #[test]
+  fn redrawn_lines_keep_their_first_state() {
+    // docker buildx: the cursor goes back up over the steps it printed.
+    let mut s = screen(30, 5);
+    feed(&mut s, b"[+] step 1 0.1s\r\n[+] step 2 0.0s\r\n");
+    feed(
+      &mut s,
+      b"\x1b[2A\r\x1b[K[+] step 1 DONE\r\n\x1b[K[+] step 2 0.5s\r\n",
+    );
+    feed(&mut s, b"\x1b[K[+] step 3\r\n");
+    assert_eq!(
+      logged(&mut s),
+      ["[+] step 1 0.1s", "[+] step 2 0.0s", "[+] step 3"]
+    );
+  }
+
+  #[test]
+  fn erase_and_redraw_frames_are_logged_once() {
+    // log-update: each frame erases the lines above and draws again.
+    let mut s = screen(20, 5);
+    feed(&mut s, b"a 1\r\nb 1");
+    feed(&mut s, b"\x1b[2K\x1b[1A\x1b[2K\x1b[Ga 2\r\nb 2");
+    feed(&mut s, b"\x1b[2K\x1b[1A\x1b[2K\x1b[Ga 3\r\nb 3\r\n");
+    assert_eq!(logged(&mut s), ["a 1", "b 3"]);
+  }
+
+  #[test]
+  fn a_full_clear_starts_afresh() {
+    let mut s = screen(20, 5);
+    feed(&mut s, b"one\r\ntwo\r\n");
+    assert_eq!(logged(&mut s), ["one", "two"]);
+    // tsc --watch
+    feed(&mut s, b"one\r\ntwo\r\n\x1bcthree\r\n");
+    assert_eq!(logged(&mut s), ["one", "two", "three"]);
+    // jest
+    feed(&mut s, b"\x1b[2J\x1b[3J\x1b[Hfour\r\n");
+    assert_eq!(logged(&mut s), ["four"]);
+    // vite: erase below from the top-left
+    feed(&mut s, b"\x1b[H\x1b[Jfive\r\n");
+    assert_eq!(logged(&mut s), ["five"]);
+  }
+
+  #[test]
+  fn partial_clears_do_not_start_afresh() {
+    let mut s = screen(20, 5);
+    feed(&mut s, b"one\r\ntwo\r\n");
+    logged(&mut s);
+    feed(&mut s, b"\x1b[3J\x1b[Hxx\r\n");
+    feed(&mut s, b"\x1b[2;1H\x1b[Jyy\r\n");
+    assert_eq!(logged(&mut s), Vec::<String>::new());
+  }
+
+  #[test]
+  fn the_alternate_screen_is_not_logged() {
+    let mut s = screen(20, 5);
+    feed(&mut s, b"before\r\npending");
+    feed(&mut s, b"\x1b[?1049hvim\r\nstuff\r\n");
+    assert_eq!(logged(&mut s), ["before"]);
+    assert_eq!(s.open_log_line().as_deref(), Some("pending"));
+    feed(&mut s, b"\x1b[?1049l line\r\nafter\r\n");
+    assert_eq!(logged(&mut s), ["pending line", "after"]);
+  }
+
+  #[test]
+  fn long_lines_survive_scrolling_off() {
+    let line = "x".repeat(45);
+    for scrollback in [0, 100] {
+      let mut s = Screen::new(
+        Size {
+          width: 10,
+          height: 3,
+        },
+        scrollback,
+      );
+      feed(&mut s, format!("{line}\r\nnext\r\n").as_bytes());
+      assert_eq!(logged(&mut s), [line.as_str(), "next"], "{scrollback}");
+    }
+  }
+
+  #[test]
+  fn rows_no_one_logged_are_logged_as_they_scroll_off() {
+    let mut s = screen(10, 3);
+    feed(&mut s, b"\x1b[3;1Hbottom\x1b[H\x1b[3S");
+    assert_eq!(logged(&mut s), ["bottom"]);
+  }
+
+  #[test]
+  fn a_scroll_region_logs_each_line() {
+    // apt: progress on the last row, output scrolling above it.
+    let mut s = screen(20, 4);
+    feed(&mut s, b"\x1b[1;3r");
+    for i in 1..=5 {
+      feed(&mut s, format!("line {i}\r\n").as_bytes());
+      feed(
+        &mut s,
+        format!("\x1b7\x1b[4;1HProgress {i}0%\x1b8").as_bytes(),
+      );
+    }
+    assert_eq!(
+      logged(&mut s),
+      ["line 1", "line 2", "line 3", "line 4", "line 5"]
+    );
+  }
+
+  #[test]
+  fn a_resize_keeps_the_open_line() {
+    let mut s = screen(20, 3);
+    feed(&mut s, b"done\r\nhalf of a line");
+    logged(&mut s);
+    s.set_size(3, 6);
+    feed(&mut s, b" and more\r\n");
+    s.set_size(3, 30);
+    feed(&mut s, b"next\r\n");
+    assert_eq!(logged(&mut s), ["half of a line and more", "next"]);
+  }
+
+  #[test]
+  fn an_exit_logs_the_open_line_once() {
+    let mut s = screen(20, 3);
+    feed(&mut s, b"a\r\nno newline");
+    s.finish_log_line();
+    s.finish_log_line();
+    assert_eq!(logged(&mut s), ["a", "no newline"]);
+    assert_eq!(s.open_log_line(), None);
+  }
+
+  #[test]
+  fn a_reset_keeps_lines_not_taken() {
+    let mut s = screen(20, 3);
+    feed(&mut s, b"a\r\n\x1bcb\r\n");
+    assert_eq!(logged(&mut s), ["a", "b"]);
+  }
+
+  #[test]
+  fn a_restored_screen_logs_only_new_lines() {
+    let mut s = screen(10, 3);
+    feed(&mut s, b"a\r\nb\r\nopen");
+    logged(&mut s);
+    let mut restored = Screen::from_snapshot(&s.snapshot()).unwrap();
+    feed(&mut restored, b"\r\nd\r\ne\r\n");
+    assert_eq!(logged(&mut restored), ["open", "d", "e"]);
+  }
 }

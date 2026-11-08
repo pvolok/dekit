@@ -220,10 +220,22 @@ impl Screen {
 
   fn erase_display(&mut self, mode: u16) {
     let style = self.style_id();
+    // A clear of the whole screen starts the log afresh; a partial one
+    // is a program redrawing what it showed.
     match mode {
-      0 => self.grid_mut().erase_all_forward(style),
+      0 => {
+        let grid = self.grid_mut();
+        let home = grid.pos() == Pos::default();
+        grid.erase_all_forward(style);
+        if home {
+          grid.log_restart();
+        }
+      }
       1 => self.grid_mut().erase_all_backward(style),
-      2 => self.grid_mut().erase_all(style),
+      2 => {
+        self.grid_mut().erase_all(style);
+        self.grid_mut().log_restart();
+      }
       3 => self.grid_mut().clear_history(),
       n => log::debug!("Unhandled ED mode: {n}"),
     }

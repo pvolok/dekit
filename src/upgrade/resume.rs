@@ -16,10 +16,10 @@ use crate::{
     attach::{Attachment, resume_session},
     main::print_warnings,
     server::{
-      Connections, Resumed, ServerCtx, dispatch_connection,
+      Connections, Resumed, ServerCtx, SessionConn, dispatch_connection,
       hello_from_snapshot, init_logging, runner_handle, serve,
     },
-    wait::{CarriedWait, WaitConn, resume_wait_session},
+    wait::{CarriedWait, resume_wait_session},
   },
   kernel::{
     kernel::Kernel,
@@ -148,7 +148,7 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
       )),
       Carried::Wait { hello, wait } => Box::pin(resume_wait_session(
         ctx,
-        WaitConn {
+        SessionConn {
           reg,
           fd,
           hello,

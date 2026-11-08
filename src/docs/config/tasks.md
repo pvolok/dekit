@@ -304,3 +304,8 @@ such as `api.log`. The object form sets `dir`, `file`, and `mode`
 (`append`, the default, or `truncate`); `{name}`, `{pid}`, and `{ts}` in
 `dir` or `file` are filled in on each run. `true` and `false` turn
 logging on or off, which is handy when `defaults` sets the directory.
+
+A file has everything the task printed, escapes and all, for as long as
+you keep it. |cli/logs| shows the lines without a file: the last ones
+dekit keeps while the runner runs, one per line however the task redrew
+it.

@@ -374,13 +374,9 @@ impl TaskScreen {
     self.settle(effects);
   }
 
-  /// Asks the screen for the text of lines as they finish (ready checks).
-  pub fn set_line_tap(&mut self, on: bool) {
-    self.screen.set_line_tap(on);
-  }
-
-  pub fn take_finished_lines(&mut self, out: &mut Vec<String>) {
-    self.screen.take_finished_lines(out);
+  /// Moves the lines the screen logged so far to `out`.
+  pub fn take_log_lines(&mut self, out: &mut Vec<String>) {
+    self.screen.take_log_lines(out);
   }
 
   pub async fn process(

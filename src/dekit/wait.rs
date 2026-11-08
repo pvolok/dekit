@@ -10,7 +10,8 @@ use tokio::{sync::mpsc::UnboundedReceiver, time::Instant};
 use crate::{
   command::Command,
   dekit::server::{
-    ConnCtl, ConnReg, ServerCtx, carried, finish, rpc_task_info, rpc_why,
+    ConnCtl, ServerCtx, SessionConn, carried, event, finish, rpc_task_info,
+    rpc_why,
   },
   kernel::{
     kernel_message::{
@@ -19,10 +20,8 @@ use crate::{
     task::TaskId,
   },
   protocol::{
-    ActResult, Bye, ConnReceiver, ConnSender, CtlMsg, Event, RpcError,
-    RpcWaitTask, WaitDoneEvent, WaitFor, WaitOutcome, WaitTasksEvent, codes,
-    ctl::Hello,
-    ok_result,
+    ActResult, Bye, CtlMsg, RpcError, RpcWaitTask, WaitDoneEvent, WaitFor,
+    WaitOutcome, WaitTasksEvent, codes, ok_result,
     rpc::{
       EVENT_TASK_CHANGED, EVENT_TASK_REMOVED, EVENT_TASKS, EVENT_WAIT_DONE,
     },
@@ -37,15 +36,6 @@ pub struct WaitParams {
   pub command: Option<Command>,
   pub wait_for: Option<WaitFor>,
   pub timeout_ms: Option<u64>,
-}
-
-/// The connection a wait session is on.
-pub struct WaitConn {
-  pub reg: ConnReg,
-  pub fd: Option<i32>,
-  pub hello: Hello,
-  pub sender: ConnSender,
-  pub receiver: ConnReceiver,
 }
 
 /// A wait carried across an upgrade: all it needs, since it reads the
@@ -117,7 +107,7 @@ fn plan(params: &WaitParams) -> Result<Plan, RpcError> {
 
 pub async fn wait_session(
   ctx: &Arc<ServerCtx>,
-  mut conn: WaitConn,
+  mut conn: SessionConn,
   request_id: u64,
   params: WaitParams,
 ) {
@@ -193,7 +183,7 @@ pub async fn wait_session(
 /// the same tasks, and the client hears the set as it is now.
 pub async fn resume_wait_session(
   ctx: Arc<ServerCtx>,
-  mut conn: WaitConn,
+  mut conn: SessionConn,
   wait: CarriedWait,
 ) {
   let deadline = wait.timeout.map(|left| Instant::now() + left);
@@ -217,13 +207,13 @@ pub async fn resume_wait_session(
 }
 
 async fn run_wait(
-  conn: WaitConn,
+  conn: SessionConn,
   cond: WaitCond,
   mut tasks: Vec<WaitTask>,
   mut events: UnboundedReceiver<WaitEvent>,
   deadline: Option<Instant>,
 ) {
-  let WaitConn {
+  let SessionConn {
     mut reg,
     fd,
     hello,
@@ -356,13 +346,6 @@ async fn run_wait(
     receiver.buffered(),
   )
   .await;
-}
-
-fn event<T: serde::Serialize>(name: &str, params: &T) -> CtlMsg {
-  CtlMsg::Event(Event {
-    name: name.to_string(),
-    params: serde_json::to_value(params).expect("event params serialize"),
-  })
 }
 
 fn outcome(verdict: WaitVerdict) -> WaitOutcome {

@@ -136,16 +136,15 @@ pub struct Screen {
   pending_image: Option<Pending>,
 
   events: Vec<VtEvent>,
-  /// Whoever owns the screen wants the text of lines as they finish.
-  line_tap: bool,
-  finished_lines: Vec<String>,
 }
 
 impl Screen {
   pub fn new(size: Size, scrollback_len: usize) -> Self {
+    let mut grid = Grid::new(size, scrollback_len);
+    grid.enable_log();
     Screen {
       scanner: Scanner::default(),
-      grid: Grid::new(size, scrollback_len),
+      grid,
       alt_grid: Grid::new(size, 0),
       style: Style::DEFAULT,
       saved_style: Style::DEFAULT,
@@ -175,14 +174,13 @@ impl Screen {
       images: ImageStore::default(),
       pending_image: None,
       events: Vec::new(),
-      line_tap: false,
-      finished_lines: Vec::new(),
     }
   }
 
   /// Clears the screen and scrollback, returning it to the initial state
-  /// at the current size. The owner's settings (palette, cell size, line
-  /// tap) stay.
+  /// at the current size. The owner's settings (palette, cell size)
+  /// stay, and so does the log's state: lines not taken yet, and what it
+  /// looks for.
   pub fn reset(&mut self) {
     self.reset_with(self.grid.scrollback_len());
   }
@@ -190,14 +188,13 @@ impl Screen {
   /// `reset`, keeping `scrollback_len` lines of history from now on.
   pub fn reset_with(&mut self, scrollback_len: usize) {
     let size = self.grid.size();
-    let fresh = Screen::new(size, scrollback_len);
+    let mut fresh = Screen::new(size, scrollback_len);
+    fresh.grid.carry_log(&mut self.grid);
     *self = Screen {
       palette: self.palette.clone(),
       cell_pixels: self.cell_pixels,
-      line_tap: self.line_tap,
-      // Replies and lines from earlier in this chunk are still owed.
+      // Replies from earlier in this chunk are still owed.
       events: std::mem::take(&mut self.events),
-      finished_lines: std::mem::take(&mut self.finished_lines),
       ..fresh
     };
   }
@@ -590,35 +587,35 @@ impl Screen {
     out.append(&mut self.events);
   }
 
-  /// Asks for (or stops) the text of each line as it finishes: when the
-  /// cursor leaves it with a line feed.
-  pub fn set_line_tap(&mut self, on: bool) {
-    self.line_tap = on;
-    if !on {
-      self.finished_lines.clear();
-    }
+  /// Moves the lines the main screen logged so far to `out` (see
+  /// `Grid::log_newline`). The alternate screen logs nothing.
+  pub fn take_log_lines(&mut self, out: &mut Vec<String>) {
+    self.grid.take_log_lines(out);
   }
 
-  pub fn take_finished_lines(&mut self, out: &mut Vec<String>) {
-    out.append(&mut self.finished_lines);
+  /// Looks for `needle` in the main screen's lines: each logged line, and
+  /// the line under way now, at each carriage return, and at the end of
+  /// each output, so text a program overwrites in place is seen too.
+  /// `None` stops looking.
+  pub fn look_for(&mut self, needle: Option<String>) {
+    self.grid.look_for(needle);
   }
 
-  /// The plain text of the cursor's logical line so far, wrapped rows
-  /// joined.
-  pub fn cursor_line_text(&self) -> String {
-    let grid = self.active_grid();
-    grid.line_text(grid.pos().row)
+  /// Whether the needle was seen since the last take; once seen, it is no
+  /// longer looked for.
+  pub fn take_found(&mut self) -> bool {
+    self.grid.take_found()
   }
 
-  fn line_finished(&mut self, row: u16) {
-    if !self.line_tap || self.finished_lines.len() >= 4096 {
-      return;
-    }
-    let text = self.active_grid().line_text(row);
-    // A carriage return followed by a line feed reports the line once.
-    if self.finished_lines.last() != Some(&text) {
-      self.finished_lines.push(text);
-    }
+  /// The main screen's line under way: the cursor's, when it is not
+  /// logged yet.
+  pub fn open_log_line(&self) -> Option<String> {
+    self.grid.open_log_line()
+  }
+
+  /// Logs the line under way as it is: the program is gone.
+  pub fn finish_log_line(&mut self) {
+    self.grid.finish_log_line();
   }
 
   // Processing
@@ -638,6 +635,8 @@ impl Screen {
     let mut scanner = std::mem::take(&mut self.scanner);
     scanner.feed(data, |seq| self.apply(seq));
     self.scanner = scanner;
+    // The output may pause on a line that is never ended.
+    self.grid.log_check_open();
     self.settle_views();
   }
 
@@ -668,14 +667,8 @@ impl Screen {
       0x09 => self.grid_mut().col_tab(),
       0x0A..=0x0C => self.linefeed(),
       0x0D => {
-        // What was on the line before the program overwrites it (a
-        // progress line, a status the next write replaces) counts as a
-        // finished line for ready checks.
-        if self.line_tap && self.active_grid().pos().col > 0 {
-          let row = self.active_grid().pos().row;
-          self.line_finished(row);
-        }
         let grid = self.grid_mut();
+        grid.log_check_open();
         let (left, _) = grid.margins();
         let col = if grid.pos().col >= left { left } else { 0 };
         grid.col_set(col);
@@ -689,8 +682,7 @@ impl Screen {
   }
 
   fn linefeed(&mut self) {
-    let row = self.active_grid().pos().row;
-    self.line_finished(row);
+    self.grid_mut().log_newline();
     let style = self.style_id();
     self.grid_mut().row_inc_scroll(1, style);
     if self.modes.newline {
@@ -714,13 +706,13 @@ impl Screen {
       b'>' => self.modes.app_keypad = false,
       // IND
       b'D' => {
+        self.grid_mut().log_newline();
         let style = self.style_id();
         self.grid_mut().row_inc_scroll(1, style);
       }
       // NEL
       b'E' => {
-        let row = self.active_grid().pos().row;
-        self.line_finished(row);
+        self.grid_mut().log_newline();
         let style = self.style_id();
         let (left, _) = self.active_grid().margins();
         self.grid_mut().row_inc_scroll(1, style);

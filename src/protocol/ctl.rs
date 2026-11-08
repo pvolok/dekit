@@ -197,6 +197,9 @@ pub mod codes {
   pub const UNSUPPORTED: &str = "unsupported";
   /// The operation is already in progress.
   pub const BUSY: &str = "busy";
+  /// Bye: the runner is being replaced live, and this session can't be
+  /// carried across.
+  pub const UPGRADE: &str = "upgrade";
 }
 
 /// Client-to-server event carrying a terminal input event in the first

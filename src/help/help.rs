@@ -151,7 +151,9 @@ fn show(
   page(&text)
 }
 
-fn color_enabled() -> bool {
+/// Whether styled output is wanted, where it can be shown: neither
+/// `NO_COLOR` nor a dumb terminal says otherwise.
+pub(crate) fn color_enabled() -> bool {
   let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
   let dumb = std::env::var("TERM").is_ok_and(|term| term == "dumb");
   !no_color && !dumb

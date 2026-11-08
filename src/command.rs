@@ -670,6 +670,7 @@ mod tests {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let pc = TaskContext::new(
       std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+      std::sync::Arc::default(),
       crate::kernel::task::INIT_TASK_ID,
       tx,
     );
@@ -699,6 +700,7 @@ mod tests {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let pc = TaskContext::new(
       std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+      std::sync::Arc::default(),
       crate::kernel::task::INIT_TASK_ID,
       tx,
     );
@@ -770,6 +772,7 @@ mod tests {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let pc = TaskContext::new(
       std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+      std::sync::Arc::default(),
       crate::kernel::task::INIT_TASK_ID,
       tx,
     );

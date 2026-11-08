@@ -7,6 +7,7 @@
   `~/projects/*` for every dir in a folder. The console's `switch` tab (`<P>`)
   shows them, running or not
 - `dekit project list` shows what the list comes to
+- `dekit logs [TARGET...]`
 
 ## 0.10.3 - 2026-10-25
 

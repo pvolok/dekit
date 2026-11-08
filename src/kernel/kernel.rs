@@ -9,15 +9,17 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::time::{DelayQueue, delay_queue};
 
 use crate::kernel::kernel_message::{KernelSnapshot, TaskContext};
+use crate::kernel::logs::LogStore;
 use crate::upgrade::snapshot as snap;
 
 use super::{
   kernel_message::{
     DepExplain, DuplicateRequest, FolderDef, FolderInfo, FolderSettings,
     KernelCommand, KernelMessage, KernelQuery, MoveError, MoveTask, Place,
-    RegisterError, Registration, SpaceSelector, TaskDescription, TaskExplain,
-    TaskInfo, TaskRegistration, TaskSelector, TaskUpdate, Verb, WaitCond,
-    WaitEvent, WaitMark, WaitOn, WaitRequest, WaitTask, WaitVerdict, task_name,
+    RegisterError, Registration, SetTask, SpaceSelector, TaskDescription,
+    TaskExplain, TaskInfo, TaskRegistration, TaskSelector, TaskUpdate, Verb,
+    WaitCond, WaitEvent, WaitMark, WaitOn, WaitRequest, WaitTask, WaitVerdict,
+    task_name,
   },
   namespace::Namespace,
   path_trie::PathConflict,
@@ -54,12 +56,11 @@ fn backoff_delay(attempts: u32) -> Duration {
   BACKOFF_MIN.saturating_mul(1 << exp).min(BACKOFF_MAX)
 }
 
-/// Reports when the selected set goes between "some task active" and
-/// "none active". Backoff counts as active: the task is coming back.
-struct ActiveWatch {
-  selector: TaskSelector,
-  sender: UnboundedSender<bool>,
-  active: bool,
+/// A `WatchSet` in progress, with the set as last sent.
+struct SetWatch {
+  selectors: Vec<TaskSelector>,
+  sender: UnboundedSender<Vec<SetTask>>,
+  last: Vec<SetTask>,
 }
 
 /// A wait in progress: its set, fixed when it began, and how each task
@@ -129,6 +130,7 @@ struct Graph {
 
   quitting: bool,
   next_task_id: Arc<AtomicUsize>,
+  logs: Arc<LogStore>,
   tasks: HashMap<TaskId, TaskHandle>,
   /// `edges[a]` contains `b` when `a` requires `b`. Edges from
   /// `INIT_TASK_ID` are pins. Every endpoint is a registered task:
@@ -155,7 +157,7 @@ struct Graph {
   /// Effects reported by tasks during the current step; `settle` applies
   /// them one at a time, each against settled state.
   pending_effects: VecDeque<(TaskId, TaskEffect)>,
-  active_watches: Vec<ActiveWatch>,
+  set_watches: Vec<SetWatch>,
   waits: Vec<WaitWatch>,
   /// Set whenever a task is added, removed, moved, renamed, retagged, or
   /// redefined, changes state, gains or loses an edge, or comes to be
@@ -181,6 +183,7 @@ impl Graph {
 
       quitting: false,
       next_task_id: Arc::new(AtomicUsize::new(1)),
+      logs: Arc::default(),
       tasks: HashMap::new(),
       edges: HashMap::new(),
       redges: HashMap::new(),
@@ -194,7 +197,7 @@ impl Graph {
       now: Instant::now(),
       timer_changes: Vec::new(),
       pending_effects: VecDeque::new(),
-      active_watches: Vec::new(),
+      set_watches: Vec::new(),
       waits: Vec::new(),
       state_changed: false,
       frozen: None,
@@ -209,6 +212,7 @@ impl Graph {
   fn context(&self) -> TaskContext {
     TaskContext::new(
       self.next_task_id.clone(),
+      self.logs.clone(),
       INIT_TASK_ID,
       self.sender.clone(),
     )
@@ -245,8 +249,13 @@ impl Graph {
       }
       None => None,
     };
-    let ctx =
-      TaskContext::new(self.next_task_id.clone(), task_id, self.sender.clone());
+    self.logs.add_task(task_id);
+    let ctx = TaskContext::new(
+      self.next_task_id.clone(),
+      self.logs.clone(),
+      task_id,
+      self.sender.clone(),
+    );
     let task = factory(ctx);
     let label = def.label.clone();
     let vt = def.vt.clone();
@@ -691,43 +700,63 @@ impl Graph {
     Some((task.epoch, deadline.saturating_duration_since(self.now)))
   }
 
-  fn any_active(&self, selector: &TaskSelector) -> bool {
-    self.matching_ids(selector).into_iter().any(|id| {
-      match self.tasks[&id].state {
+  /// The tasks `selectors` match, each once, in list order.
+  fn set_of(&self, selectors: &[TaskSelector]) -> Vec<SetTask> {
+    let mut ids: Vec<TaskId> = selectors
+      .iter()
+      .flat_map(|selector| self.matching_ids(selector))
+      .collect::<HashSet<_>>()
+      .into_iter()
+      .collect();
+    ids.sort_by_cached_key(|id| self.list_key(*id));
+    let task = |id: TaskId| {
+      let task = self.tasks.get(&id)?;
+      let active = match task.state {
         TaskState::Starting
         | TaskState::Running
         | TaskState::Ready
         | TaskState::Stopping
         | TaskState::Backoff(_) => true,
         TaskState::Idle | TaskState::Done(_) | TaskState::Exited(_) => false,
-      }
-    })
+      };
+      Some(SetTask {
+        id,
+        name: task_name(id, &task.space, task.path.as_ref()),
+        active,
+      })
+    };
+    ids.into_iter().filter_map(task).collect()
   }
 
-  fn watch_active(
+  fn watch_set(
     &mut self,
-    selector: TaskSelector,
-    sender: UnboundedSender<bool>,
+    selectors: Vec<TaskSelector>,
+    sender: UnboundedSender<Vec<SetTask>>,
   ) {
-    let active = self.any_active(&selector);
-    self.active_watches.push(ActiveWatch {
-      selector,
-      sender,
-      active,
-    });
+    // A watch whose receiver is gone goes now: without a state change,
+    // `check_set_watches` would not get to it.
+    self.set_watches.retain(|watch| !watch.sender.is_closed());
+    let last = self.set_of(&selectors);
+    if sender.send(last.clone()).is_ok() {
+      self.set_watches.push(SetWatch {
+        selectors,
+        sender,
+        last,
+      });
+    }
   }
 
-  fn check_active_watches(&mut self) {
-    let mut watches = std::mem::take(&mut self.active_watches);
+  fn check_set_watches(&mut self) {
+    let mut watches = std::mem::take(&mut self.set_watches);
     watches.retain_mut(|watch| {
-      let active = self.any_active(&watch.selector);
-      if active == watch.active {
-        return true;
+      let set = self.set_of(&watch.selectors);
+      if set == watch.last {
+        return !watch.sender.is_closed();
       }
-      watch.active = active;
-      watch.sender.send(active).is_ok()
+      watch.last = set.clone();
+      watch.sender.send(set).is_ok()
     });
-    self.active_watches = watches;
+    self.set_watches = watches;
   }
 
   /// Carries out `verb` on the selector's matches (for `up`, its set)
@@ -1879,6 +1908,7 @@ impl Graph {
     let Some(mut handle) = self.tasks.remove(&task_id) else {
       return;
     };
+    self.logs.remove_task(task_id);
     self.state_changed = true;
     if handle.deadline.is_some() {
       self.timer_changes.push(task_id);
@@ -2960,7 +2990,7 @@ impl Kernel {
     self.graph.settle();
     let changed = std::mem::take(&mut self.graph.state_changed);
     if changed {
-      self.graph.check_active_watches();
+      self.graph.check_set_watches();
     }
     self.graph.check_waits(changed);
     timers.update(&mut self.graph);
@@ -3013,7 +3043,7 @@ impl Kernel {
       | KernelCommand::TaskMsg(..)
       | KernelCommand::SubscribePath(..)
       | KernelCommand::UnsubscribePath(..)
-      | KernelCommand::WatchActive(..)
+      | KernelCommand::WatchSet(..)
       | KernelCommand::Wait(..)
       | KernelCommand::StateTimeout(..) => {
         frozen.deferred.push(msg);
@@ -3253,8 +3283,8 @@ impl Kernel {
       KernelCommand::UnsubscribePath(path, mode) => {
         self.graph.unsubscribe(msg.from, path, mode);
       }
-      KernelCommand::WatchActive(selector, sender) => {
-        self.graph.watch_active(selector, sender);
+      KernelCommand::WatchSet(selectors, sender) => {
+        self.graph.watch_set(selectors, sender);
       }
       KernelCommand::Wait(request) => self.graph.begin_wait(msg.from, *request),
 
