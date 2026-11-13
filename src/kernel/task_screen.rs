@@ -182,6 +182,9 @@ pub enum ScreenNotify {
     kind: String,
     root: String,
   },
+  /// Sent to an observer as it is detached: its session ends at its own
+  /// asking, not because the screen or the runner went away.
+  Detached,
 }
 
 pub enum TaskScreenEffect {
@@ -461,6 +464,9 @@ impl TaskScreen {
         }
       }
       TaskScreenCmd::Detach { observer } => {
+        if let Some(obs) = self.observers.iter().find(|o| o.id == observer) {
+          let _ = obs.sink.send(ScreenNotify::Detached);
+        }
         self.observers.retain(|o| o.id != observer);
         self.apply_size(effects);
       }
@@ -1021,6 +1027,7 @@ mod tests {
         Ok(ScreenNotify::CopyPresent { .. }) => out.push("copy"),
         Ok(ScreenNotify::Yank { .. }) => out.push("yank"),
         Ok(ScreenNotify::Switch { .. }) => out.push("switch"),
+        Ok(ScreenNotify::Detached) => out.push("detached"),
         Err(_) => break,
       }
     }

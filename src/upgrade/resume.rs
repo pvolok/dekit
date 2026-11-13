@@ -107,6 +107,7 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
       &server_socket,
       log_level,
     )),
+    quitting: kernel.quitting(),
   });
   if let Some(hook) = config.on_idle.clone() {
     let console = pc.get_task_sender(console);

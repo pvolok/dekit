@@ -366,12 +366,16 @@ impl Config {
         .warnings
         .push(format!("ignoring 'tui' in {}: {err:#}", path.display()));
     }
-    if obj.get("keymap").is_some()
-      && let Err(err) = self.keymap.merge(&obj)
-    {
-      self
+    match self.keymap.merge(&obj) {
+      Ok(warnings) => {
+        let warnings = warnings
+          .into_iter()
+          .map(|warning| format!("{}: {warning}", path.display()));
+        self.warnings.extend(warnings);
+      }
+      Err(err) => self
         .warnings
-        .push(format!("ignoring 'keymap' in {}: {err:#}", path.display()));
+        .push(format!("ignoring 'keymap' in {}: {err:#}", path.display())),
     }
     if let Some(agent) = obj.get("agent") {
       let cmd = agent.as_obj().and_then(|agent| {

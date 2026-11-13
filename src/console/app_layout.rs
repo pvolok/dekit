@@ -10,13 +10,20 @@ pub struct AppLayout {
 }
 
 impl AppLayout {
+  /// Rows of the key hints at the bottom.
+  pub const HINTS_HEIGHT: u16 = 3;
+
   pub fn new(
     area: Rect,
     zoom: bool,
     hide_keymap_window: bool,
     config: &Config,
   ) -> Self {
-    let keymap_h = if zoom || hide_keymap_window { 0 } else { 3 };
+    let keymap_h = if zoom || hide_keymap_window {
+      0
+    } else {
+      Self::HINTS_HEIGHT
+    };
     let sidebar_w = if zoom {
       0
     } else {

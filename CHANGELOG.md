@@ -8,6 +8,10 @@
   shows them, running or not
 - `dekit project list` shows what the list comes to
 - `dekit logs [TARGET...]`
+- A key binding can be several keys typed one after another, written as
+  in vim: `gg`, `<C-w>v`
+- `keymap.global` holds bindings for every focus. Its defaults start
+  with `<leader>`
 
 ## 0.10.3 - 2026-10-25
 

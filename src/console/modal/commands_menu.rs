@@ -2,7 +2,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::console::action::{Action, FoldOp, RunnerTab, ScrollUnit};
 use crate::console::{
-  keymap::{Keymap, KeymapGroup},
+  keymap::{Keymap, KeymapGroup, keys_label},
   theme::Theme,
   widgets::filter_list::{FilterInput, FilterList},
 };
@@ -112,8 +112,8 @@ impl Modal for CommandsMenuModal {
       // not shown: actions with fields would share it. It still matches
       // the search.
       let mut rest = area.inner((0, 1, 0, 2));
-      if let Some(key) = keymap.key(KeymapGroup::Tasks, &item.action) {
-        let key = key.to_string();
+      if let Some(keys) = keymap.keys(KeymapGroup::Tasks, &item.action) {
+        let key = keys_label(keys);
         grid.draw_text(rest.take_right(key.width() as u16), &key, style.key);
         rest.take_right(1);
       }

@@ -59,7 +59,12 @@ pub async fn client_main(
   // survive on it.
   drop(term_driver);
   match result? {
-    LoopEnd::Detached => Ok(AttachEnd::Detached),
+    LoopEnd::Detached { why } => {
+      if let Some(why) = why {
+        eprintln!("dekit: {why}");
+      }
+      Ok(AttachEnd::Detached)
+    }
     LoopEnd::Switch(runner) => Ok(AttachEnd::Switch(runner)),
     LoopEnd::TaskExited { state, screen } => {
       if let Some(screen) = screen {
@@ -75,7 +80,11 @@ pub async fn client_main(
 }
 
 enum LoopEnd {
-  Detached,
+  /// With what the runner said, when the session did not end at the
+  /// client's asking.
+  Detached {
+    why: Option<String>,
+  },
   TaskExited {
     state: Option<crate::protocol::RpcState>,
     screen: Option<String>,
@@ -175,7 +184,10 @@ async fn client_loop(
               if let Some(switch) = bye.switch {
                 return Ok(LoopEnd::Switch(switch_target(switch)?));
               }
-              break;
+              let _ = stdout.flush().await;
+              return Ok(LoopEnd::Detached {
+                why: (!bye.message.is_empty()).then_some(bye.message),
+              });
             }
             if bye.code == codes::TASK_EXITED {
               let _ = stdout.flush().await;
@@ -199,7 +211,7 @@ async fn client_loop(
           }
         },
         Some(Err(err)) => return Err(err),
-        None => break,
+        None => bail!("lost the connection to the runner"),
       },
       LocalEvent::TermEvent(event) => match event? {
         Some(event) => {
@@ -214,5 +226,5 @@ async fn client_loop(
 
   let _ = stdout.flush().await;
 
-  Ok(LoopEnd::Detached)
+  Ok(LoopEnd::Detached { why: None })
 }

@@ -12,7 +12,7 @@ use crate::{
   console::{
     action::{Action, CopyMove, RunnerTab, ScrollUnit},
     app_layout::AppLayout,
-    keymap::{Keymap, KeymapGroup},
+    keymap::{Keymap, KeymapGroup, Lookup},
     modal::{
       commands_menu::CommandsMenuModal,
       menu::{MenuItem, MenuModal},
@@ -52,7 +52,7 @@ use crate::{
   term::{
     CursorStyle, Geometry, Grid, Screen, ScreenHandle, TermEvent,
     grid::Rect,
-    key::{Key, KeyEventKind},
+    key::{Key, KeyCode, KeyEventKind},
     mouse::{MouseButton, MouseEventKind},
     style::Style,
   },
@@ -171,6 +171,7 @@ impl App {
         scope: Scope::Tasks,
         tasks: TaskTree::with_groups(groups),
         hide_keymap_window: !project.config().tui.tips.show,
+        pending_keys: Vec::new(),
         quitting: false,
         header: Default::default(),
         unsaved_hit: None,
@@ -322,7 +323,14 @@ impl App {
       theme,
     );
     render_term(layout.term, grid, &self.state, theme);
-    render_keymap(layout.keymap, grid, &self.state, &self.keymap, theme);
+    let mut hints = layout.keymap;
+    if hints.height == 0 && !self.state.pending_keys.is_empty() {
+      // Zoomed, or without the hints: the keys that can follow still
+      // show, over the bottom of the screen, as nothing else says that
+      // a binding is half typed.
+      hints = grid.area().take_bottom(AppLayout::HINTS_HEIGHT);
+    }
+    render_keymap(hints, grid, &self.state, &self.keymap, theme);
     render_zoom_tip(layout.zoom_banner, grid, &self.keymap, theme);
     if let Some(modal) = &mut self.modal {
       shade(grid, &theme.block, modal.unshaded());
@@ -675,25 +683,45 @@ impl App {
     }
     if let Some(drag) = &self.state.drag
       && drag.observer == observer
-      && key.code == crate::term::key::KeyCode::Esc
+      && key.code == KeyCode::Esc
     {
       // Esc lets go of what is dragged.
       self.state.drag = None;
       return;
     }
     if let Some(modal) = &mut self.modal {
+      self.state.pending_keys.clear();
       let result = modal.handle_key(&key);
       self.modal_result(Some(observer), result);
       return;
     }
+    let mid_binding = !self.state.pending_keys.is_empty();
+    if mid_binding && matches!(key.code, KeyCode::Modifier(_)) {
+      // Shift on its way to the next key.
+      return;
+    }
     let group = self.state.keymap_group();
-    if let Some(action) = self.keymap.action(group, &key.plain()) {
-      self.handle_action(Some(observer), action.clone());
-    } else if group == KeymapGroup::Term {
+    match self
+      .keymap
+      .lookup(group, &mut self.state.pending_keys, &key)
+    {
+      Lookup::Action(action) => {
+        let action = match action {
+          // As it was typed, which is the leader's character on the
+          // layout in use.
+          Action::SendLeader => Action::SendKey { key },
+          action => action.clone(),
+        };
+        self.handle_action(Some(observer), action)
+      }
       // Unbound keys go to the process; in copy mode the keymap is the
       // whole vocabulary, so they are dropped rather than fed to the
-      // screen's own copy-mode keys.
-      self.handle_action(Some(observer), Action::SendKey { key });
+      // screen's own copy-mode keys. So is a key that ends a binding
+      // half typed, with what was typed of it.
+      Lookup::None if group == KeymapGroup::Term && !mid_binding => {
+        self.handle_action(Some(observer), Action::SendKey { key });
+      }
+      Lookup::Prefix | Lookup::None => (),
     }
   }
 
@@ -931,6 +959,8 @@ impl App {
       Action::SendKey { key } => {
         self.input_current(current, TermEvent::Key(key))
       }
+      // Only a key press has a key to send, and `handle_key` sends it.
+      Action::SendLeader => (),
     }
   }
 
@@ -1007,7 +1037,9 @@ impl App {
       }
       ScreenNotify::Attached => self.dirty = true,
       // Addressed to attach sessions, never to a screen's observer.
-      ScreenNotify::Bell | ScreenNotify::Switch { .. } => (),
+      ScreenNotify::Bell
+      | ScreenNotify::Switch { .. }
+      | ScreenNotify::Detached => (),
       ScreenNotify::CopyPresent { screen, handle } => {
         if let Some(task) = self.state.tasks.task_mut(screen) {
           task.present = handle;

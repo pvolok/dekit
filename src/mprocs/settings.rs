@@ -28,7 +28,7 @@ pub struct Settings {
 impl Default for Settings {
   fn default() -> Self {
     Self {
-      keymap: KeymapConfig::default(),
+      keymap: KeymapConfig::classic(),
       hide_keymap_window: false,
       mouse_scroll_speed: 5,
       scrollback_len: 1000,
@@ -92,7 +92,7 @@ impl Settings {
     let obj = val.as_object()?;
 
     fn add_keys(
-      into: &mut IndexMap<crate::term::key::Key, Action>,
+      into: &mut IndexMap<crate::config::keymap::KeySeq, Action>,
       val: Option<&Val>,
     ) -> Result<()> {
       if let Some(keymap) = val {
@@ -106,8 +106,8 @@ impl Settings {
 
         for (key, event) in keymap {
           let key =
-            crate::term::key::KeySpec::parse(value_to_string(&key)?.as_str())?
-              .key();
+            crate::term::key::Key::parse(value_to_string(&key)?.as_str())?
+              .into();
           if event.raw().is_null() {
             into.shift_remove(&key);
           } else {

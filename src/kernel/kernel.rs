@@ -2786,6 +2786,9 @@ pub struct Kernel {
   replay: VecDeque<KernelMessage>,
   /// Set by a runner: a quit first freezes and saves the graph.
   save: Option<SaveFn>,
+  /// True from the first quit on, before any task stops: a runner takes
+  /// no new clients from then (`quitting`).
+  quit_begun: tokio::sync::watch::Sender<bool>,
 }
 
 /// How long a quit waits for every task to freeze before giving up on
@@ -2854,7 +2857,13 @@ impl Kernel {
       receiver,
       replay: VecDeque::new(),
       save: None,
+      quit_begun: tokio::sync::watch::Sender::new(false),
     }
+  }
+
+  /// Becomes true when a quit begins, saving first or not.
+  pub fn quitting(&self) -> tokio::sync::watch::Receiver<bool> {
+    self.quit_begun.subscribe()
   }
 
   pub fn context(&self) -> TaskContext {
@@ -3062,6 +3071,7 @@ impl Kernel {
     save: bool,
     reply: Option<tokio::sync::oneshot::Sender<Duration>>,
   ) -> bool {
+    self.quit_begun.send_replace(true);
     if save && self.save.is_some() && !self.graph.quitting {
       if let Some(reply) = reply {
         let _ = reply.send(SAVE_TIMEOUT + self.graph.stop_within());
@@ -3094,6 +3104,17 @@ impl Kernel {
   }
 
   fn dispatch_now(&mut self, msg: KernelMessage) -> bool {
+    if let KernelCommand::Quit
+    | KernelCommand::QuitWithoutSave
+    | KernelCommand::QuitWithin { .. } = &msg.command
+    {
+      // What stopped a runner is otherwise nowhere to be found.
+      let by = match msg.from {
+        INIT_TASK_ID => "a client or hook".to_string(),
+        from => self.graph.name(from),
+      };
+      log::info!("Quit asked by {by}");
+    }
     match msg.command {
       KernelCommand::Quit => {
         if self.quit(true, None) {

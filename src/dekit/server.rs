@@ -75,6 +75,8 @@ pub struct ServerCtx {
   pub connections: Connections,
   /// None when serving in-process (tests): no upgrade possible.
   pub runner: Option<RunnerHandle>,
+  /// The kernel's `quitting`: true once the runner is on its way down.
+  pub quitting: tokio::sync::watch::Receiver<bool>,
 }
 
 impl ServerCtx {
@@ -85,6 +87,7 @@ impl ServerCtx {
       project: Project::new(config),
       connections: Connections::default(),
       runner: None,
+      quitting: tokio::sync::watch::channel(false).1,
     })
   }
 }
@@ -321,6 +324,7 @@ async fn run_locked(
     anyhow::bail!("Failed to register console task: {err}")
   }
   let console = pc.get_task_sender(console_id);
+  let quitting = kernel.quitting();
   let kernel_handle = tokio::spawn(kernel.run());
 
   // Watch before any task exists so the first start→exit fires the hook.
@@ -366,6 +370,7 @@ async fn run_locked(
     project,
     connections: Connections::default(),
     runner: Some(runner_handle(runner, lock_guard, &server_socket, log_level)),
+    quitting,
   });
   serve(ctx, server_socket, kernel_handle, Vec::new()).await
 }
@@ -509,6 +514,7 @@ pub async fn serve(
   kernel_handle: tokio::task::JoinHandle<()>,
   carried: Vec<BoxFuture<'static, ()>>,
 ) -> anyhow::Result<()> {
+  let mut quitting = ctx.quitting.clone();
   let (accept_tx, mut accept_rx) = unbounded_channel();
   if let Ok(mut accept) = ctx.connections.accept.lock() {
     *accept = Some(accept_tx);
@@ -517,8 +523,23 @@ pub async fn serve(
   tokio::spawn(async move {
     log::debug!("Waiting for clients...");
     let mut paused = false;
+    // Off for a kernel that can no longer say: one that has ended, or
+    // none (in-process serving).
+    let mut watching = true;
     loop {
       tokio::select! {
+        // A client that came now would be dropped as the runner stops.
+        // Refused instead, it waits for the runner to go and starts the
+        // next one.
+        quit = quitting.wait_for(|quitting| *quitting), if watching => {
+          match quit {
+            Ok(_) => {
+              log::debug!("Quitting: no more clients.");
+              break;
+            }
+            Err(_) => watching = false,
+          }
+        }
         accepted = server_socket.accept(), if !paused => match accepted {
           Ok(accepted) => {
             // Registered before its task runs, so a freeze from here on
@@ -1706,6 +1727,47 @@ mod tests {
       .await
       .unwrap()
       .unwrap();
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn a_quitting_runner_takes_no_new_clients() {
+    let dir =
+      std::env::temp_dir().join(format!("dk-quit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.sock");
+    let socket = bind_server_socket(&path).await.unwrap();
+    let kernel = Kernel::new();
+    let pc = kernel.context();
+    let ctx = Arc::new(ServerCtx {
+      quitting: kernel.quitting(),
+      ..Arc::into_inner(ServerCtx::local(
+        pc.clone(),
+        Arc::new(Config::make_default()),
+      ))
+      .unwrap()
+    });
+    let kernel_handle = tokio::spawn(kernel.run());
+    let server =
+      tokio::spawn(serve(ctx.clone(), socket, kernel_handle, Vec::new()));
+    let path = path.to_str().unwrap();
+    let (mut sender, mut receiver) =
+      crate::runner::socket::connect_socket(path).await.unwrap();
+    client_handshake(&mut sender, &mut receiver).await.unwrap();
+
+    pc.send(KernelCommand::Quit);
+    // Its end fails in tests, which have no process waiter to drop.
+    let _ = timeout(Duration::from_secs(2), server).await.unwrap();
+    // Refused: a client waits for the runner to go and starts the next,
+    // where an accepted one would be dropped without a word.
+    let connected = timeout(
+      Duration::from_secs(2),
+      crate::runner::socket::connect_socket(path),
+    )
+    .await
+    .unwrap();
+    assert!(connected.is_err());
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   #[cfg(unix)]

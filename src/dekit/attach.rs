@@ -210,7 +210,12 @@ async fn run_attached(
         ..Bye::new(codes::TASK_EXITED, "")
       }
     }
-    SessionEnd::Closed => Bye::new(codes::QUIT, ""),
+    SessionEnd::Detached => Bye::new(codes::QUIT, ""),
+    // Said, so the client does not leave as if it had detached.
+    SessionEnd::Closed => match *ctx.quitting.borrow() {
+      true => Bye::new(codes::QUIT, "the runner stopped"),
+      false => Bye::new(codes::QUIT, "the screen closed"),
+    },
     SessionEnd::Switch { kind, root } => Bye {
       switch: Some(ByeSwitch { kind, root }),
       ..Bye::new(codes::QUIT, "")
@@ -286,7 +291,10 @@ fn exit_state(tasks: &[WaitTask]) -> Option<RpcState> {
 }
 
 enum SessionEnd {
-  /// The client went away or closed the session.
+  /// The client detached: the console's `detach`.
+  Detached,
+  /// Anything else: the client went away, or the screen or the runner
+  /// did.
   Closed,
   /// `until_exit`: the attached task's execution finished, with the
   /// state its wait for the exit saw it end in.
@@ -412,6 +420,7 @@ async fn session(
             ScreenNotify::Switch { kind, root } => {
               return SessionEnd::Switch { kind, root };
             }
+            ScreenNotify::Detached => return SessionEnd::Detached,
           }
         }
         match &reveal {
@@ -968,7 +977,7 @@ mod tests {
     use crate::console::keymap::KeymapGroup;
     let mut config = Config::make_default();
     config.keymap.group_mut(KeymapGroup::Tasks).insert(
-      Key::new(KeyCode::F(5), KeyMods::NONE),
+      Key::new(KeyCode::F(5), KeyMods::NONE).into(),
       crate::console::action::Action::SwitchRunner {
         kind: "project".to_string(),
         root: "/home/me/other".to_string(),

@@ -8,6 +8,7 @@ use crate::console::{
 };
 use crate::kernel::{task::TaskId, task_path::TaskPath};
 use crate::term::grid::Rect;
+use crate::term::key::Key;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Scope {
@@ -46,6 +47,8 @@ pub struct State {
   pub scope: Scope,
   pub tasks: TaskTree,
   pub hide_keymap_window: bool,
+  /// The keys typed of a binding that takes more.
+  pub pending_keys: Vec<Key>,
   pub quitting: bool,
   /// The clickable parts of the header as last drawn.
   pub header: HeaderHits,

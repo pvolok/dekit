@@ -2,7 +2,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::console::action::{Action, RunnerTab};
 use crate::console::{
-  keymap::{Keymap, KeymapGroup},
+  keymap::{Keymap, KeymapGroup, keys_label},
   state::State,
   theme::Theme,
 };
@@ -21,8 +21,28 @@ pub fn render_keymap(
 
   let style = theme.block.panel(false);
   let mut line = style.draw(grid, area).title(" Help ", style.title).inner();
+  let mut hint = |key: String, desc: String| {
+    for (text, attrs) in [
+      (" <".to_string(), style.dim),
+      (key, style.key),
+      (": ".to_string(), style.dim),
+      (desc, style.text),
+      ("> ".to_string(), style.dim),
+    ] {
+      grid.draw_text(line.take_left(text.width() as u16), &text, attrs);
+    }
+  };
 
   let group = state.keymap_group();
+  let pending = &state.pending_keys;
+  if !pending.is_empty() {
+    // Half of a binding is typed: the keys that can follow.
+    for (key, action) in keymap.next_keys(group, pending) {
+      let desc = action.map_or_else(|| "...".to_string(), Action::desc);
+      hint(key.to_string(), desc);
+    }
+    return;
+  }
   let items: &[Action] = match group {
     KeymapGroup::Tasks => &[
       Action::ToggleFocus,
@@ -39,7 +59,7 @@ pub fn render_keymap(
       },
       Action::ToggleKeymapWindow,
     ],
-    KeymapGroup::Term => &[Action::ToggleFocus],
+    KeymapGroup::Term | KeymapGroup::Global => &[Action::ToggleFocus],
     KeymapGroup::Copy => &[
       Action::CopyModeEnd,
       Action::CopyModeCopy,
@@ -48,17 +68,12 @@ pub fn render_keymap(
   };
 
   for action in items {
-    let Some(key) = keymap.key(group, action) else {
-      continue;
-    };
-    for (text, attrs) in [
-      (" <".to_string(), style.dim),
-      (key.to_string(), style.key),
-      (": ".to_string(), style.dim),
-      (action.desc(), style.text),
-      ("> ".to_string(), style.dim),
-    ] {
-      grid.draw_text(line.take_left(text.width() as u16), &text, attrs);
+    if let Some(keys) = keymap.keys(group, action) {
+      hint(keys_label(keys), action.desc());
     }
+  }
+  // And the keys that more keys follow, the leader for one.
+  for key in keymap.prefix_keys(group) {
+    hint(key.to_string(), "...".to_string());
   }
 }

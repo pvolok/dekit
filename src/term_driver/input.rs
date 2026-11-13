@@ -380,13 +380,23 @@ fn decode_csi_u(p: &Params) -> Option<Key> {
 
   // With "report alternate keys" a shifted key carries the character
   // Shift makes of it: that is the key as users and keymaps know it
-  // (`<A>`, not `<S-a>`), with the unshifted key kept as its base.
+  // (`<A>`, not `<S-a>`), with the unshifted key kept as its base. The
+  // alternate comes only with Shift held, so it counts even when the
+  // modifiers leave Shift out, as WezTerm's do on macOS.
   let mut unshifted = None;
-  if mods.contains(KeyMods::SHIFT)
-    && let KeyCode::Char(plain) = keycode
+  if let KeyCode::Char(plain) = keycode
     && let Some(shifted) = shifted_code.and_then(char::from_u32)
   {
     keycode = KeyCode::Char(shifted);
+    mods.set(KeyMods::SHIFT, false);
+    unshifted = Some(plain);
+  } else if mods.contains(KeyMods::SHIFT)
+    && let KeyCode::Char(plain) = keycode
+    && plain.is_ascii_lowercase()
+  {
+    // No alternate reported: a Latin letter's capital is the same on
+    // every layout.
+    keycode = KeyCode::Char(plain.to_ascii_uppercase());
     mods.set(KeyMods::SHIFT, false);
     unshifted = Some(plain);
   }
@@ -554,6 +564,18 @@ mod tests {
     let shifted = keys_of(&[b"\x1b[97:65;2u"]);
     assert_eq!(shifted[0].plain(), key("<A>"));
     assert_eq!(shifted[0].unshifted, Some('a'));
+    // WezTerm on macOS: the alternate, but no Shift in the modifiers.
+    for seq in [&b"\x1b[106:74;1u"[..], b"\x1b[106:74u", b"\x1b[47:63;1u"] {
+      let shifted = keys_of(&[seq]);
+      assert_ne!(shifted[0].plain().code, KeyCode::Char('j'));
+      assert_ne!(shifted[0].plain().code, KeyCode::Char('/'));
+      assert_eq!(shifted[0].plain().mods, KeyMods::NONE);
+    }
+    assert_eq!(keys_of(&[b"\x1b[106:74;1u"])[0].plain(), key("<J>"));
+    assert_eq!(keys_of(&[b"\x1b[47:63;1u"])[0].plain(), key("<?>"));
+    // No alternate at all: Shift and a letter are its capital.
+    assert_eq!(keys_of(&[b"\x1b[106;2u"])[0].plain(), key("<J>"));
+    assert_eq!(keys_of(&[b"\x1b[106;6u"])[0].plain(), key("<C-J>"));
     // A layout key with its base, and associated text.
     let layout = keys_of(&[b"\x1b[1092::97;5;1092u"]);
     assert_eq!(layout[0].code, KeyCode::Char('\u{444}'));

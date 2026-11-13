@@ -50,7 +50,7 @@ impl From<crate::mprocs::config::Config> for Config {
         zoom_tip: true,
         theme: ThemeMode::Auto,
       },
-      keymap: KeymapConfig::default(),
+      keymap: KeymapConfig::classic(),
       on_init: legacy.on_init.map(Hook::LegacyAction),
       on_idle: legacy.on_all_finished.map(Hook::LegacyAction),
       system_shell: true,

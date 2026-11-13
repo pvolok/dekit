@@ -4,7 +4,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::config::Config;
 use crate::console::action::Action;
-use crate::console::keymap::{Keymap, KeymapGroup};
+use crate::console::keymap::{Keymap, KeymapGroup, keys_label};
 use crate::console::state::{Scope, State};
 use crate::console::task_tree::{Group, Node};
 use crate::console::task_view::TaskView;
@@ -178,9 +178,9 @@ pub fn render_tasks(
     let mut hint = inner.inner((1, PAD));
     let dim = style.dim;
     grid.draw_text(hint.take_top(1), "No tasks yet.", dim);
-    match keymap.key(KeymapGroup::Tasks, &Action::ShowAddTask) {
-      Some(key) => {
-        let line = format!("Press {key} to add one,");
+    match keymap.keys(KeymapGroup::Tasks, &Action::ShowAddTask) {
+      Some(keys) => {
+        let line = format!("Press {} to add one,", keys_label(keys));
         grid.draw_text(hint.take_top(1), &line, dim);
         grid.draw_text(hint.take_top(1), "or right-click here.", dim);
       }

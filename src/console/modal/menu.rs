@@ -1,7 +1,11 @@
 use unicode_width::UnicodeWidthStr;
 
 use crate::console::action::Action;
-use crate::console::{keymap::Keymap, theme::Theme, widgets::list::paint_row};
+use crate::console::{
+  keymap::{Keymap, KeymapGroup, keys_label},
+  theme::Theme,
+  widgets::list::paint_row,
+};
 use crate::term::{
   Grid,
   grid::Rect,
@@ -29,8 +33,8 @@ pub struct MenuModal {
 pub struct MenuItem {
   pub label: String,
   pub action: Action,
-  /// Picks it while the menu is open; shown at the right.
-  pub key: Option<Key>,
+  /// Shown at the right; a single key picks it while the menu is open.
+  pub keys: Vec<Key>,
   /// Dimmed and passed over.
   pub enabled: bool,
   /// A line above it.
@@ -46,9 +50,10 @@ impl MenuItem {
   ) -> Self {
     MenuItem {
       label: label.into(),
-      key: keymap
-        .key(crate::console::keymap::KeymapGroup::Tasks, &action)
-        .cloned(),
+      keys: keymap
+        .keys(KeymapGroup::Tasks, &action)
+        .unwrap_or_default()
+        .to_vec(),
       action,
       enabled: true,
       separated: false,
@@ -117,7 +122,7 @@ impl MenuModal {
   }
 
   fn key_text(item: &MenuItem) -> Option<String> {
-    item.key.as_ref().map(|key| key.to_string())
+    (!item.keys.is_empty()).then(|| keys_label(&item.keys))
   }
 
   /// Rows the items take, separators included.
@@ -143,11 +148,9 @@ impl Modal for MenuModal {
       | (KeyCode::Char('n'), KeyMods::CONTROL) => self.step(1),
       _ => {
         let plain = key.plain();
-        if let Some(index) = self
-          .items
-          .iter()
-          .position(|item| item.enabled && item.key.as_ref() == Some(&plain))
-        {
+        if let Some(index) = self.items.iter().position(|item| {
+          item.enabled && item.keys == std::slice::from_ref(&plain)
+        }) {
           return self.pick(index);
         }
       }
@@ -269,7 +272,7 @@ mod tests {
 
   fn menu() -> MenuModal {
     let item = |label, action| MenuItem {
-      key: None,
+      keys: Vec::new(),
       ..MenuItem::new(label, action, &Keymap::new())
     };
     MenuModal::new(
@@ -284,7 +287,7 @@ mod tests {
           },
         ),
         MenuItem {
-          key: Some(KeyCode::Char('q').into()),
+          keys: vec![KeyCode::Char('q').into()],
           ..item("Quit", Action::ShowQuit)
         }
         .separated(),

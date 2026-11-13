@@ -132,6 +132,9 @@ pub enum Action {
     #[serde(with = "key_spec")]
     key: Key,
   },
+  /// Send the key that ran it to the task: the leader, as the end of
+  /// the binding that types it.
+  SendLeader,
 }
 
 impl Action {
@@ -218,6 +221,7 @@ impl Action {
       Action::ToggleKeymapWindow => "Toggle help".to_string(),
       Action::ToggleTheme => "Toggle dark/light theme".to_string(),
       Action::SendKey { key } => format!("Send {} key", key.spec()),
+      Action::SendLeader => "Send the leader key".to_string(),
     }
   }
 }

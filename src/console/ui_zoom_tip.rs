@@ -1,7 +1,7 @@
 use unicode_width::UnicodeWidthStr;
 
 use crate::console::action::Action;
-use crate::console::keymap::{Keymap, KeymapGroup};
+use crate::console::keymap::{Keymap, KeymapGroup, keys_label};
 use crate::console::theme::Theme;
 use crate::term::{Grid, grid::Rect, style::Style};
 
@@ -15,20 +15,20 @@ pub fn render_zoom_tip(
     return;
   }
 
-  let key = [Action::FocusTerm, Action::ToggleFocus, Action::FocusTasks]
+  let keys = [Action::ToggleFocus, Action::FocusTerm, Action::FocusTasks]
     .iter()
-    .find_map(|action| keymap.key(KeymapGroup::Term, action));
+    .find_map(|action| keymap.keys(KeymapGroup::Term, action));
 
   let bg = theme.block.selected_bg.into();
   let text = Style::default().bg(bg).fg(theme.block.text.into());
   grid.fill_area(area, ' ', text);
   let mut line = area;
-  match key {
-    Some(key) => {
+  match keys {
+    Some(keys) => {
       let prompt = " To exit zoom mode press ";
       grid.draw_text(line.take_left(prompt.width() as u16), prompt, text);
       let key_attrs = Style::default().bg(bg).fg(theme.block.key.into());
-      grid.draw_text(line, &key.spec().to_string(), key_attrs);
+      grid.draw_text(line, &keys_label(keys), key_attrs);
     }
     None => {
       grid.draw_text(line, " No key bound to exit the zoom mode", text);
