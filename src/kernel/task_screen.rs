@@ -17,7 +17,6 @@ use crate::{
     copy_mode::{CopyMove, CopyState, Pos},
     task::TaskId,
   },
-  protocol::caps::Background,
   task::logger::LogMsg,
   term::{
     Color, Frame, Geometry, MouseProtocolMode, Screen, ScreenHandle, Size,
@@ -110,9 +109,6 @@ struct Observer {
   /// The size this observer shows, and its cell size when it said.
   geometry: Geometry,
   sink: UnboundedSender<ScreenNotify>,
-  /// The dekit version of the client behind this observer, when it is
-  /// an attach session rather than another screen.
-  client_version: Option<String>,
 }
 
 pub enum TaskScreenCmd {
@@ -120,11 +116,6 @@ pub enum TaskScreenCmd {
     observer: ObserverId,
     geometry: Geometry,
     sink: UnboundedSender<ScreenNotify>,
-    /// The attaching client's dekit version; `None` for an in-process
-    /// observer like the console.
-    client_version: Option<String>,
-    /// The attaching client's terminal background, when it knows it.
-    background: Option<Background>,
   },
   Detach {
     observer: ObserverId,
@@ -164,23 +155,14 @@ pub enum ScreenNotify {
   /// The attach took effect; paint the screen.
   Attached,
   /// The screen changed; paint it.
-  Render {
-    screen: TaskId,
-  },
+  Render,
   Bell,
   /// Copy mode began (`Some`, draw this surface instead) or ended.
   CopyPresent {
-    screen: TaskId,
     handle: Option<ScreenHandle>,
   },
   Yank {
     text: String,
-  },
-  /// Sent to one attach session: its client should leave this runner
-  /// and attach to the console of the named one.
-  Switch {
-    kind: String,
-    root: String,
   },
   /// Sent to an observer as it is detached: its session ends at its own
   /// asking, not because the screen or the runner went away.
@@ -243,10 +225,6 @@ impl TaskScreen {
     &mut self.screen
   }
 
-  pub fn size(&self) -> Size {
-    self.screen.size()
-  }
-
   /// The pty size: cells, and pixels from the cell size an observer
   /// reported (0 while none has).
   pub fn winsize(&self) -> Winsize {
@@ -283,7 +261,7 @@ impl TaskScreen {
   /// Publishes the screen and tells observers to paint it.
   fn render(&mut self) {
     self.publish();
-    self.broadcast(|screen| ScreenNotify::Render { screen });
+    self.broadcast(|| ScreenNotify::Render);
   }
 
   /// When the view should scroll again for a drag resting on the top or
@@ -315,10 +293,6 @@ impl TaskScreen {
     }
   }
 
-  pub fn has_observers(&self) -> bool {
-    !self.observers.is_empty()
-  }
-
   /// The smallest cell size an observer reported, if any did.
   pub fn reported_cell_pixels(&self) -> Option<(u16, u16)> {
     self
@@ -328,30 +302,9 @@ impl TaskScreen {
       .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
   }
 
-  /// The dekit versions of the attached clients, one per attach session.
-  pub fn client_versions(&self) -> impl Iterator<Item = &str> {
-    self
-      .observers
-      .iter()
-      .filter_map(|o| o.client_version.as_deref())
-  }
-
-  /// Sends a notification to one observer. A closed sink is noticed the
-  /// way a failed broadcast is.
-  pub fn notify(&mut self, observer: ObserverId, notify: ScreenNotify) {
-    if let Some(obs) = self.observers.iter().find(|o| o.id == observer)
-      && obs.sink.send(notify).is_err()
-    {
-      self.lost_observers = true;
-    }
-  }
-
-  fn broadcast(&mut self, mut make: impl FnMut(TaskId) -> ScreenNotify) {
-    let task_id = self.task_id;
+  fn broadcast(&mut self, mut make: impl FnMut() -> ScreenNotify) {
     let before = self.observers.len();
-    self
-      .observers
-      .retain(|obs| obs.sink.send(make(task_id)).is_ok());
+    self.observers.retain(|obs| obs.sink.send(make()).is_ok());
     if self.observers.len() != before {
       self.lost_observers = true;
     }
@@ -362,19 +315,6 @@ impl TaskScreen {
     if std::mem::take(&mut self.lost_observers) {
       self.apply_size(effects);
     }
-  }
-
-  /// The task drew into the screen itself (a UI rather than process
-  /// output).
-  pub fn rendered(&mut self, effects: &mut Vec<TaskScreenEffect>) {
-    self.render();
-    self.settle(effects);
-  }
-
-  /// Text copied on this task's behalf (e.g. by a screen it shows).
-  pub fn yank(&mut self, text: String, effects: &mut Vec<TaskScreenEffect>) {
-    self.broadcast(|_| ScreenNotify::Yank { text: text.clone() });
-    self.settle(effects);
   }
 
   /// Moves the lines the screen logged so far to `out`.
@@ -391,12 +331,12 @@ impl TaskScreen {
     self.screen.take_events(&mut self.events_buf);
     for event in std::mem::take(&mut self.events_buf) {
       match event {
-        VtEvent::Bell => self.broadcast(|_| ScreenNotify::Bell),
+        VtEvent::Bell => self.broadcast(|| ScreenNotify::Bell),
         VtEvent::Reply(bytes) => effects.push(TaskScreenEffect::Write(bytes)),
         // The program put text on the clipboard: the attached clients
         // own the user's clipboard.
         VtEvent::SetClipboard(text) => {
-          self.broadcast(|_| ScreenNotify::Yank { text: text.clone() });
+          self.broadcast(|| ScreenNotify::Yank { text: text.clone() });
         }
         VtEvent::Notify { title, body } => {
           log::debug!(
@@ -434,8 +374,6 @@ impl TaskScreen {
         observer,
         geometry,
         sink,
-        client_version,
-        background: _,
       } => {
         // Re-attaching replaces the previous registration.
         self.observers.retain(|o| o.id != observer);
@@ -443,7 +381,6 @@ impl TaskScreen {
           id: observer,
           geometry,
           sink,
-          client_version,
         });
         // Size first so Attached/CopyPresent paint the applied geometry.
         let resized = self.sync_size(effects);
@@ -454,7 +391,6 @@ impl TaskScreen {
           let _ = obs.sink.send(ScreenNotify::Attached);
           if let Some(session) = &self.copy {
             let _ = obs.sink.send(ScreenNotify::CopyPresent {
-              screen: self.task_id,
               handle: Some(session.present_handle.clone()),
             });
           }
@@ -507,8 +443,7 @@ impl TaskScreen {
       TaskScreenCmd::CopyEnter => {
         if let Some(present) = self.enter_copy() {
           self.render_present();
-          self.broadcast(|screen| ScreenNotify::CopyPresent {
-            screen,
+          self.broadcast(|| ScreenNotify::CopyPresent {
             handle: Some(present.clone()),
           });
         }
@@ -559,7 +494,7 @@ impl TaskScreen {
   fn copy_yank(&mut self) {
     let text = self.copy.as_ref().and_then(|s| s.state.selected_text());
     if let Some(text) = text {
-      self.broadcast(|_| ScreenNotify::Yank { text: text.clone() });
+      self.broadcast(|| ScreenNotify::Yank { text: text.clone() });
     }
     self.leave_copy();
   }
@@ -590,10 +525,7 @@ impl TaskScreen {
   fn leave_copy(&mut self) {
     self.drag_scroll_at = None;
     if self.copy.take().is_some() {
-      self.broadcast(|screen| ScreenNotify::CopyPresent {
-        screen,
-        handle: None,
-      });
+      self.broadcast(|| ScreenNotify::CopyPresent { handle: None });
     }
   }
 
@@ -700,11 +632,10 @@ impl TaskScreen {
         self.sync_drag_extent();
         self.render_present();
         match entered {
-          Some(present) => self.broadcast(|screen| ScreenNotify::CopyPresent {
-            screen,
+          Some(present) => self.broadcast(|| ScreenNotify::CopyPresent {
             handle: Some(present.clone()),
           }),
-          None => self.broadcast(|screen| ScreenNotify::Render { screen }),
+          None => self.broadcast(|| ScreenNotify::Render),
         }
       }
       MouseEventKind::Up(_) => {
@@ -763,7 +694,7 @@ impl TaskScreen {
   /// Repaints copy mode for its observers.
   fn repaint_copy(&mut self) {
     self.render_present();
-    self.broadcast(|screen| ScreenNotify::Render { screen });
+    self.broadcast(|| ScreenNotify::Render);
   }
 
   /// Publishes what observers draw in copy mode: the frozen screen at
@@ -845,6 +776,7 @@ impl TaskScreen {
       title: Arc::from(""),
       images: images.table(),
       placements,
+      mouse: Default::default(),
     });
   }
 
@@ -1007,8 +939,6 @@ mod tests {
         observer,
         geometry,
         sink,
-        client_version: None,
-        background: None,
       },
       &mut effects,
     );
@@ -1022,11 +952,10 @@ mod tests {
     loop {
       match rx.try_recv() {
         Ok(ScreenNotify::Attached) => out.push("attached"),
-        Ok(ScreenNotify::Render { .. }) => out.push("render"),
+        Ok(ScreenNotify::Render) => out.push("render"),
         Ok(ScreenNotify::Bell) => out.push("bell"),
         Ok(ScreenNotify::CopyPresent { .. }) => out.push("copy"),
         Ok(ScreenNotify::Yank { .. }) => out.push("yank"),
-        Ok(ScreenNotify::Switch { .. }) => out.push("switch"),
         Ok(ScreenNotify::Detached) => out.push("detached"),
         Err(_) => break,
       }

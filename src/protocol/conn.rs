@@ -219,7 +219,20 @@ pub async fn client_handshake(
   sender: &mut ConnSender,
   receiver: &mut ConnReceiver,
 ) -> anyhow::Result<Hello> {
-  sender.send_ctl(CtlMsg::Hello(local_hello())).await?;
+  client_handshake_with(sender, receiver, Vec::new()).await
+}
+
+/// `client_handshake` from a client that does `features`.
+pub async fn client_handshake_with(
+  sender: &mut ConnSender,
+  receiver: &mut ConnReceiver,
+  features: Vec<String>,
+) -> anyhow::Result<Hello> {
+  let hello = Hello {
+    features,
+    ..local_hello()
+  };
+  sender.send_ctl(CtlMsg::Hello(hello)).await?;
   match receiver.recv_ctl().await? {
     CtlMsg::Hello(hello) => {
       if hello.protocol != PROTOCOL_VERSION {
@@ -255,6 +268,8 @@ pub fn server_hello(client: &Hello) -> Result<Hello, Bye> {
       crate::protocol::ctl::FEATURE_ATCH2.to_string(),
       crate::protocol::rpc::FEATURE_WAIT.to_string(),
       crate::protocol::rpc::FEATURE_LOGS.to_string(),
+      crate::protocol::rpc::FEATURE_WATCH.to_string(),
+      crate::protocol::rpc::FEATURE_RELOAD_PLAN.to_string(),
     ],
     ..local_hello()
   })

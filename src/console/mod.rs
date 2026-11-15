@@ -1,8 +1,11 @@
 pub mod action;
 pub mod app;
 pub mod app_layout;
+pub mod host;
 pub mod keymap;
+pub mod link;
 pub mod modal;
+pub mod pane;
 pub mod state;
 pub mod task_tree;
 pub mod task_view;

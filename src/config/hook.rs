@@ -4,7 +4,10 @@ use crate::cfg::CfgObj;
 use crate::command::{Command, issue};
 use crate::config::config::Config;
 use crate::console::action::Action;
-use crate::kernel::kernel_message::{TaskContext, TaskSelector, TaskSender};
+use crate::kernel::kernel_message::{TaskContext, TaskSelector};
+
+/// Where a legacy hook's action goes: the console mprocs runs.
+pub type Actions = tokio::sync::mpsc::UnboundedSender<Action>;
 
 #[derive(Clone)]
 pub enum Hook {
@@ -13,10 +16,21 @@ pub enum Hook {
 }
 
 impl Hook {
-  pub fn run(&self, pc: &TaskContext, config: &Config, console: &TaskSender) {
+  /// A legacy action goes to `console`; with none, it is dropped.
+  pub fn run(
+    &self,
+    pc: &TaskContext,
+    config: &Config,
+    console: Option<&Actions>,
+  ) {
     match self {
       Hook::Command(command) => issue(pc, config, command.clone()),
-      Hook::LegacyAction(action) => console.send(action.clone()),
+      Hook::LegacyAction(action) => match console {
+        Some(console) => {
+          let _ = console.send(action.clone());
+        }
+        None => log::warn!("no console for the hook's action {action:?}"),
+      },
     }
   }
 }
@@ -27,7 +41,7 @@ pub fn watch_idle(
   config: &Config,
   selector: TaskSelector,
   hook: Hook,
-  console: TaskSender,
+  console: Option<Actions>,
 ) {
   let mut watch = pc.watch_set(vec![selector]);
   let pc = pc.clone();
@@ -37,7 +51,7 @@ pub fn watch_idle(
     while let Some(set) = watch.recv().await {
       let was = std::mem::replace(&mut active, set.iter().any(|t| t.active));
       if was && !active {
-        hook.run(&pc, &config, &console);
+        hook.run(&pc, &config, console.as_ref());
       }
     }
   });

@@ -59,22 +59,6 @@ impl SubTrie {
       .insert((path.clone(), mode));
   }
 
-  pub fn unsubscribe(
-    &mut self,
-    subscriber: TaskId,
-    path: &TaskPath,
-    mode: SubMode,
-  ) {
-    let components: Vec<&str> = path.components().collect();
-    Self::remove_one(&mut self.root, &components, subscriber, mode);
-    if let Some(set) = self.by_subscriber.get_mut(&subscriber) {
-      set.remove(&(path.clone(), mode));
-      if set.is_empty() {
-        self.by_subscriber.remove(&subscriber);
-      }
-    }
-  }
-
   /// Drop every subscription held by `subscriber`.
   pub fn remove_subscriber(&mut self, subscriber: TaskId) {
     let Some(subs) = self.by_subscriber.remove(&subscriber) else {
@@ -105,25 +89,6 @@ impl SubTrie {
     if reached {
       out.extend(node.exact.iter().copied());
     }
-  }
-
-  pub fn is_subscribed(&self, subscriber: TaskId, path: &TaskPath) -> bool {
-    let mut node = &self.root;
-    if node.subtree.contains(&subscriber) {
-      return true;
-    }
-    for component in path.components() {
-      match node.children.get(component) {
-        Some(child) => {
-          node = child;
-          if node.subtree.contains(&subscriber) {
-            return true;
-          }
-        }
-        None => return false,
-      }
-    }
-    node.exact.contains(&subscriber)
   }
 
   fn remove_one(
@@ -211,25 +176,6 @@ mod tests {
   }
 
   #[test]
-  fn unsubscribe_removes_match() {
-    let mut trie = SubTrie::new();
-    trie.subscribe(TaskId(1), &path("a"), SubMode::Subtree);
-    trie.unsubscribe(TaskId(1), &path("a"), SubMode::Subtree);
-    assert!(collect(&trie, "a/b").is_empty());
-  }
-
-  #[test]
-  fn unsubscribe_only_removes_named_mode() {
-    let mut trie = SubTrie::new();
-    trie.subscribe(TaskId(1), &path("a"), SubMode::Subtree);
-    trie.subscribe(TaskId(1), &path("a"), SubMode::Exact);
-    trie.unsubscribe(TaskId(1), &path("a"), SubMode::Exact);
-
-    assert_eq!(collect(&trie, "a"), HashSet::from([TaskId(1)]));
-    assert_eq!(collect(&trie, "a/b"), HashSet::from([TaskId(1)]));
-  }
-
-  #[test]
   fn remove_subscriber_purges_all() {
     let mut trie = SubTrie::new();
     trie.subscribe(TaskId(1), &path("a"), SubMode::Subtree);
@@ -240,21 +186,6 @@ mod tests {
 
     assert_eq!(collect(&trie, "a"), HashSet::from([TaskId(2)]));
     assert!(collect(&trie, "b/c").is_empty());
-  }
-
-  #[test]
-  fn is_subscribed_follows_collect() {
-    let mut trie = SubTrie::new();
-    trie.subscribe(TaskId(1), &path("a"), SubMode::Subtree);
-    trie.subscribe(TaskId(2), &path("a/b"), SubMode::Exact);
-
-    assert!(trie.is_subscribed(TaskId(1), &path("a")));
-    assert!(trie.is_subscribed(TaskId(1), &path("a/b/c")));
-    assert!(!trie.is_subscribed(TaskId(1), &path("b")));
-    assert!(trie.is_subscribed(TaskId(2), &path("a/b")));
-    assert!(!trie.is_subscribed(TaskId(2), &path("a")));
-    assert!(!trie.is_subscribed(TaskId(2), &path("a/b/c")));
-    assert!(!trie.is_subscribed(TaskId(3), &path("a")));
   }
 
   #[test]

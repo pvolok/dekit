@@ -1,5 +1,5 @@
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::HashMap,
   path::PathBuf,
   sync::{
     Arc, Mutex,
@@ -24,21 +24,20 @@ use crate::{
     config::Config,
     hook::{Hook, watch_idle},
   },
-  console::app::console_task_registration,
   dekit::{
     attach::{Attachment, attach_session},
     logs::{LogsParams, logs, logs_session},
     wait::{WaitParams, wait_session},
+    watch::watch_session,
+    write_back::write_back,
   },
   kernel::{
     kernel::{Kernel, SaveFn},
     kernel_message::{
       KernelCommand, KernelSnapshot, MoveError, RegisterError, ScreenHandle,
-      TaskContext, TaskExplain, TaskInfo, TaskSelector,
+      TaskContext, TaskDescription, TaskExplain, TaskInfo, TaskSelector,
     },
-    task::{StateReason, TaskDef, TaskKind, TaskState},
-    task_key::TaskSpaceId,
-    task_path::TaskPath,
+    task::{StateReason, TaskKind, TaskState},
   },
   protocol::{
     ActResult, ConnReceiver, ConnSender, CtlMsg, QuitResult, RpcError,
@@ -77,6 +76,8 @@ pub struct ServerCtx {
   pub runner: Option<RunnerHandle>,
   /// The kernel's `quitting`: true once the runner is on its way down.
   pub quitting: tokio::sync::watch::Receiver<bool>,
+  /// The write-backs prompted for, to check once an agent wrote them.
+  pub prompts: crate::dekit::write_back::Prompts,
 }
 
 impl ServerCtx {
@@ -88,6 +89,7 @@ impl ServerCtx {
       connections: Connections::default(),
       runner: None,
       quitting: tokio::sync::watch::channel(false).1,
+      prompts: Default::default(),
     })
   }
 }
@@ -281,7 +283,6 @@ async fn run_locked(
 ) -> anyhow::Result<()> {
   let working_dir = runner.root.clone();
   let config = Config::load_blocking(runner).await?;
-  let keymap = config.keymap.build();
   let config = Arc::new(config);
   let project = Project::new(config.clone());
 
@@ -293,8 +294,6 @@ async fn run_locked(
 
   log::info!("Lock file created for directory: {}", working_dir.display());
 
-  // Read before the console is made: it lists the saved groups as it had
-  // them.
   let saved = Saved::read(runner)?;
   #[cfg(unix)]
   crate::process::unix_processes_waiter::UnixProcessesWaiter::init()?;
@@ -302,34 +301,12 @@ async fn run_locked(
   kernel.save_on_quit(save_on_quit(runner, project.clone()));
   let pc = kernel.context();
   let socket_path = lock_guard.socket_path().to_path_buf();
-  let console_id = pc.alloc_id();
-  let console = console_task_registration(
-    console_id,
-    TaskDef {
-      space: TaskSpaceId::dekit(),
-      path: Some(TaskPath::new("console").expect("valid console path")),
-      pinned: true,
-      ..TaskDef::default()
-    },
-    project.clone(),
-    keymap,
-    saved
-      .as_ref()
-      .map(Saved::console_groups)
-      .unwrap_or_default(),
-  );
-  if let Err(err) = kernel.register_task_registration(console) {
-    #[cfg(unix)]
-    crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()?;
-    anyhow::bail!("Failed to register console task: {err}")
-  }
-  let console = pc.get_task_sender(console_id);
   let quitting = kernel.quitting();
   let kernel_handle = tokio::spawn(kernel.run());
 
   // Watch before any task exists so the first start→exit fires the hook.
   if let Some(hook) = config.on_idle.clone() {
-    watch_idle(&pc, &config, TaskSelector::all(), hook, console);
+    watch_idle(&pc, &config, TaskSelector::all(), hook, None);
   }
 
   let bootstrap = async {
@@ -371,6 +348,7 @@ async fn run_locked(
     connections: Connections::default(),
     runner: Some(runner_handle(runner, lock_guard, &server_socket, log_level)),
     quitting,
+    prompts: Default::default(),
   });
   serve(ctx, server_socket, kernel_handle, Vec::new()).await
 }
@@ -417,22 +395,6 @@ impl Saved {
       Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
       Err(err) => anyhow::bail!("reading {}: {err}", path.display()),
     }
-  }
-
-  /// The groups the saved console listed, and whether each was
-  /// collapsed.
-  fn console_groups(&self) -> BTreeMap<String, bool> {
-    let Ok(snapshot) = &self.snapshot else {
-      return BTreeMap::new();
-    };
-    snapshot
-      .tasks
-      .iter()
-      .find_map(|task| match &task.kind {
-        snap::TaskKind::Console { groups } => Some(groups.clone()),
-        snap::TaskKind::Process(_) => None,
-      })
-      .unwrap_or_default()
   }
 }
 
@@ -823,10 +785,36 @@ pub async fn dispatch_connection(
               let _ = tx.send(error);
             });
           }
+          Ok(RpcRequest::Watch { target }) => {
+            // Earlier requests are answered before the events start, as
+            // for a wait.
+            while let Some(reply) = replies.join_next().await {
+              if let Ok(reply) = reply && sender.queue_ctl(reply).is_err() {
+                return;
+              }
+            }
+            let Some(client) = hello else {
+              return;
+            };
+            watch_session(
+              &ctx,
+              SessionConn {
+                reg,
+                fd,
+                hello: client,
+                sender,
+                receiver,
+              },
+              request.id,
+              target,
+            )
+            .await;
+            return;
+          }
           Ok(req) => {
             let (ctx, id) = (ctx.clone(), request.id);
             replies.spawn(async move {
-              match handle_rpc(&ctx.pc, &ctx.project, req).await {
+              match handle_rpc(&ctx, req).await {
                 Ok(result) => CtlMsg::ok(id, result),
                 Err(error) => CtlMsg::err(id, error),
               }
@@ -975,6 +963,17 @@ pub(crate) fn rpc_task_info(task: &TaskInfo) -> RpcTaskInfo {
       .to_string(),
     ),
     state: task_state(task.state, task.reason),
+    spec: None,
+    origin: None,
+  }
+}
+
+/// A task's task-info with its definition.
+pub(crate) fn rpc_task_described(task: &TaskDescription) -> RpcTaskInfo {
+  RpcTaskInfo {
+    spec: task.spec.clone(),
+    origin: task.origin.clone(),
+    ..rpc_task_info(&task.info)
   }
 }
 
@@ -1047,19 +1046,27 @@ pub async fn resolve_screen(
 }
 
 async fn handle_rpc(
-  pc: &TaskContext,
-  project: &Arc<Project>,
+  ctx: &ServerCtx,
   req: RpcRequest,
 ) -> Result<Value, RpcError> {
+  let (pc, project) = (&ctx.pc, &ctx.project);
   let config = project.config();
   let config = config.as_ref();
   match req {
     RpcRequest::Attach { .. }
     | RpcRequest::Wait { .. }
+    | RpcRequest::Watch { .. }
     | RpcRequest::Logs { follow: true, .. }
     | RpcRequest::Upgrade { .. } => {
       Err(RpcError::internal("handled by the connection loop"))
     }
+
+    RpcRequest::WriteBack {
+      include,
+      paths,
+      prompt,
+      plan,
+    } => write_back(ctx, include, paths, prompt, plan).await,
 
     RpcRequest::Logs {
       targets,
@@ -1122,7 +1129,13 @@ async fn handle_rpc(
 
     RpcRequest::Ls { target } => {
       let target = target.unwrap_or_else(|| Target::glob("**"));
-      let tasks = list(pc, &target).await?.iter().map(rpc_task_info).collect();
+      let selector = target.selector().map_err(bad_target)?;
+      let tasks = pc
+        .describe(selector)
+        .await
+        .iter()
+        .map(rpc_task_described)
+        .collect();
       serde_json::to_value(TaskListResult { tasks }).map_err(RpcError::internal)
     }
 
@@ -1133,10 +1146,20 @@ async fn handle_rpc(
       serde_json::to_value(rpc_why(explain)).map_err(RpcError::internal)
     }
 
-    RpcRequest::Reload { apply } => {
+    RpcRequest::Reload {
+      apply,
+      plan: chosen,
+    } => {
+      let chosen = chosen
+        .map(serde_json::from_value::<crate::reload::Plan>)
+        .transpose()
+        .map_err(|err| RpcError::new(codes::INVALID_PARAMS, err.to_string()))?;
       let mut plan = crate::reload::plan_reload(pc, project)
         .await
         .map_err(|err| RpcError::new(codes::BAD_CONFIG, format!("{err:#}")))?;
+      if let Some(chosen) = &chosen {
+        plan.take_choices(chosen);
+      }
       let errors = if apply {
         crate::reload::apply(pc, project, &mut plan).await
       } else {
@@ -1166,7 +1189,12 @@ mod tests {
 
   use super::*;
   use crate::{
-    kernel::{kernel::Kernel, task::TaskId},
+    command::Command,
+    kernel::{
+      kernel::Kernel,
+      task::{TaskDef, TaskId},
+      task_path::TaskPath,
+    },
     protocol::{Request, client_handshake},
   };
 
@@ -1282,6 +1310,103 @@ mod tests {
       ConnReceiver::new(client_read),
       connection,
     )
+  }
+
+  /// A watch starts with the tasks as `ls` has them, each with what it
+  /// is listed after, then tells of each task added and removed among
+  /// those its target selects.
+  #[tokio::test]
+  async fn a_watch_follows_what_its_target_selects() {
+    let config = Arc::new(Config::make_default());
+    let mut kernel = Kernel::new();
+    let pc = kernel.context();
+    for path in ["db", "web/ui"] {
+      kernel.register_task(
+        TaskDef {
+          path: Some(TaskPath::new(path).unwrap()),
+          ..Default::default()
+        },
+        |_| Box::new(crate::kernel::task::TargetTask),
+      );
+    }
+    let kernel_handle = tokio::spawn(kernel.run());
+    let ctx = ServerCtx::local(pc.clone(), config.clone());
+    let watch = async |target: Option<Target>| {
+      let (mut sender, mut receiver, _) = serve_duplex(&ctx, None);
+      client_handshake(&mut sender, &mut receiver).await.unwrap();
+      let (method, params) = RpcRequest::Watch { target }.to_wire();
+      sender
+        .send_ctl(CtlMsg::Request(Request {
+          id: 1,
+          method,
+          params,
+        }))
+        .await
+        .unwrap();
+      (sender, receiver)
+    };
+    let (_all_tx, mut all) = watch(None).await;
+    let (_web_tx, mut web) = watch(Some(Target::glob("web/**"))).await;
+
+    let (name, params) = next_event(&mut all).await;
+    assert_eq!(name, "tasks");
+    let listed: Vec<(String, bool)> = params["tasks"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .map(|t| {
+        (
+          t["path"].as_str().unwrap().to_string(),
+          t["after"].is_null(),
+        )
+      })
+      .collect();
+    assert_eq!(
+      listed,
+      [("db".to_string(), true), ("web/ui".to_string(), false)]
+    );
+    let (name, params) = next_event(&mut web).await;
+    assert_eq!(name, "tasks");
+    assert_eq!(params["tasks"].as_array().unwrap().len(), 1);
+
+    let add = |path: &str| Command::Add {
+      target: Target::glob(path),
+      spec: serde_yaml::from_str("{cmd: [sh, -c, 'true']}").unwrap(),
+      place: Default::default(),
+      start: false,
+      defaults: true,
+      origin: None,
+    };
+    execute(&pc, &config, &add("api")).await.unwrap();
+    execute(&pc, &config, &add("web/admin")).await.unwrap();
+    let (name, params) = next_event(&mut all).await;
+    assert_eq!(
+      (name.as_str(), params["path"].as_str()),
+      ("task", Some("api"))
+    );
+    assert_eq!(params["spec"]["cmd"][0], "sh");
+    let (name, _) = next_event(&mut all).await;
+    assert_eq!(name, "task");
+    // What the target does not select is not told.
+    let (name, params) = next_event(&mut web).await;
+    assert_eq!(
+      (name.as_str(), params["path"].as_str()),
+      ("task", Some("web/admin"))
+    );
+    let id = params["id"].clone();
+
+    let remove = Command::Remove {
+      target: Target::glob("web/admin"),
+    };
+    execute(&pc, &config, &remove).await.unwrap();
+    let (name, params) = next_event(&mut web).await;
+    assert_eq!((name.as_str(), params["id"].clone()), ("task-removed", id));
+
+    pc.send(KernelCommand::Quit);
+    timeout(Duration::from_secs(2), kernel_handle)
+      .await
+      .unwrap()
+      .unwrap();
   }
 
   /// A probe whose verdict is in at once reports it, never a timeout,

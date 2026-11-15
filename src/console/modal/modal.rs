@@ -12,8 +12,13 @@ pub enum ModalResult {
   Issue(Vec<Command>),
   /// Close the modal and carry the reload out as chosen.
   ApplyReload(Box<crate::reload::Plan>),
-  /// Close the modal and write the changes back.
-  WriteBack(Box<crate::write_back::WritePlan>, crate::write_back::How),
+  /// Close the modal and write back the items at the paths `chosen`,
+  /// with the runner's own tasks `include`d.
+  WriteBack {
+    include: Vec<crate::kernel::task::TaskId>,
+    chosen: Vec<String>,
+    how: super::write_back::How,
+  },
 }
 
 /// Commands a modal issued, one of which failed.

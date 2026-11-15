@@ -9,10 +9,11 @@ Every command talks to the runner of the project you are in: the nearest
 `package.json`. `-C <dir>` picks another project root, and `--json` switches
 a command to machine-readable output.
 
-With no command, `dekit` opens the runner's console. If the runner is not
-running, it starts it like |cli/up| first; if it is, it only attaches
-like |cli/attach|. A `.js` file argument runs that script on the
-embedded JavaScript runtime.
+With no command, `dekit` opens the console with the tasks of every runner
+on this machine, and `dekit .` opens it with this project's tasks alone.
+If the project's runner is not running, either starts it like |cli/up|
+first; if it is, it only attaches like |cli/attach|. A `.js` file
+argument runs that script on the embedded JavaScript runtime.
 
 :::usage
 

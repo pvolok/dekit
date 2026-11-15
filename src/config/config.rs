@@ -202,6 +202,19 @@ impl Config {
     }
   }
 
+  /// The user config alone: what a console draws with, whatever runners
+  /// it shows. What does not load is in the warnings; `watched` is the
+  /// file.
+  pub fn user() -> Config {
+    let mut config = Config::make_default();
+    if let Err(error) = config.load_presentation() {
+      config
+        .warnings
+        .push(format!("ignoring the user config: {error:#}"));
+    }
+    config
+  }
+
   /// The config of `runner`'s project, as that runner reads it.
   pub fn load(runner: &RunnerSpec) -> Result<Config> {
     Config::try_load(runner).map_err(|(err, _)| err)

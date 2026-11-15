@@ -247,6 +247,38 @@ impl Plan {
     }
   }
 
+  /// Takes what `chosen`, a plan made before and answered, took: each
+  /// change by its kind and path, each field by its key. A change it
+  /// does not list was not seen, and is left.
+  pub fn take_choices(&mut self, chosen: &Plan) {
+    for change in &mut self.changes {
+      let Some(was) = chosen
+        .changes
+        .iter()
+        .find(|was| was.kind == change.kind && was.path == change.path)
+      else {
+        change.set_apply(false);
+        continue;
+      };
+      change.apply = was.apply;
+      for field in &mut change.fields {
+        field.take = was
+          .fields
+          .iter()
+          .find(|was| was.key == field.key)
+          .is_some_and(|was| was.take);
+      }
+      // A changed task takes its fields: it is taken when one is.
+      if !change.fields.is_empty() {
+        change.apply = change.fields.iter().any(|field| field.take);
+      }
+    }
+    if let Some(order) = &mut self.order {
+      order.apply = chosen.order.as_ref().is_some_and(|order| order.apply);
+    }
+    self.check_the_way();
+  }
+
   /// Marks each new task that a task here would be in the way of, once
   /// the changes taken are carried out: the kernel would refuse it. One
   /// that comes to be in the way is left; one no longer in the way is
@@ -1212,13 +1244,6 @@ pub async fn load(
   Ok((Arc::new(config?), live, project.base()))
 }
 
-/// The tasks and the base, as they stand together: for a comparison with
-/// a config read before, while what it is read from is unchanged.
-pub async fn tasks(pc: &TaskContext, project: &Project) -> (Live, Base) {
-  let _syncing = project.syncing().await;
-  (Live::read(pc).await, project.base())
-}
-
 /// Loads the config and plans a reload against the runner's tasks.
 pub async fn plan_reload(
   pc: &TaskContext,
@@ -1386,6 +1411,52 @@ mod tests {
   /// by hand or by an agent, under the task's key, or at its path under
   /// another, which the task takes as its own. A task of the runner's own
   /// written in as it is becomes a config task when taken.
+  /// Choices made on a plan answered over the wire carry over to the
+  /// plan made again: each change by kind and path, each field by key;
+  /// a change the chosen plan did not list is left.
+  #[test]
+  fn a_plan_takes_the_choices_of_one_answered_before() {
+    let base = base(&[("api", "{cmd: [api]}"), ("db", "{cmd: [pg]}")]);
+    let live = live_with([
+      task(1, "api", "{cmd: [api]}", Some("api")),
+      task(2, "db", "{cmd: [pg]}", Some("db")),
+    ]);
+    let config = config(&[
+      ("api", "{cmd: [api, --v2], cwd: /srv}"),
+      ("db", "{cmd: [pg]}"),
+      ("new", "{cmd: [new]}"),
+    ]);
+    let answered = plan(config.clone(), &base, &live);
+    let mut chosen: Plan =
+      serde_json::from_value(serde_json::to_value(&answered).unwrap()).unwrap();
+    chosen.changes.retain(|change| change.path == "api");
+    let api = &mut chosen.changes[0];
+    api.fields.retain(|field| field.key == "cwd");
+    api.fields[0].take = false;
+
+    let mut again = plan(config, &base, &live);
+    again.take_choices(&chosen);
+    let taken: Vec<(&str, bool, Vec<(&str, bool)>)> = again
+      .changes
+      .iter()
+      .map(|change| {
+        let fields = change
+          .fields
+          .iter()
+          .map(|field| (field.key.as_str(), field.take))
+          .collect();
+        (change.path.as_str(), change.apply, fields)
+      })
+      .collect();
+    assert_eq!(
+      taken,
+      [
+        ("api", false, vec![("cmd", false), ("cwd", false)]),
+        ("new", false, vec![]),
+      ]
+    );
+  }
+
   #[test]
   fn what_the_config_says_as_here_is_no_change() {
     let base = base(&[("api", "{cmd: [api]}"), ("web", "{cmd: [old]}")]);

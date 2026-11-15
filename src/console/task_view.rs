@@ -1,20 +1,28 @@
 use std::sync::Arc;
 
+use crate::console::app::RunnerId;
 use crate::kernel::{
-  kernel_message::ScreenHandle,
   task::{TaskId, TaskKind, TaskState},
   task_path::TaskPath,
 };
+use crate::spec::{Source, TaskSpec};
 
 pub struct TaskView {
+  /// Its id in the list.
   pub id: TaskId,
+  /// The runner it is on, and its id there.
+  pub runner: RunnerId,
+  pub remote: TaskId,
   pub label: Option<String>,
+  /// Where it is in the list: under its runner's group, when the list
+  /// has one.
   pub path: Arc<TaskPath>,
   pub kind: TaskKind,
   pub status: TaskState,
-  pub vt: ScreenHandle,
-  /// Copy-mode surface, shown instead of `vt` while set.
-  pub present: Option<ScreenHandle>,
+  /// Its definition, when the runner says; an older one does not.
+  pub spec: Option<TaskSpec>,
+  /// The config entry it is written in; none for the runner's own.
+  pub origin: Option<Source>,
 }
 
 impl TaskView {

@@ -14,20 +14,18 @@ use crate::upgrade::snapshot as snap;
 
 use super::{
   kernel_message::{
-    DepExplain, DuplicateRequest, FolderDef, FolderInfo, FolderSettings,
+    DepExplain, DuplicateRequest, FolderDef, FolderInfo, FolderSettings, Heard,
     KernelCommand, KernelMessage, KernelQuery, MoveError, MoveTask, Place,
     RegisterError, Registration, SetTask, SpaceSelector, TaskDescription,
-    TaskExplain, TaskInfo, TaskRegistration, TaskSelector, TaskUpdate, Verb,
-    WaitCond, WaitEvent, WaitMark, WaitOn, WaitRequest, WaitTask, WaitVerdict,
-    task_name,
+    TaskExplain, TaskInfo, TaskSelector, TaskUpdate, Verb, WaitCond, WaitEvent,
+    WaitMark, WaitOn, WaitRequest, WaitTask, WaitVerdict, task_name,
   },
   namespace::Namespace,
   path_trie::PathConflict,
   sub_trie::SubMode,
   task::{
     Effects, ExitInfo, INIT_TASK_ID, NextRun, Run, STOP_TIMEOUT, Task, TaskCmd,
-    TaskDef, TaskEffect, TaskHandle, TaskId, TaskKind, TaskNotification,
-    TaskNotify, TaskState,
+    TaskDef, TaskEffect, TaskHandle, TaskId, TaskKind, TaskNotify, TaskState,
   },
   task_key::{TaskKey, TaskSpaceId},
   task_path::TaskPath,
@@ -159,6 +157,9 @@ struct Graph {
   pending_effects: VecDeque<(TaskId, TaskEffect)>,
   set_watches: Vec<SetWatch>,
   waits: Vec<WaitWatch>,
+  /// The subscribers that are not tasks (`Listen`), by the id each was
+  /// given.
+  listeners: HashMap<TaskId, UnboundedSender<Heard>>,
   /// Set whenever a task is added, removed, moved, renamed, retagged, or
   /// redefined, changes state, gains or loses an edge, or comes to be
   /// wanted or not; watches and waits only need checking again then.
@@ -199,6 +200,7 @@ impl Graph {
       pending_effects: VecDeque::new(),
       set_watches: Vec::new(),
       waits: Vec::new(),
+      listeners: HashMap::new(),
       state_changed: false,
       frozen: None,
       freezes: 0,
@@ -646,24 +648,45 @@ impl Graph {
 
   /// Subscribes and replays `Added` for every task and folder already in
   /// scope, in list order.
-  fn subscribe(&mut self, subscriber: TaskId, key: TaskKey, mode: SubMode) {
-    // Tasks the subscriber already hears about are not replayed again.
-    let replay: Vec<(TaskPath, TaskId)> = self
-      .ns
-      .in_scope(&key, mode)
-      .into_iter()
-      .filter(|(path, _)| !self.ns.is_subscribed(subscriber, &key.space, path))
+  /// A listener that hears on a channel: told what is there, then that
+  /// it has been, then each change.
+  fn listen(
+    &mut self,
+    id: TaskId,
+    key: TaskKey,
+    mode: SubMode,
+    sender: UnboundedSender<Heard>,
+  ) {
+    if self.tasks.contains_key(&id) || self.listeners.contains_key(&id) {
+      return;
+    }
+    // Those no one hears any more go now: one on a quiet path is never
+    // sent anything that would find it gone.
+    let gone: Vec<TaskId> = (self.listeners.iter())
+      .filter(|(_, sender)| sender.is_closed())
+      .map(|(id, _)| *id)
       .collect();
-    self.ns.subscribe(subscriber, &key, mode);
-    for (path, id) in replay {
-      if let Some(notify) = self.added_at(id, &key.space, &path) {
-        self.deliver(id, notify, HashSet::from([subscriber]));
+    for gone in gone {
+      self.drop_listener(gone);
+    }
+    self.listeners.insert(id, sender);
+    let there = self.ns.in_scope(&key, mode);
+    self.ns.subscribe(id, &key, mode);
+    for (path, from) in there {
+      if let Some(notify) = self.added_at(from, &key.space, &path) {
+        self.deliver(from, notify, HashSet::from([id]));
       }
+    }
+    if let Some(sender) = self.listeners.get(&id)
+      && sender.send(Heard::Caught).is_err()
+    {
+      self.drop_listener(id);
     }
   }
 
-  fn unsubscribe(&mut self, subscriber: TaskId, key: TaskKey, mode: SubMode) {
-    self.ns.unsubscribe(subscriber, &key, mode);
+  fn drop_listener(&mut self, id: TaskId) {
+    self.listeners.remove(&id);
+    self.ns.remove_subscriber(id);
   }
 
   fn sender_space(&self, sender: TaskId) -> TaskSpaceId {
@@ -1956,7 +1979,6 @@ impl Graph {
       }
     }
 
-    self.ns.remove_subscriber(task_id);
     self.notify_subscribers(
       task_id,
       handle.space,
@@ -2742,23 +2764,43 @@ impl Graph {
     self.deliver(from, notify, targets);
   }
 
+  /// What is listed right before a task or folder.
+  fn listed_before(&self, id: TaskId) -> Option<TaskId> {
+    let (space, path) = match self.tasks.get(&id) {
+      Some(task) => (task.space.clone(), task.path.clone()?),
+      None => {
+        let folder = self.folders.get(&id)?;
+        (folder.space.clone(), folder.path.clone())
+      }
+    };
+    self.ns.before(&TaskKey::new(space, path))
+  }
+
   fn deliver(
     &mut self,
     from: TaskId,
     notify: TaskNotify,
     targets: HashSet<TaskId>,
   ) {
+    if targets.is_empty() {
+      return;
+    }
+    let (now, after) = match notify {
+      TaskNotify::Removed => (None, None),
+      TaskNotify::FolderAdded { .. } => (None, self.listed_before(from)),
+      _ => (self.describe(from).map(Box::new), self.listed_before(from)),
+    };
     for listener_id in targets {
-      if let Some(listener) = self.tasks.get_mut(&listener_id) {
-        let mut fx = Effects::new();
-        listener.task.handle_cmd(
-          TaskCmd::msg(TaskNotification {
-            from,
-            notify: notify.clone(),
-          }),
-          &mut fx,
-        );
-        self.queue_effects(listener_id, &mut fx);
+      if let Some(sender) = self.listeners.get(&listener_id) {
+        let heard = Heard::Notify {
+          from,
+          notify: notify.clone(),
+          now: now.clone(),
+          after,
+        };
+        if sender.send(heard).is_err() {
+          self.drop_listener(listener_id);
+        }
       }
     }
   }
@@ -2891,9 +2933,10 @@ impl Kernel {
   }
 
   /// Installs a task before the kernel starts processing untrusted messages.
+  #[cfg(test)]
   pub fn register_task_registration(
     &mut self,
-    registration: TaskRegistration,
+    registration: super::kernel_message::TaskRegistration,
   ) -> Result<(), RegisterError> {
     self.graph.register_task_with_id(
       registration.task_id,
@@ -3050,8 +3093,7 @@ impl Kernel {
       | KernelCommand::SetOrigin(..)
       | KernelCommand::Move(..)
       | KernelCommand::TaskMsg(..)
-      | KernelCommand::SubscribePath(..)
-      | KernelCommand::UnsubscribePath(..)
+      | KernelCommand::Listen(..)
       | KernelCommand::WatchSet(..)
       | KernelCommand::Wait(..)
       | KernelCommand::StateTimeout(..) => {
@@ -3298,11 +3340,8 @@ impl Kernel {
         self.graph.on_state_timeout(task_id, epoch)
       }
 
-      KernelCommand::SubscribePath(path, mode) => {
-        self.graph.subscribe(msg.from, path, mode);
-      }
-      KernelCommand::UnsubscribePath(path, mode) => {
-        self.graph.unsubscribe(msg.from, path, mode);
+      KernelCommand::Listen(id, path, mode, sender) => {
+        self.graph.listen(id, path, mode, sender);
       }
       KernelCommand::WatchSet(selectors, sender) => {
         self.graph.watch_set(selectors, sender);

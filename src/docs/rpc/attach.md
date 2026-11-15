@@ -7,9 +7,8 @@ order: 20
 ---
 
 `attach` must be the first and only request on its connection. It
-attaches the connection to the screen of any screen-bearing task; the
-terminal client defaults to `@dekit/console`, the runner's built-in
-console. After the ok response the connection is in session mode until
+attaches the connection to the screen of any screen-bearing task. After
+the ok response the connection is in session mode until
 `bye` (`quit`), sent whether the client detached, the task went away, or
 the runner quit.
 
@@ -21,11 +20,6 @@ not. The session ends with `bye` (`task_exited`) carrying the task's
 final `state` and final `screen` in optional fields. The runner removes
 the attached task at that point, which is what the foreground `run` verb
 relies on.
-
-The console's runner selector ends a session with `bye` (`quit`)
-carrying `switch: {kind, root}`: the client connects to that runner
-(`project` or `host`, at the absolute `root`) and attaches to its console,
-starting the runner when it is not up.
 
 ## Screen stream
 
@@ -72,10 +66,11 @@ painted as a true-color terminal with `italic`, `strikethrough`, and
 - `screen` with a screen command as params: `scroll {delta, unit}`, `copy-enter`, `copy-leave`, `copy-move {dir}`, `copy-select`, `copy-yank`. These act on the attached screen for every observer, as a tmux window would.
 
 Keys, mouse, and pastes are interpreted by the attached task: a process
-task feeds them to its pty (in copy mode they drive the selection), the
+task feeds them to its pty (in copy mode they drive the selection), a
 console treats them as UI input. Events that fail to decode are dropped,
 not fatal.
 
 ## Server events
 
 - `copy` with `{text}`: text copied from the attached screen, for the client to put on the user's clipboard.
+- `screen-state` with `{width, height, copy?, mouse?}`, to a client whose hello names the feature `screen-state`: what the stream cannot say of the attached screen, for a client that runs the stream through its own emulator. `width` and `height` are the size it is painted at, the smallest attached size; `copy` is whether it is in copy mode; `mouse` is the mouse reports the program asked for: `press`, `press-release`, `button-motion`, or `any-motion`. While `mouse` is absent the mouse is the screen's own: a drag selects, and the wheel scrolls its history. Each event is the whole state; it comes before the first paint, and again ahead of the paint that shows a change.

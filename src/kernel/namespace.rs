@@ -194,33 +194,10 @@ impl Namespace {
       .subscribe(subscriber, &key.path, mode);
   }
 
-  pub fn unsubscribe(
-    &mut self,
-    subscriber: TaskId,
-    key: &TaskKey,
-    mode: SubMode,
-  ) {
-    if let Some(space) = self.spaces.get_mut(&key.space) {
-      space.subs.unsubscribe(subscriber, &key.path, mode);
-    }
-  }
-
   pub fn remove_subscriber(&mut self, subscriber: TaskId) {
     for space in self.spaces.values_mut() {
       space.subs.remove_subscriber(subscriber);
     }
-  }
-
-  pub fn is_subscribed(
-    &self,
-    subscriber: TaskId,
-    space: &TaskSpaceId,
-    path: &TaskPath,
-  ) -> bool {
-    self
-      .spaces
-      .get(space)
-      .is_some_and(|ns| ns.subs.is_subscribed(subscriber, path))
   }
 
   pub fn collect(&self, key: &TaskKey, out: &mut HashSet<TaskId>) {

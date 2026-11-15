@@ -95,6 +95,8 @@ pub struct Frame {
   pub images: Arc<ImageTable>,
   /// Image placements in view, in view coordinates.
   pub placements: Vec<VisiblePlacement>,
+  /// The mouse reports the program asked for.
+  pub mouse: crate::term::MouseProtocolMode,
 }
 
 impl Frame {
@@ -111,6 +113,7 @@ impl Frame {
       title: Arc::from(""),
       images: grid.image_table().clone(),
       placements,
+      mouse: Default::default(),
     }
   }
 

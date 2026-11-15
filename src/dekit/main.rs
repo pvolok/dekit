@@ -9,6 +9,11 @@ use crate::{
   attach_client::{AttachEnd, client_main},
   command::Command,
   config::task::is_script,
+  console::{
+    app::{self as console, Setup},
+    host::{Ended, run_on_terminal},
+    link::{Link, socket_connector},
+  },
   dekit::{
     logs_client::{LogsArgs, cli_logs},
     rpc_client::rpc_request,
@@ -608,40 +613,45 @@ fn run_exit_code(state: Option<&RpcState>) -> i32 {
   if state.state == "done" { 0 } else { 1 }
 }
 
-/// Attaches to `target` on `runner`, and follows the console from runner
-/// to runner for as long as it asks to switch. A switch always lands on
-/// the next runner's console, starting that runner when it is not up;
-/// when that fails, the console it came from gets the client back.
-async fn attach_loop(
-  mut runner: RunnerSpec,
-  mut target: Target,
-  mut start: bool,
+/// Attaches the terminal to `target`'s screen on `runner`.
+async fn attach(
+  runner: RunnerSpec,
+  target: Target,
+  start: bool,
 ) -> anyhow::Result<()> {
-  // The runner a switch left, still running, until the next one is up.
-  let mut previous: Option<RunnerSpec> = None;
-  loop {
-    let connected = connect_client_socket(&runner, start).await;
-    let (sender, receiver) = match (connected, previous.take()) {
-      (Ok(conn), _) => conn,
-      (Err(err), Some(back)) => {
-        eprintln!("Cannot switch to {}: {err:#}", runner.root.display());
-        eprintln!("Back to {}...", back.root.display());
-        runner = back;
-        start = false;
-        continue;
-      }
-      (Err(err), None) => return Err(err),
-    };
-    match client_main(target, false, sender, receiver).await? {
-      AttachEnd::Detached | AttachEnd::TaskExited(_) => return Ok(()),
-      AttachEnd::Switch(next) => {
-        eprintln!("Switching to {}...", next.root.display());
-        previous = Some(std::mem::replace(&mut runner, next));
-        target = "@dekit/console".parse().expect("valid target");
-        start = true;
-      }
-    }
+  let (sender, receiver) = connect_client_socket(&runner, start).await?;
+  client_main(target, false, sender, receiver).await?;
+  Ok(())
+}
+
+/// Runs the console here, on `runner` and, when `global`, the others that
+/// run.
+async fn console(
+  runner: RunnerSpec,
+  start: bool,
+  global: bool,
+) -> anyhow::Result<()> {
+  let (sender, receiver) = connect_client_socket(&runner, start).await?;
+  let connector = socket_connector(runner.clone());
+  let link =
+    Link::open_with(Some(runner), connector, (sender, receiver)).await?;
+  let config = std::sync::Arc::new(crate::config::config::Config::user());
+  let ended = run_on_terminal(|geometry, caps| {
+    console::start(Setup {
+      keymap: config.keymap.build(),
+      config,
+      geometry,
+      caps,
+      links: vec![link],
+      all_runners: global,
+      follow_user_config: true,
+    })
+  })
+  .await?;
+  if let Ended::Closed(why) = ended {
+    eprintln!("dekit: {why}");
   }
+  Ok(())
 }
 
 /// Carries out `command` and waits on what it acted on, for what its
@@ -1165,7 +1175,10 @@ pub fn cli() -> ClapCommand {
       Arg::new("files")
         .action(clap::ArgAction::Append)
         .trailing_var_arg(true)
-        .help("A .js script to run; with no command, attach to the console"),
+        .help(
+          "A .js script to run, or `.` for the console of this project alone; \
+           with neither, the console of every runner",
+        ),
     )
     .after_help(
       "Run `dekit help` for the documentation topics, `dekit help <command>`\n\
@@ -1200,14 +1213,16 @@ pub async fn dekit_main() -> anyhow::Result<()> {
     return crate::mprocs::mprocs::run_app(argv).await;
   }
 
-  let console = || "@dekit/console".parse::<Target>().expect("valid target");
-
   match matches.subcommand() {
     Some(("attach", sub_m)) => {
-      let target = arg_target(sub_m)?.unwrap_or_else(console);
-      let (runner, target) = resolve_target(&matches, target)?;
       let start = !sub_m.get_flag("no-start");
-      attach_loop(runner, target, start).await?;
+      match arg_target(sub_m)? {
+        Some(target) => {
+          let (runner, target) = resolve_target(&matches, target)?;
+          attach(runner, target, start).await?;
+        }
+        None => console(resolve_runner(&matches)?, start, true).await?,
+      }
     }
     Some(("spawn", sub_m)) => {
       let target = arg_target(sub_m)?.expect("clap requires target");
@@ -1234,7 +1249,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         AttachEnd::TaskExited(state) => {
           std::process::exit(run_exit_code(state.as_ref()));
         }
-        AttachEnd::Detached | AttachEnd::Switch(_) => {
+        AttachEnd::Detached => {
           eprintln!(
             "Detached; {target} keeps running (remove with `dekit rm {target}`)."
           );
@@ -1358,7 +1373,8 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       let runner = arg_runner(&matches, sub_m)?;
       let apply = sub_m.get_flag("yes");
       let result =
-        rpc_request(&runner, RpcRequest::Reload { apply }, false).await?;
+        rpc_request(&runner, RpcRequest::Reload { apply, plan: None }, false)
+          .await?;
       if json {
         println!("{result}");
       } else {
@@ -1670,7 +1686,9 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         .map(|p| p.collect::<Vec<_>>())
         .unwrap_or_default();
 
-      if let Some(first) = paths.first() {
+      // `dekit .`: the console of this project's runner alone.
+      let local = matches!(paths.as_slice(), [only] if only.as_str() == ".");
+      if let Some(first) = paths.first().filter(|_| !local) {
         // .js
         if is_script(Path::new(first)) {
           let src = std::fs::read_to_string(first)
@@ -1694,8 +1712,8 @@ pub async fn dekit_main() -> anyhow::Result<()> {
           );
         }
       } else {
-        // No args: `attach`, with an `up` first when the runner is not
-        // running yet.
+        // No args, or `.`: `attach`, with an `up` first when the runner
+        // is not running yet.
         let runner = resolve_runner(&matches)?;
         match lockfile::get_runner_state(&runner)? {
           lockfile::RunnerState::Ready(_) => {}
@@ -1707,7 +1725,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
               .await?;
           }
         }
-        attach_loop(runner, console(), true).await?;
+        console(runner, true, !local).await?;
       }
     }
   }

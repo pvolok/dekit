@@ -1,7 +1,4 @@
-use std::{
-  collections::{BTreeMap, HashMap},
-  sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use indexmap::IndexSet;
 
@@ -100,33 +97,6 @@ impl TaskTree {
   }
 
   /// A tree whose groups start as `groups` says, once listed.
-  pub fn with_groups(groups: BTreeMap<String, bool>) -> Self {
-    TaskTree {
-      seeds: groups.into_iter().collect(),
-      ..TaskTree::new()
-    }
-  }
-
-  /// How the groups are shown, by path, for `with_groups`: each folder,
-  /// whose entry may say otherwise by the next start, and each other
-  /// group that is collapsed. A tree with neither gives none, which a
-  /// save then leaves out.
-  pub fn groups(&self) -> BTreeMap<String, bool> {
-    self
-      .nodes
-      .iter()
-      .filter_map(|(path, node)| match node {
-        Node::Group(group)
-          if !path.is_empty()
-            && (group.collapsed || group.folder.is_some()) =>
-        {
-          Some((path.clone(), group.collapsed))
-        }
-        Node::Group(_) | Node::Task(_) => None,
-      })
-      .collect()
-  }
-
   /// `after` is the task or folder listed just before the new one, if
   /// any.
   pub fn add(&mut self, task: TaskView, after: Option<TaskId>) {
@@ -386,6 +356,26 @@ impl TaskTree {
     }
   }
 
+  pub fn task(&self, id: TaskId) -> Option<&TaskView> {
+    match self.nodes.get(self.paths.get(&id)?.as_str())? {
+      Node::Task(task) => Some(task),
+      Node::Group(_) => None,
+    }
+  }
+
+  /// Keeps how the groups under `prefix` are shown, for when they are
+  /// listed again: each collapsed or not as it is now.
+  pub fn seed(&mut self, prefix: &str) {
+    for (path, node) in &self.nodes {
+      if let Node::Group(group) = node
+        && !path.is_empty()
+        && path.starts_with(prefix)
+      {
+        self.seeds.insert(path.clone(), group.collapsed);
+      }
+    }
+  }
+
   /// Not for the status: `set_status` keeps the group counts.
   pub fn task_mut(&mut self, id: TaskId) -> Option<&mut TaskView> {
     match self.nodes.get_mut(self.paths.get(&id)?.as_str())? {
@@ -407,13 +397,6 @@ impl TaskTree {
     self.iter().any(|task| {
       task.status.is_active()
         && is_at_or_under(task.path.as_str(), path.as_str())
-    })
-  }
-
-  pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut TaskView> {
-    self.nodes.values_mut().filter_map(|node| match node {
-      Node::Task(task) => Some(task),
-      Node::Group(_) => None,
     })
   }
 
@@ -747,21 +730,22 @@ fn under<'a>(group: &str, path: &'a str) -> Option<&'a str> {
 mod tests {
   use super::*;
   use crate::console::action::FoldOp;
-  use crate::kernel::kernel_message::{Place, ScreenHandle};
+  use crate::console::app::RunnerId;
+  use crate::kernel::kernel_message::Place;
   use crate::kernel::path_trie::PathTrie;
   use crate::kernel::task::ExitInfo;
 
   fn task(id: usize, path: &str) -> TaskView {
     TaskView {
       id: TaskId(id),
+      runner: RunnerId(1),
+      remote: TaskId(id),
       label: None,
       path: Arc::new(TaskPath::new(path).unwrap()),
       kind: crate::kernel::task::TaskKind::Service,
       status: TaskState::Idle,
-      vt: ScreenHandle::new(crate::term::Frame::empty(
-        crate::term::Size::default(),
-      )),
-      present: None,
+      spec: None,
+      origin: None,
     }
   }
 
@@ -1044,26 +1028,23 @@ mod tests {
     assert_eq!(shown(&mut tree), ["db*"]);
   }
 
-  /// Groups listed again start as they were saved; the others as their
-  /// folder says, or open.
+  /// Groups listed again, as a runner's list read again lists them,
+  /// start as they were shown; the others as their folder says, or open.
   #[test]
-  fn groups_start_as_saved() {
-    let saved =
-      BTreeMap::from([("web".to_string(), true), ("apps".to_string(), false)]);
-    let mut tree = TaskTree::with_groups(saved);
+  fn groups_listed_again_start_as_seeded() {
+    let mut tree = tree(&["web/ui", "db/pg"]);
+    tree.fold(FoldOp::Close, Some("web"));
+    tree.seed("");
+    tree.remove(TaskId(1));
+    tree.remove(TaskId(2));
     tree.add_folder(TaskId(10), TaskPath::new("apps").unwrap(), None, true);
-    tree.add(task(1, "apps/api"), Some(TaskId(10)));
-    tree.add(task(2, "web/ui"), Some(TaskId(1)));
-    tree.add(task(3, "db/pg"), Some(TaskId(2)));
-    assert_eq!(
-      shown(&mut tree),
-      ["apps/*", "  apps/api", "web/", "db/", "  db/pg"]
-    );
-    // Each folder, and the other groups closed.
-    assert_eq!(
-      tree.groups(),
-      BTreeMap::from([("apps".to_string(), false), ("web".to_string(), true)])
-    );
+    tree.add(task(3, "web/ui"), Some(TaskId(10)));
+    tree.add(task(4, "db/pg"), Some(TaskId(3)));
+    let rows: Vec<String> = shown(&mut tree)
+      .into_iter()
+      .map(|row| row.trim_end_matches('*').to_string())
+      .collect();
+    assert_eq!(rows, ["apps/", "web/", "db/", "  db/pg"]);
   }
 
   #[test]

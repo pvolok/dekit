@@ -11,7 +11,7 @@ use proptest::prelude::*;
 
 use super::{Graph, Kernel, SentCmd};
 use crate::kernel::kernel_message::{
-  KernelCommand, KernelMessage, SpaceSelector, TaskSelector, Verb,
+  Heard, KernelCommand, KernelMessage, SpaceSelector, TaskSelector, Verb,
 };
 use crate::kernel::sub_trie::SubMode;
 use crate::kernel::task::{
@@ -58,7 +58,6 @@ struct Script {
   on_start: Reaction,
   on_stop: Reaction,
   on_kill: Reaction,
-  on_msg: Reaction,
 }
 
 struct ScriptedTask {
@@ -72,8 +71,7 @@ impl Task for ScriptedTask {
       TaskCmd::Stop => self.script.on_stop.apply(fx),
       TaskCmd::Kill => self.script.on_kill.apply(fx),
       // Never frozen: the harness drives no upgrades.
-      TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
-      TaskCmd::Msg(_) => self.script.on_msg.apply(fx),
+      TaskCmd::Freeze(_) | TaskCmd::Thaw | TaskCmd::Msg(_) => (),
     }
   }
 }
@@ -133,7 +131,8 @@ enum Cmd {
   Veto(Sel),
   Register(usize),
   Remove(usize),
-  Subscribe(usize, usize),
+  /// A listener on a task's path, kept for the rest of the run.
+  Listen(usize),
   Report(usize, ReportKind),
   FireTimer(usize),
 }
@@ -157,12 +156,11 @@ fn reaction() -> impl Strategy<Value = Reaction> {
 }
 
 fn script() -> impl Strategy<Value = Script> {
-  (reaction(), reaction(), reaction(), reaction()).prop_map(
-    |(on_start, on_stop, on_kill, on_msg)| Script {
+  (reaction(), reaction(), reaction()).prop_map(
+    |(on_start, on_stop, on_kill)| Script {
       on_start,
       on_stop,
       on_kill,
-      on_msg,
     },
   )
 }
@@ -232,7 +230,7 @@ fn cmd(n: usize) -> impl Strategy<Value = Cmd> {
     1 => sel(n).prop_map(Cmd::Veto),
     2 => (0..n).prop_map(Cmd::Register),
     1 => (0..n).prop_map(Cmd::Remove),
-    1 => (0..n, 0..n).prop_map(|(a, b)| Cmd::Subscribe(a, b)),
+    1 => (0..n).prop_map(Cmd::Listen),
     2 => (0..n, report_kind()).prop_map(|(t, k)| Cmd::Report(t, k)),
     3 => (0..16usize).prop_map(Cmd::FireTimer),
   ]
@@ -274,6 +272,8 @@ struct Run {
   /// Last seen epoch per task; cleared on removal so re-registration
   /// starts a fresh baseline.
   epochs: HashMap<TaskId, u64>,
+  /// What the listeners hear, held so that they keep listening.
+  heard: Vec<tokio::sync::mpsc::UnboundedReceiver<Heard>>,
 }
 
 impl Run {
@@ -283,6 +283,7 @@ impl Run {
       timers: BTreeMap::new(),
       dropped: Vec::new(),
       epochs: HashMap::new(),
+      heard: Vec::new(),
     }
   }
 
@@ -654,13 +655,19 @@ impl Run {
         // re-registration.
         self.dropped.retain(|(task_id, _)| *task_id != t);
       }
-      Cmd::Subscribe(a, b) => {
+      Cmd::Listen(b) => {
         let path = TaskPath::new(format!("t{}", (b % n) + 1)).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.heard.push(rx);
+        // Clear of the tasks' ids, which are small.
+        let listener = TaskId(usize::MAX - self.heard.len());
         self.turn(
-          id(*a),
-          KernelCommand::SubscribePath(
+          INIT_TASK_ID,
+          KernelCommand::Listen(
+            listener,
             TaskKey::default_space(path),
             SubMode::Subtree,
+            tx,
           ),
         );
       }

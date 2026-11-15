@@ -14,7 +14,7 @@ target (|cli/up|, |cli/down|).
 - a task path — `services/web`
 - a glob — `services/*` matches one level, `services/**` any depth
 - a tag — `+backend` (a plus, not a hash: an unquoted `#` starts a shell comment)
-- in a space — `@dekit/console`, or `@*/web` for every space
+- in a space — `@space/path`, or `@*/web` for every space
 - on a runner — `project::web`, `host::+ci`, `~/dev/api::web/*`
 
 Quote globs so the shell leaves them alone. A task can't have tasks under
@@ -23,7 +23,7 @@ it: with `services/web` there is no task `services`.
 A runner is `project` (the nearest project), `host` (the machine-wide
 runner, |start/runners|), or a path (`/abs/dir`, `~/dir`, `./dir`) naming a
 project root. `**` covers the default space only; `@*/**` spans every space
-in the runner, including the built-in `@dekit/console`.
+in the runner.
 
 ## Stopping tasks
 

@@ -44,10 +44,37 @@ pub enum RpcRequest {
     caps: Option<TermCaps>,
   },
   /// Merge the config on disk into the tasks: with `apply`, carry out
-  /// the default choices; either way, answer with the plan.
+  /// the default choices, or with `plan` (feature `reload-plan`) the choices
+  /// it makes; either way, answer with the plan.
   Reload {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     apply: bool,
+    /// A plan a dry `reload` answered, with its changes and fields taken
+    /// or not: what the plan made now takes of each it lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<Value>,
+  },
+  /// `ls` kept current for the rest of the connection (feature `watch`).
+  Watch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<Target>,
+  },
+  /// Write what changed here back to the config: with neither `paths`
+  /// nor `prompt`, answer what it would write. `include` adds the
+  /// runner's own tasks.
+  WriteBack {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    include: Vec<TaskId>,
+    /// The items at these paths, in place of those chosen by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paths: Option<Vec<String>>,
+    /// Answer a prompt for an agent to write them, and the `plan` it is
+    /// for, in place of writing them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    prompt: bool,
+    /// Record what an agent wrote of a plan a `prompt` answered; alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<u64>,
   },
   /// Wait until tasks meet a condition, for the rest of the connection:
   /// `target` observes the tasks it matches; `command` carries out a
@@ -91,8 +118,17 @@ pub enum RpcRequest {
 /// Gate for `from_wire`: methods not listed here are `unknown_method`
 /// instead of `invalid_params`. Kept in sync with the enum by tests.
 const METHODS: &[&str] = &[
-  "command", "ls", "why", "screen", "attach", "reload", "upgrade", "wait",
+  "command",
+  "ls",
+  "why",
+  "screen",
+  "attach",
+  "reload",
+  "upgrade",
+  "wait",
   "logs",
+  "watch",
+  "write_back",
 ];
 
 impl RpcRequest {
@@ -180,7 +216,7 @@ pub struct RpcState {
   pub reason: Option<String>,
 }
 
-/// `path` is the space-qualified target of the task (`@dekit/console`),
+/// `path` is the space-qualified target of the task (`@space/path`),
 /// or `<task:id>` for a task without one.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RpcTaskInfo {
@@ -193,6 +229,13 @@ pub struct RpcTaskInfo {
   pub kind: Option<String>,
   #[serde(flatten)]
   pub state: RpcState,
+  /// Its definition, as dekit.yaml writes an entry; absent for a task
+  /// not made from one, and from an older runner.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub spec: Option<crate::spec::TaskSpec>,
+  /// The config entry it is written in; absent for the runner's own.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub origin: Option<crate::spec::Source>,
 }
 
 /// What a `wait` on a target waits for; a command's verb implies its own.
@@ -307,6 +350,112 @@ pub struct RpcWhyDep {
   pub state: RpcState,
   pub wanted: bool,
   pub satisfied: bool,
+}
+
+/// Feature `watch`: the server takes the `watch` method.
+pub const FEATURE_WATCH: &str = "watch";
+/// Feature `reload-plan`: `reload` takes the choices of a `plan`. An
+/// older runner would ignore them.
+pub const FEATURE_RELOAD_PLAN: &str = "reload-plan";
+
+/// Events of a watch session, server to client, beside `tasks` and
+/// `task-removed`: a task or a folder, new or as it is now, and where it
+/// is listed.
+pub const EVENT_TASK: &str = "task";
+pub const EVENT_FOLDER: &str = "folder";
+pub const EVENT_CONFIG_CHANGED: &str = "config-changed";
+
+/// Params of a watch session's `tasks`: the selected tasks as `ls`
+/// answers them, and the folders among them, each with what it is listed
+/// right after.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct WatchTasksEvent {
+  pub tasks: Vec<RpcListed>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub folders: Vec<RpcFolder>,
+}
+
+/// A task as a watch lists it, and params of `task`: its task-info, and
+/// the id of the task or folder listed right before it, absent when it
+/// is listed first.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RpcListed {
+  #[serde(flatten)]
+  pub info: RpcTaskInfo,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub after: Option<TaskId>,
+}
+
+/// Params of `folder`, and a folder of `tasks`: a node of the list that
+/// holds the tasks under its path. `collapsed` is how it starts out.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RpcFolder {
+  pub id: TaskId,
+  pub path: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub after: Option<TaskId>,
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub collapsed: bool,
+}
+
+/// Params of a watch session's `task-removed`: a task or folder gone.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TaskRemovedEvent {
+  pub id: TaskId,
+}
+
+/// Result of `write_back`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct WriteBackResult {
+  /// What it would write; with none of `write`, `prompt` and `check`.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub items: Vec<RpcWriteItem>,
+  /// What was not written, or did not read back as written.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub failed: Vec<RpcWriteFailure>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub prompt: Option<String>,
+  /// The plan the prompt is for, to `check`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub plan: Option<u64>,
+}
+
+/// One entry a write-back writes.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RpcWriteItem {
+  /// The task's path here, or in the config for one removed here; a
+  /// folder's ends in `/`.
+  pub path: String,
+  /// The entry as the file has it.
+  pub source: crate::spec::Source,
+  /// `changed`, `added` (the runner's own), or `removed`.
+  pub kind: String,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub fields: Vec<RpcWriteField>,
+  /// Chosen unless the user says otherwise.
+  pub apply: bool,
+  /// Why the writer can't do it; an agent can.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub note: Option<String>,
+  /// The task or folder here that it writes.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub task: Option<TaskId>,
+}
+
+/// What a write changes in an entry: what the file says, and will.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RpcWriteField {
+  pub key: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub was: Option<Value>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub now: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RpcWriteFailure {
+  pub path: String,
+  pub why: String,
 }
 
 /// Feature `logs`: the server takes the `logs` method.
@@ -491,7 +640,10 @@ mod tests {
         origin: None,
       }),
       RpcRequest::Command(Command::Down),
-      RpcRequest::Reload { apply: true },
+      RpcRequest::Reload {
+        apply: true,
+        plan: None,
+      },
       RpcRequest::Command(Command::Quit),
       RpcRequest::Ls { target: None },
       RpcRequest::Ls {
@@ -563,6 +715,40 @@ mod tests {
         lines: None,
         since_ms: Some(600_000),
       },
+      RpcRequest::Watch { target: None },
+      RpcRequest::Watch {
+        target: Some(Target::glob("web/*")),
+      },
+      RpcRequest::Reload {
+        apply: true,
+        plan: Some(
+          json!({"changes": [{"kind": "removed", "path": "old", "apply": false}]}),
+        ),
+      },
+      RpcRequest::WriteBack {
+        include: Vec::new(),
+        paths: None,
+        prompt: false,
+        plan: None,
+      },
+      RpcRequest::WriteBack {
+        include: vec![TaskId(4)],
+        paths: Some(vec!["api".to_string(), "web/".to_string()]),
+        prompt: false,
+        plan: None,
+      },
+      RpcRequest::WriteBack {
+        include: Vec::new(),
+        paths: Some(vec!["api".to_string()]),
+        prompt: true,
+        plan: None,
+      },
+      RpcRequest::WriteBack {
+        include: Vec::new(),
+        paths: None,
+        prompt: false,
+        plan: Some(3),
+      },
     ]
   }
 
@@ -608,6 +794,17 @@ mod tests {
         "logs",
         r#"{"follow":true,"since_ms":600000,"targets":["web/*","+db"]}"#,
       ),
+      ("watch", r#"null"#),
+      ("watch", r#"{"target":"web/*"}"#),
+      // `reload-plan`: the choices of a plan a dry reload answered.
+      (
+        "reload",
+        r#"{"apply":true,"plan":{"changes":[{"apply":false,"kind":"removed","path":"old"}]}}"#,
+      ),
+      ("write_back", r#"null"#),
+      ("write_back", r#"{"include":[4],"paths":["api","web/"]}"#),
+      ("write_back", r#"{"paths":["api"],"prompt":true}"#),
+      ("write_back", r#"{"plan":3}"#),
     ];
     let samples = samples();
     assert_eq!(samples.len(), expected.len());
@@ -641,6 +838,8 @@ mod tests {
           label: None,
           kind: None,
           state: ready.clone(),
+          spec: None,
+          origin: None,
         },
         RpcTaskInfo {
           id: TaskId(7),
@@ -648,6 +847,8 @@ mod tests {
           label: Some("Web".to_string()),
           kind: None,
           state: exited.clone(),
+          spec: None,
+          origin: None,
         },
       ],
     };
@@ -708,6 +909,8 @@ mod tests {
         signal: None,
         reason: None,
       },
+      spec: None,
+      origin: None,
     };
     let pending = RpcWaitTask {
       info: api.clone(),

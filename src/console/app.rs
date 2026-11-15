@@ -1,4 +1,9 @@
-use std::collections::BTreeMap;
+//! The console: one user's view of the runners it shows, drawn into a
+//! screen of its own that a host paints on a terminal (`host`). It runs
+//! in the client, and speaks to each runner as any client does: a watch
+//! for its task list, requests for what it does, and an attach for the
+//! terminal it shows (`link`, `pane`).
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,6 +18,7 @@ use crate::{
     action::{Action, CopyMove, RunnerTab, ScrollUnit},
     app_layout::AppLayout,
     keymap::{Keymap, KeymapGroup, Lookup},
+    link::{Link, RunnerEvent},
     modal::{
       commands_menu::CommandsMenuModal,
       menu::{MenuItem, MenuModal},
@@ -20,9 +26,9 @@ use crate::{
       quit::QuitModal,
       runner_select::RunnerSelectModal,
     },
+    pane::{Pane, PaneCtl, PaneEvent},
     state::{ConfigStatus, Scope, State},
     task_tree::{Node, TaskTree},
-    task_view::TaskView,
     theme::{BlockTheme, Theme},
     ui_header::{HeaderInfo, render_header},
     ui_keymap::render_keymap,
@@ -31,182 +37,200 @@ use crate::{
     ui_zoom_tip::render_zoom_tip,
   },
   kernel::{
-    copy_mode::CopyMove as KernelCopyMove,
-    kernel_message::{KernelCommand, TaskContext, TaskRegistration},
-    sub_trie::SubMode,
-    task::{
-      ChannelTask, ExitInfo, TaskCmd, TaskDef, TaskId, TaskKind,
-      TaskNotification, TaskNotify, TaskState,
-    },
-    task_key::TaskKey,
-    task_path::{TaskPath, overlaps, path_name, unique},
-    task_screen::{
-      DEFAULT_SIZE, ObserverId, ScreenNotify, ScrollUnit as KernelScrollUnit,
-      TaskScreen, TaskScreenCmd, TaskScreenEffect,
-    },
+    task::TaskId,
+    task_path::{TaskPath, path_name, unique},
   },
-  project::Project,
-  protocol::caps::Background,
+  protocol::{
+    ScreenCommand, TermCaps, caps::Background, screen as wire_screen,
+  },
   spec::TaskSpec,
   target::Target,
   term::{
     CursorStyle, Geometry, Grid, Screen, ScreenHandle, TermEvent,
     grid::Rect,
     key::{Key, KeyCode, KeyEventKind},
-    mouse::{MouseButton, MouseEventKind},
+    mouse::{MouseButton, MouseEvent, MouseEventKind},
     style::Style,
   },
 };
 
-use crate::upgrade::snapshot::TaskKind as TaskKindSnapshot;
-
 #[path = "app_edit.rs"]
 mod edit;
+#[path = "app_runners.rs"]
+mod runners;
 use edit::{ConsoleMsg, Purpose};
+pub(crate) use runners::{Runner, RunnerId};
 
-fn kernel_copy_move(dir: CopyMove) -> KernelCopyMove {
-  match dir {
-    CopyMove::Up => KernelCopyMove::Up,
-    CopyMove::Down => KernelCopyMove::Down,
-    CopyMove::Left => KernelCopyMove::Left,
-    CopyMove::Right => KernelCopyMove::Right,
-  }
+/// What a console is told.
+pub enum AppMsg {
+  /// From the terminal it is on.
+  Input(TermEvent),
+  Runner(RunnerId, RunnerEvent),
+  /// From the session of the pane with this number.
+  Pane(u64, PaneEvent),
+  /// Done off the console's loop: what to do on it.
+  Post(ConsoleMsg),
+  /// An mprocs hook's or its ctl server's.
+  Action(Action),
+  /// The user config changed, as it reads now.
+  UserConfig(Arc<Config>),
 }
 
-fn kernel_scroll_unit(unit: ScrollUnit) -> KernelScrollUnit {
-  match unit {
-    ScrollUnit::Line => KernelScrollUnit::Line,
-    ScrollUnit::HalfScreen => KernelScrollUnit::HalfScreen,
-    ScrollUnit::Screen => KernelScrollUnit::Screen,
-  }
+/// What a console tells its host.
+pub enum HostMsg {
+  /// The screen changed.
+  Paint,
+  /// Text to put on the user's clipboard.
+  Copy(String),
+  /// The console is done: the user left it, or else why.
+  Exit(Option<String>),
 }
 
-/// `groups` are the groups a saved console listed, and whether each was
-/// collapsed: they are shown so again once listed.
-pub fn console_task_registration(
-  task_id: TaskId,
-  def: TaskDef,
-  project: Arc<Project>,
-  keymap: Keymap,
-  groups: BTreeMap<String, bool>,
-) -> TaskRegistration {
-  let screen = Screen::new(DEFAULT_SIZE, 0);
+/// How a console starts.
+pub struct Setup {
+  /// What it draws with: the user config, or mprocs'.
+  pub config: Arc<Config>,
+  pub keymap: Keymap,
+  /// The terminal's size, and what it can show.
+  pub geometry: Geometry,
+  pub caps: TermCaps,
+  /// The runners shown from the start, the first with the focus.
+  pub links: Vec<Link>,
+  /// Each runner's tasks under a group of its own, and the others that
+  /// run on this machine shown too; otherwise the one runner's tasks at
+  /// the top of the list, as `dekit mprocs` has them.
+  pub all_runners: bool,
+  /// Draw again as the user config changes.
+  pub follow_user_config: bool,
+}
+
+/// A console started: where to tell it things, what it tells its host,
+/// and the screen it draws into.
+pub struct Started {
+  pub app: UnboundedSender<AppMsg>,
+  pub host: UnboundedReceiver<HostMsg>,
+  pub screen: ScreenHandle,
+}
+
+pub fn start(setup: Setup) -> Started {
+  let (tx, msgs) = unbounded_channel();
+  let (host, host_rx) = unbounded_channel();
+  let screen = Screen::new(setup.geometry.size, 0);
   let handle = ScreenHandle::new(screen.frame());
-  TaskRegistration {
-    task_id,
-    def: TaskDef {
-      vt: Some(handle.clone()),
-      ..def
+  if setup.follow_user_config {
+    runners::follow_user_config(tx.clone());
+  }
+  let mut app = App {
+    keymap: setup.keymap,
+    theme: Theme::resolve(setup.config.tui.theme, setup.caps.background),
+    background: setup.caps.background,
+    state: State {
+      scope: Scope::Tasks,
+      tasks: TaskTree::new(),
+      hide_keymap_window: !setup.config.tui.tips.show,
+      pending_keys: Vec::new(),
+      quitting: false,
+      header: Default::default(),
+      unsaved_hit: None,
+      hover: None,
+      toast: None,
+      config: ConfigStatus::default(),
+      drag: None,
+      copy: false,
     },
-    factory: Box::new(move |pc| {
-      log::debug!("Creating console task (id: {})", pc.task_id.0);
-      // Subscribe at registration, so tasks registered later are seen
-      // before any message addressed to the console.
-      pc.subscribe_path(
-        TaskKey::default_space(TaskPath::root()),
-        SubMode::Subtree,
-      );
-      let (tx, rx) = unbounded_channel();
-      let app = App::new(project, keymap, rx, pc, screen, handle, groups);
-      tokio::spawn(app.run());
-      Box::new(ChannelTask::new(tx))
-    }),
+    config: setup.config,
+    caps: setup.caps,
+    modal: None,
+    modal_seq: 0,
+    modal_runner: None,
+    msgs,
+    tx: tx.clone(),
+    host,
+    screen,
+    handle: handle.clone(),
+    geometry: setup.geometry,
+    runners: Vec::new(),
+    next_runner: 0,
+    next_id: 1,
+    all_runners: setup.all_runners,
+    connecting: Default::default(),
+    failed: Default::default(),
+    pane: None,
+    panes: 0,
+    pane_failed: None,
+    stop: false,
+    dirty: true,
+  };
+  for link in setup.links {
+    app.add_runner(link);
+  }
+  if app.all_runners {
+    runners::discover(tx.clone());
+  }
+  tokio::spawn(app.run());
+  Started {
+    app: tx,
+    host: host_rx,
+    screen: handle,
   }
 }
 
-/// The built-in console: one view state shared by every attachment, drawn
-/// into its own task screen. It observes the screens of the tasks it
-/// shows only while something is attached to it.
 pub struct App {
-  project: Arc<Project>,
+  /// What it draws with.
+  config: Arc<Config>,
   keymap: Keymap,
   theme: Theme,
-  /// The terminal background the latest attached client reported.
+  /// The terminal's background, as the host said.
   background: Option<Background>,
+  /// What the terminal can show, as the host said: the panes are painted
+  /// for it.
+  caps: TermCaps,
   state: State,
   modal: Option<Box<dyn Modal>>,
   /// How many modals were opened: the number of the one open.
   modal_seq: u64,
-  receiver: UnboundedReceiver<TaskCmd>,
-  pc: TaskContext,
+  /// The runner the open modal's commands go to.
+  modal_runner: Option<RunnerId>,
+  msgs: UnboundedReceiver<AppMsg>,
+  tx: UnboundedSender<AppMsg>,
+  host: UnboundedSender<HostMsg>,
 
-  screen: TaskScreen,
-  effects: Vec<TaskScreenEffect>,
+  /// What it draws into, and where each picture of it goes.
+  screen: Screen,
+  handle: ScreenHandle,
+  /// The terminal's size, and its cells' in pixels.
+  geometry: Geometry,
 
-  /// The console's identity as an observer of task screens, and where
-  /// their notifications arrive.
-  observer: ObserverId,
-  sink: UnboundedSender<ScreenNotify>,
-  notifies: UnboundedReceiver<ScreenNotify>,
+  /// The runners shown, in list order.
+  runners: Vec<Runner>,
+  next_runner: u64,
+  /// The next id for a task or folder in the list: the runners' own
+  /// ids are each runner's.
+  next_id: usize,
+  all_runners: bool,
+  /// Runners being connected to, not shown yet.
+  connecting: std::collections::HashSet<crate::runner::RunnerSpec>,
+  /// Runners that could not be shown, and when.
+  failed: std::collections::HashMap<crate::runner::RunnerSpec, Instant>,
+
+  /// The selected task's screen, by the list's id of the task, and its
+  /// number.
+  pane: Option<(TaskId, u64, Pane)>,
+  panes: u64,
+  /// The task whose screen could not be shown: not tried again until
+  /// another is selected.
+  pane_failed: Option<TaskId>,
 
   stop: bool,
   /// Something the picture depends on changed since the last render.
   dirty: bool,
-
-  /// The tasks changed since the config was last compared with them.
-  status_dirty: bool,
-  /// A comparison is under way.
-  status_running: bool,
-  /// The config on disk as last read for the comparison, with the
-  /// `config_generation` it was read at: reused while no file it is read
-  /// from changed.
-  disk_config: Option<(u64, Arc<Config>)>,
-  /// Counts the changes to the files the config is read from.
-  config_generation: u64,
 }
 
 impl App {
-  fn new(
-    project: Arc<Project>,
-    keymap: Keymap,
-    receiver: UnboundedReceiver<TaskCmd>,
-    pc: TaskContext,
-    screen: Screen,
-    handle: ScreenHandle,
-    groups: BTreeMap<String, bool>,
-  ) -> Self {
-    let (sink, notifies) = unbounded_channel();
-    App {
-      state: State {
-        scope: Scope::Tasks,
-        tasks: TaskTree::with_groups(groups),
-        hide_keymap_window: !project.config().tui.tips.show,
-        pending_keys: Vec::new(),
-        quitting: false,
-        header: Default::default(),
-        unsaved_hit: None,
-        hover: None,
-        toast: None,
-        config: ConfigStatus::default(),
-        drag: None,
-      },
-      theme: Theme::resolve(project.config().tui.theme, None),
-      background: None,
-      project,
-      keymap,
-      modal: None,
-      modal_seq: 0,
-      receiver,
-      screen: TaskScreen::new(pc.task_id, screen, handle, 1),
-      pc,
-      effects: Vec::new(),
-      observer: ObserverId::new(),
-      sink,
-      notifies,
-      stop: false,
-      dirty: true,
-      status_dirty: true,
-      status_running: false,
-      disk_config: None,
-      config_generation: 0,
-    }
-  }
-
-  /// Repaints in the theme `tui.theme` asks for, given what the latest
-  /// client said about its terminal's background.
+  /// Repaints in the theme `tui.theme` asks for, given what the terminal
+  /// said about its background.
   fn apply_theme(&mut self) {
-    let theme =
-      Theme::resolve(self.project.config().tui.theme, self.background);
+    let theme = Theme::resolve(self.config.tui.theme, self.background);
     if theme.dark != self.theme.dark {
       self.theme = theme;
       self.dirty = true;
@@ -214,81 +238,77 @@ impl App {
   }
 
   async fn run(mut self) {
-    let mut geometry = self.task_geometry();
-    let mut cmds = Vec::new();
-    let mut notifies = Vec::new();
-    // Only a runner has a config on disk to compare with.
-    let mut config_changes = self
-      .project
-      .config()
-      .runner
-      .is_some()
-      .then(|| self.project.changes());
+    let mut msgs = Vec::new();
     while !self.stop {
-      let now = self.task_geometry();
-      if now != geometry {
-        geometry = now;
-        for task in self.state.tasks.iter() {
-          self.pc.send_msg(
-            task.id,
-            TaskScreenCmd::Input {
-              observer: self.observer,
-              event: TermEvent::Resize(now),
-            },
-          );
-        }
-      }
-
       tokio::select! {
-        n = self.receiver.recv_many(&mut cmds, 512) => {
-          // Zero means the kernel is gone.
+        n = self.msgs.recv_many(&mut msgs, 512) => {
           if n == 0 {
             break;
           }
-          for cmd in cmds.drain(..) {
-            self.dirty = true;
-            self.handle_task_cmd(cmd);
+          for msg in msgs.drain(..) {
+            self.handle_msg(msg);
           }
-        }
-        _ = self.notifies.recv_many(&mut notifies, 512) => {
-          for notify in notifies.drain(..) {
-            self.handle_screen_notify(notify);
-          }
-        }
-        () = changed(&mut config_changes) => {
-          // The config on disk is read again for the next comparison.
-          self.config_generation = self.config_generation.wrapping_add(1);
-          self.status_dirty = true;
-          // As the user config says since a reload took it in.
-          self.keymap = self.project.config().keymap.build();
-          self.apply_theme();
-          self.dirty = true;
         }
         () = sleep_until(self.state.toast.as_ref().map(|toast| toast.until)) => {
           self.state.toast = None;
           self.dirty = true;
         }
       }
-
+      if self.stop {
+        break;
+      }
+      self.sync_pane();
       self.refresh_status();
-      if self.dirty && self.screen.has_observers() {
+      if self.dirty {
         self.dirty = false;
         self.render();
       }
     }
-    self.pc.unsubscribe_path(
-      TaskKey::default_space(TaskPath::root()),
-      SubMode::Subtree,
-    );
-    self.pc.send(KernelCommand::TaskStopped(ExitInfo::code(0)));
+  }
+
+  fn handle_msg(&mut self, msg: AppMsg) {
+    match msg {
+      AppMsg::Input(event) => {
+        self.dirty = true;
+        self.handle_input(event);
+      }
+      AppMsg::Runner(id, event) => {
+        self.dirty = true;
+        self.runner_event(id, event);
+      }
+      AppMsg::Pane(number, event) => self.pane_event(number, event),
+      AppMsg::Post(msg) => {
+        self.dirty = true;
+        self.handle_console_msg(msg);
+      }
+      AppMsg::Action(action) => {
+        self.dirty = true;
+        self.handle_action(action);
+      }
+      AppMsg::UserConfig(config) => {
+        self.config = config;
+        self.keymap = self.config.keymap.build();
+        self.apply_theme();
+        self.dirty = true;
+      }
+    }
+  }
+
+  /// Leaves, telling the host why unless the user left.
+  pub(super) fn exit(&mut self, why: Option<String>) {
+    self.stop = true;
+    let _ = self.host.send(HostMsg::Exit(why));
   }
 
   fn render(&mut self) {
     let layout = self.layout();
-    let client_versions: Vec<String> =
-      self.screen.client_versions().map(String::from).collect();
+    let focused = self.focused();
+    let runner = focused.and_then(|runner| runner.link.runner().cloned());
+    let runner_version =
+      focused.map(|runner| runner.link.hello().version.clone());
+    let shown = self.shown_frame();
     let theme = &self.theme;
-    let vt = self.screen.screen_mut();
+    let vt = &mut self.screen;
     let grid = vt.grid_mut();
     let bg = Style::default()
       .bg(theme.block.bg.into())
@@ -298,14 +318,14 @@ impl App {
     grid.cursor_pos = None;
     grid.cursor_style = CursorStyle::Default;
 
-    let config = self.project.config();
+    let own = env!("CARGO_PKG_VERSION");
     let header = render_header(
       layout.header,
       grid,
       &HeaderInfo {
-        runner: config.runner.as_ref(),
-        version: env!("CARGO_PKG_VERSION"),
-        client_versions: client_versions.iter().map(String::as_str).collect(),
+        runner: runner.as_ref(),
+        version: runner_version.as_deref().unwrap_or(own),
+        client_versions: vec![own],
         hover: self.state.hover,
         held: self.modal.as_ref().and_then(|modal| modal.unshaded()),
         config_changes: self.state.config.changes,
@@ -318,11 +338,11 @@ impl App {
       layout.sidebar,
       grid,
       &mut self.state,
-      &config,
+      &self.config,
       &self.keymap,
       theme,
     );
-    render_term(layout.term, grid, &self.state, theme);
+    render_term(layout.term, grid, &self.state, shown.as_deref(), theme);
     let mut hints = layout.keymap;
     if hints.height == 0 && !self.state.pending_keys.is_empty() {
       // Zoomed, or without the hints: the keys that can follow still
@@ -349,7 +369,8 @@ impl App {
       None => vt.set_hide_cursor(true),
     }
     vt.set_cursor_style(cursor_style);
-    self.with_screen(TaskScreen::rendered);
+    self.handle.publish(vt.frame());
+    let _ = self.host.send(HostMsg::Paint);
   }
 
   /// The whole screen.
@@ -363,215 +384,49 @@ impl App {
       self.frame(),
       self.state.scope.is_zoomed(),
       self.state.hide_keymap_window,
-      &self.project.config(),
+      &self.config,
     )
   }
 
-  fn add_task(
-    &mut self,
-    id: TaskId,
-    label: Option<String>,
-    path: Option<TaskPath>,
-    after: Option<TaskId>,
-    kind: TaskKind,
-    status: TaskState,
-    vt: Option<ScreenHandle>,
-  ) {
-    // Console tasks always have a path.
-    let (Some(vt), Some(path)) = (vt, path) else {
-      return;
-    };
-    self.state.tasks.add(
-      TaskView {
-        id,
-        label,
-        path: Arc::new(path),
-        kind,
-        status,
-        vt,
-        present: None,
-      },
-      after,
-    );
-    if self.screen.has_observers() {
-      self.observe(id);
-    }
-  }
-
-  fn observe(&self, id: TaskId) {
-    self.pc.send_msg(
-      id,
-      TaskScreenCmd::Attach {
-        observer: self.observer,
-        geometry: self.task_geometry(),
-        sink: self.sink.clone(),
-        client_version: None,
-        background: None,
-      },
-    );
-  }
-
-  /// What the task screens the console shows are told about their size:
-  /// the terminal pane in cells, and the cells' size as the console's
-  /// own clients report it.
-  fn task_geometry(&self) -> Geometry {
+  /// What the pane's task is told about its size: the terminal pane in
+  /// cells, and the cells' size as the terminal reports it.
+  fn pane_geometry(&self) -> Geometry {
     Geometry {
       size: self.layout().term_area().size(),
-      cell_pixels: self.screen.reported_cell_pixels(),
+      cell_pixels: self.geometry.cell_pixels,
     }
   }
 
-  fn observe_all(&self) {
-    for task in self.state.tasks.iter() {
-      self.observe(task.id);
-    }
-  }
-
-  fn unobserve_all(&mut self) {
-    for task in self.state.tasks.iter_mut() {
-      task.present = None;
-      self.pc.send_msg(
-        task.id,
-        TaskScreenCmd::Detach {
-          observer: self.observer,
-        },
-      );
-    }
-  }
-
-  fn handle_task_cmd(&mut self, cmd: TaskCmd) {
-    let msg = match cmd {
-      TaskCmd::Start(_) => {
-        self.pc.send(KernelCommand::TaskStarted);
-        self.pc.send(KernelCommand::TaskReady);
-        return;
-      }
-      TaskCmd::Stop | TaskCmd::Kill => {
-        self.stop = true;
-        return;
-      }
-      TaskCmd::Thaw => return,
-      // Attachments re-attach and the task list is replayed on resume:
-      // what is carried is how the groups were shown.
-      TaskCmd::Freeze(number) => {
-        self.pc.send(KernelCommand::TaskFrozen(
-          number,
-          TaskKindSnapshot::Console {
-            groups: self.state.tasks.groups(),
-          },
-        ));
-        return;
-      }
-      TaskCmd::Msg(msg) => msg,
-    };
-    let msg = match msg.downcast::<Action>() {
-      Ok(action) => return self.handle_action(None, *action),
-      Err(msg) => msg,
-    };
-    let msg = match msg.downcast::<ConsoleMsg>() {
-      Ok(msg) => return self.handle_console_msg(*msg),
-      Err(msg) => msg,
-    };
-    let msg = match msg.downcast::<TaskScreenCmd>() {
-      Ok(cmd) => return self.handle_screen_cmd(*cmd),
-      Err(msg) => msg,
-    };
-    match msg.downcast::<TaskNotification>() {
-      Ok(n) => self.handle_task_notify(n.from, n.notify),
-      Err(_) => log::error!("Console received unknown message"),
-    }
-  }
-
-  /// Commands addressed to the console's own screen. Keys, mouse, and
-  /// pastes are the UI's input; attachments and their geometry go to the
-  /// screen.
-  fn handle_screen_cmd(&mut self, cmd: TaskScreenCmd) {
-    let cmd = match cmd {
-      TaskScreenCmd::Input {
-        observer,
-        event: TermEvent::Key(key),
-      } => return self.handle_key(observer, key),
-      TaskScreenCmd::Input {
-        observer,
-        event: TermEvent::Mouse(mouse),
-      } => return self.handle_mouse(observer, mouse),
-      TaskScreenCmd::Input {
-        observer,
-        event: TermEvent::Paste(text),
-      } => {
+  fn handle_input(&mut self, event: TermEvent) {
+    match event {
+      TermEvent::Key(key) => self.handle_key(key),
+      TermEvent::Mouse(mouse) => self.handle_mouse(mouse),
+      TermEvent::Paste(text) => {
         if let Some(modal) = &mut self.modal {
           let result = modal.handle_paste(&text);
-          self.modal_result(Some(observer), result);
-        } else if self.state.scope.is_term()
-          && let Some(task) = self.state.current_task()
-        {
-          self.input_current(Some(task.id), TermEvent::Paste(text));
+          self.modal_result(result);
+        } else if self.state.scope.is_term() {
+          self.to_pane(PaneCtl::Input(TermEvent::Paste(text)));
         }
-        return;
       }
-      cmd @ TaskScreenCmd::Detach { .. } => {
-        // The pointer that left would otherwise stay lit for everyone.
-        self.state.hover = None;
-        cmd
+      TermEvent::Resize(geometry) => {
+        self.geometry = geometry;
+        self
+          .screen
+          .set_size(geometry.size.height, geometry.size.width);
       }
-      // A console attachment is what makes a project recent.
-      cmd @ TaskScreenCmd::Attach { background, .. } => {
-        if let Some(background) = background {
-          // The latest client to say decides for everyone attached.
-          self.background = Some(background);
-          self.apply_theme();
-        }
-        if let Some(runner) = self.project.config().runner.clone() {
-          tokio::task::spawn_blocking(move || {
-            crate::runner::recent::touch(&runner)
-          });
-        }
-        cmd
+      TermEvent::FocusGained | TermEvent::FocusLost => {
+        self.to_pane(PaneCtl::Input(event));
       }
-      cmd @ TaskScreenCmd::Input { .. } => cmd,
-      // Copy mode and scrolling do not apply to a composed UI.
-      TaskScreenCmd::CopyEnter
-      | TaskScreenCmd::CopyLeave
-      | TaskScreenCmd::CopyMove { .. }
-      | TaskScreenCmd::CopyBeginSelection
-      | TaskScreenCmd::Scroll { .. }
-      | TaskScreenCmd::CopyYank => return,
-    };
-    self.with_screen(|screen, effects| screen.handle_cmd(cmd, effects));
-  }
-
-  /// Runs `f` on the console's own screen, then what it asked for.
-  fn with_screen(
-    &mut self,
-    f: impl FnOnce(&mut TaskScreen, &mut Vec<TaskScreenEffect>),
-  ) {
-    let attached = self.screen.has_observers();
-    f(&mut self.screen, &mut self.effects);
-    self.apply_screen(attached);
-  }
-
-  /// Copies `text` for whoever is attached.
-  pub(super) fn yank(&mut self, text: String) {
-    self.with_screen(|screen, effects| screen.yank(text, effects));
-  }
-
-  /// Applies what the screen asked for, and starts or stops watching task
-  /// screens when the first attachment arrives or the last one leaves.
-  fn apply_screen(&mut self, attached: bool) {
-    // The screen resizes the vt itself; nothing else applies to a UI.
-    self.effects.clear();
-    match (attached, self.screen.has_observers()) {
-      (false, true) => self.observe_all(),
-      (true, false) => self.unobserve_all(),
-      (false, false) | (true, true) => (),
     }
   }
 
-  fn handle_mouse(
-    &mut self,
-    observer: ObserverId,
-    mouse: crate::term::mouse::MouseEvent,
-  ) {
+  /// Copies `text` for the user.
+  pub(super) fn yank(&mut self, text: String) {
+    let _ = self.host.send(HostMsg::Copy(text));
+  }
+
+  fn handle_mouse(&mut self, mouse: MouseEvent) {
     let frame = self.frame();
     self.state.hover = Some((mouse.x as u16, mouse.y as u16));
     if let Some(modal) = &mut self.modal {
@@ -581,21 +436,16 @@ impl App {
         _ if outside => ModalResult::Keep,
         _ => modal.handle_mouse(&mouse),
       };
-      self.modal_result(Some(observer), result);
+      self.modal_result(result);
       return;
     }
     // What is dragged from the task list is dragged until let go,
     // wherever the pointer is; a press means the release was missed.
-    if self
-      .state
-      .drag
-      .as_ref()
-      .is_some_and(|drag| drag.observer == observer)
-    {
+    if self.state.drag.is_some() {
       if matches!(mouse.kind, MouseEventKind::Down(_)) {
         self.state.drag = None;
       } else {
-        self.sidebar_mouse(observer, &mouse);
+        self.sidebar_mouse(&mouse);
         return;
       }
     }
@@ -603,42 +453,36 @@ impl App {
     let (x, y) = (mouse.x as u16, mouse.y as u16);
     let term_area = layout.term_area();
     // A selection dragged out of the terminal keeps driving it from the
-    // nearest edge cell, so the kernel can scroll the view under it. The
-    // release has to reach the kernel too, or the drag never ends.
+    // nearest edge cell, so the runner can scroll the view under it. The
+    // release has to reach it too, or the drag never ends.
     let drag_outside =
       matches!(
         mouse.kind,
         MouseEventKind::Drag(MouseButton::Left)
           | MouseEventKind::Up(MouseButton::Left)
       ) && matches!(self.state.scope, Scope::Term | Scope::TermZoom)
-        && self.state.drag.is_none()
         && !term_area.contains(x, y)
         && term_area.width > 0
         && term_area.height > 0;
     if drag_outside {
-      if let Some(task) = self.state.current_task() {
-        let mut event = mouse;
-        event.x = x.clamp(term_area.x, term_area.right() - 1) as i32;
-        event.y = y.clamp(term_area.y, term_area.bottom() - 1) as i32;
-        let event = event.translate(term_area);
-        self.input_current(Some(task.id), TermEvent::Mouse(event));
-      }
+      let mut event = mouse;
+      event.x = x.clamp(term_area.x, term_area.right() - 1) as i32;
+      event.y = y.clamp(term_area.y, term_area.bottom() - 1) as i32;
+      let event = event.translate(term_area);
+      self.to_pane(PaneCtl::Input(TermEvent::Mouse(event)));
       return;
     }
     if layout.header.contains(x, y) {
       if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
         let hits = self.state.header;
         if hits.logo.is_some_and(|hit| hit.contains(x, y)) {
-          self.handle_action(Some(observer), Action::ShowMainMenu);
+          self.handle_action(Action::ShowMainMenu);
         } else if hits.reload.is_some_and(|hit| hit.contains(x, y)) {
-          self.handle_action(Some(observer), Action::ShowReload);
+          self.handle_action(Action::ShowReload);
         } else if hits.runner.is_some_and(|hit| hit.contains(x, y)) {
-          self.handle_action(
-            Some(observer),
-            Action::ShowRunnerSelect {
-              tab: RunnerTab::Switch,
-            },
-          );
+          self.handle_action(Action::ShowRunnerSelect {
+            tab: RunnerTab::Switch,
+          });
         }
       }
       return;
@@ -656,35 +500,29 @@ impl App {
     if mouse.kind == MouseEventKind::Down(MouseButton::Left)
       && self.state.unsaved_hit.is_some_and(|hit| hit.contains(x, y))
     {
-      self.handle_action(Some(observer), Action::ShowWriteBack);
+      self.handle_action(Action::ShowWriteBack);
       return;
     }
-    let term_area = layout.term_area();
     if term_area.contains(x, y) {
       if pressed && self.state.scope == Scope::Tasks {
         self.state.scope = Scope::Term;
       }
-      if let Some(task) = self.state.current_task() {
-        let event = mouse.translate(term_area);
-        self.input_current(Some(task.id), TermEvent::Mouse(event));
-      }
+      let event = mouse.translate(term_area);
+      self.to_pane(PaneCtl::Input(TermEvent::Mouse(event)));
     } else if layout.sidebar.contains(x, y) {
       if pressed && self.state.scope == Scope::Term {
         self.state.scope = Scope::Tasks;
       }
-      self.sidebar_mouse(observer, &mouse);
+      self.sidebar_mouse(&mouse);
     }
   }
 
-  fn handle_key(&mut self, observer: ObserverId, key: Key) {
+  fn handle_key(&mut self, key: Key) {
     match key.kind {
       KeyEventKind::Press | KeyEventKind::Repeat => (),
       KeyEventKind::Release => return,
     }
-    if let Some(drag) = &self.state.drag
-      && drag.observer == observer
-      && key.code == KeyCode::Esc
-    {
+    if self.state.drag.is_some() && key.code == KeyCode::Esc {
       // Esc lets go of what is dragged.
       self.state.drag = None;
       return;
@@ -692,7 +530,7 @@ impl App {
     if let Some(modal) = &mut self.modal {
       self.state.pending_keys.clear();
       let result = modal.handle_key(&key);
-      self.modal_result(Some(observer), result);
+      self.modal_result(result);
       return;
     }
     let mid_binding = !self.state.pending_keys.is_empty();
@@ -712,44 +550,46 @@ impl App {
           Action::SendLeader => Action::SendKey { key },
           action => action.clone(),
         };
-        self.handle_action(Some(observer), action)
+        self.handle_action(action)
       }
       // Unbound keys go to the process; in copy mode the keymap is the
       // whole vocabulary, so they are dropped rather than fed to the
       // screen's own copy-mode keys. So is a key that ends a binding
       // half typed, with what was typed of it.
       Lookup::None if group == KeymapGroup::Term && !mid_binding => {
-        self.handle_action(Some(observer), Action::SendKey { key });
+        self.handle_action(Action::SendKey { key });
       }
       Lookup::Prefix | Lookup::None => (),
     }
   }
 
-  /// Runs an action, retaining the attachment that originated it when it
-  /// came from terminal input. A quit from an attachment detaches only that
-  /// observer; an out-of-band quit action still addresses the runner.
-  fn handle_action(&mut self, observer: Option<ObserverId>, action: Action) {
-    let current = self.state.current_task().map(|t| t.id);
+  pub(super) fn handle_action(&mut self, action: Action) {
     match action {
       Action::Batch { cmds } => {
         for cmd in cmds {
-          self.handle_action(observer, cmd);
+          self.handle_action(cmd);
         }
       }
 
       Action::ShowQuit => self.open(Box::new(QuitModal::default())),
-      Action::Detach => {
-        if let Some(observer) = observer {
-          self.handle_screen_cmd(TaskScreenCmd::Detach { observer });
-        }
-      }
+      Action::Detach => self.exit(None),
       Action::Down | Action::Quit => {
         let command = match action {
           Action::Down => Command::Down,
           _ => Command::Quit,
         };
+        let Some(runner) = self.focused().map(|runner| runner.id) else {
+          return self.exit(None);
+        };
         self.state.quitting = true;
-        self.issue_with(command, |app| app.state.quitting = false);
+        // The runner goes, and the console with it.
+        self.issue_then(runner, command, |app, result| match result {
+          Ok(()) => app.exit(None),
+          Err(err) => {
+            app.state.quitting = false;
+            app.toast(err, true);
+          }
+        });
       }
       Action::Command { command } => self.issue(command),
 
@@ -767,7 +607,7 @@ impl App {
         let item =
           |label: &str, action: Action| MenuItem::new(label, action, keymap);
         let mut items = vec![item("All commands", Action::ShowCommandsMenu)];
-        if self.has_project() {
+        if self.all_runners {
           items.extend([
             item(
               "Open project",
@@ -781,6 +621,10 @@ impl App {
                 tab: RunnerTab::Switch,
               },
             ),
+          ]);
+        }
+        if self.has_project() {
+          items.extend([
             item("Reload the config…", Action::ShowReload).separated(),
             item("Write back to the config…", Action::ShowWriteBack),
           ]);
@@ -789,8 +633,8 @@ impl App {
         self.open(Box::new(MenuModal::new(anchor, items)));
       }
       Action::ShowRunnerSelect { tab } => {
-        if self.has_project() {
-          let runner = self.project.config().runner.clone();
+        if self.all_runners {
+          let runner = self.focused().and_then(|r| r.link.runner().cloned());
           self.spawn_modal(async move {
             // It reads the runners' records and a directory.
             let modal = tokio::task::spawn_blocking(move || {
@@ -801,14 +645,7 @@ impl App {
           });
         }
       }
-      Action::SwitchRunner { kind, root } => match observer {
-        Some(observer) => {
-          self
-            .screen
-            .notify(observer, ScreenNotify::Switch { kind, root });
-        }
-        None => log::warn!("switch-runner needs an attached client"),
-      },
+      Action::SwitchRunner { kind, root } => self.switch_runner(&kind, &root),
       Action::CloseCurrentModal => self.modal = None,
       Action::ToggleKeymapWindow => {
         self.state.hide_keymap_window = !self.state.hide_keymap_window;
@@ -848,12 +685,13 @@ impl App {
       Action::ForceRestartTask => {
         self.issue_selected(|target| Command::ForceRestart { target })
       }
-      Action::RestartAll => {
-        self.issue_all(|target| Command::Restart { target })
-      }
-      Action::ForceRestartAll => {
-        self.issue_all(|target| Command::ForceRestart { target })
-      }
+      // Every task of the runner in focus, not of every runner shown.
+      Action::RestartAll => self.issue(Command::Restart {
+        target: Target::glob("**"),
+      }),
+      Action::ForceRestartAll => self.issue(Command::ForceRestart {
+        target: Target::glob("**"),
+      }),
 
       Action::ShowAddTask => self.show_add_task(),
       Action::ShowEditTask => self.show_edit_task(Purpose::Edit),
@@ -871,25 +709,29 @@ impl App {
         }
       }
       Action::AddTask { cmd, name } => {
+        let Some(runner) = self.focused().map(|runner| runner.id) else {
+          return;
+        };
         let label =
-          self.unique_label(&name.unwrap_or_else(|| cmd.clone()), None);
-        let path = self.unique_path(&path_name(&label));
-        let argv = crate::parse_shell::typed_argv(
-          &cmd,
-          self.project.config().system_shell,
-        );
+          self.unique_label(runner, &name.unwrap_or_else(|| cmd.clone()), None);
+        let path = self.unique_path(runner, &path_name(&label));
+        let argv =
+          crate::parse_shell::typed_argv(&cmd, self.config.system_shell);
         match (path.parse::<Target>(), argv) {
           (Ok(target), Ok(argv)) => {
             let mut spec = TaskSpec::with_cmd(argv);
             spec.set_label(Some(&label));
-            self.issue(Command::Add {
-              target,
-              spec,
-              place: Default::default(),
-              start: true,
-              defaults: true,
-              origin: None,
-            })
+            self.issue_on(
+              runner,
+              Command::Add {
+                target,
+                spec,
+                place: Default::default(),
+                start: true,
+                defaults: true,
+                origin: None,
+              },
+            )
           }
           (_, Err(err)) => self.toast(format!("`{cmd}`: {err}"), true),
           (Err(err), Ok(_)) => log::warn!("Cannot add task '{path}': {err}"),
@@ -897,157 +739,149 @@ impl App {
       }
       Action::DuplicateTask => {
         if let Some(task) = self.state.current_task() {
-          let name = self.unique_label(&task.name(), None);
-          self.issue(Command::Duplicate {
-            target: Target::Id(task.id),
-            name: Some(name),
-            path: None,
-            start: true,
-          });
+          let (runner, remote) = (task.runner, task.remote);
+          let name = self.unique_label(runner, &task.name(), None);
+          self.issue_on(
+            runner,
+            Command::Duplicate {
+              target: Target::Id(remote),
+              name: Some(name),
+              path: None,
+              start: true,
+            },
+          );
         }
       }
       Action::RenameTask { name } => {
-        if let Some(id) = current {
-          let name = self.unique_label(&name, Some(id));
-          self.issue(Command::Rename {
-            target: Target::Id(id),
-            name,
-          });
+        if let Some(task) = self.state.current_task() {
+          let (runner, remote, id) = (task.runner, task.remote, task.id);
+          let name = self.unique_label(runner, &name, Some(id));
+          self.issue_on(
+            runner,
+            Command::Rename {
+              target: Target::Id(remote),
+              name,
+            },
+          );
         }
       }
       Action::ShowRemoveTask => self.show_remove(),
 
       Action::ScrollUp { n, unit } => {
-        self.send_current(
-          current,
-          TaskScreenCmd::Scroll {
-            delta: n.min(i32::MAX as usize) as i32,
-            unit: kernel_scroll_unit(unit),
-          },
-        );
+        self.screen_command(ScreenCommand::Scroll {
+          delta: n.min(i32::MAX as usize) as i32,
+          unit: wire_scroll_unit(unit),
+        });
       }
       Action::ScrollDown { n, unit } => {
-        self.send_current(
-          current,
-          TaskScreenCmd::Scroll {
-            delta: -(n.min(i32::MAX as usize) as i32),
-            unit: kernel_scroll_unit(unit),
-          },
-        );
+        self.screen_command(ScreenCommand::Scroll {
+          delta: -(n.min(i32::MAX as usize) as i32),
+          unit: wire_scroll_unit(unit),
+        });
       }
       Action::CopyModeEnter => {
-        if current.is_some() {
+        if self.state.current_task().is_some() {
           self.state.scope = Scope::Term;
         }
-        self.send_current(current, TaskScreenCmd::CopyEnter);
+        self.screen_command(ScreenCommand::CopyEnter);
       }
-      Action::CopyModeLeave => {
-        self.send_current(current, TaskScreenCmd::CopyLeave)
+      Action::CopyModeLeave => self.screen_command(ScreenCommand::CopyLeave),
+      Action::CopyModeMove { dir } => {
+        self.screen_command(ScreenCommand::CopyMove {
+          dir: wire_copy_move(dir),
+        })
       }
-      Action::CopyModeMove { dir } => self.send_current(
-        current,
-        TaskScreenCmd::CopyMove {
-          dir: kernel_copy_move(dir),
-        },
-      ),
-      Action::CopyModeEnd => {
-        self.send_current(current, TaskScreenCmd::CopyBeginSelection)
-      }
-      Action::CopyModeCopy => {
-        self.send_current(current, TaskScreenCmd::CopyYank)
-      }
+      Action::CopyModeEnd => self.screen_command(ScreenCommand::CopySelect),
+      Action::CopyModeCopy => self.screen_command(ScreenCommand::CopyYank),
       Action::SendKey { key } => {
-        self.input_current(current, TermEvent::Key(key))
+        self.to_pane(PaneCtl::Input(TermEvent::Key(key)))
       }
       // Only a key press has a key to send, and `handle_key` sends it.
       Action::SendLeader => (),
     }
   }
 
-  /// Whether the console is a runner's, with a project to switch from,
-  /// reload, and write back to; `dekit mprocs` has none.
+  /// Whether a runner shown has a project to reload and write back to;
+  /// `dekit mprocs` has none.
   fn has_project(&self) -> bool {
-    self.project.config().runner.is_some()
+    self
+      .runners
+      .iter()
+      .any(|runner| runner.link.runner().is_some())
   }
 
-  /// `unique`, a path taken while a task is there or under it.
-  fn unique_path(&self, base: &str) -> String {
+  /// `unique`, among a runner's paths: one taken while a task is there
+  /// or under it.
+  fn unique_path(&self, runner: RunnerId, base: &str) -> String {
+    let paths = self.remote_paths(runner);
     unique(base, |path| {
-      self
-        .state
-        .tasks
+      paths
         .iter()
-        .any(|t| overlaps(t.path.as_str(), path))
+        .any(|taken| crate::kernel::task_path::overlaps(taken, path))
     })
   }
 
-  fn unique_label(&self, base: &str, exclude: Option<TaskId>) -> String {
+  fn unique_label(
+    &self,
+    runner: RunnerId,
+    base: &str,
+    exclude: Option<TaskId>,
+  ) -> String {
     unique(base, |name| {
-      self
-        .state
-        .tasks
-        .iter()
-        .any(|t| Some(t.id) != exclude && t.name() == name)
+      self.state.tasks.iter().any(|t| {
+        t.runner == runner && Some(t.id) != exclude && t.name() == name
+      })
     })
   }
 
-  fn send_current(&self, current: Option<TaskId>, cmd: TaskScreenCmd) {
-    if let Some(id) = current {
-      self.pc.send_msg(id, cmd);
+  fn screen_command(&self, command: ScreenCommand) {
+    self.to_pane(PaneCtl::Screen(command));
+  }
+
+  /// To the selected task's screen, when it is shown.
+  fn to_pane(&self, ctl: PaneCtl) {
+    if let Some((id, _, pane)) = &self.pane
+      && self.shown_task() == Some(*id)
+    {
+      pane.send(ctl);
     }
   }
 
-  fn input_current(&self, current: Option<TaskId>, event: TermEvent) {
-    self.send_current(
-      current,
-      TaskScreenCmd::Input {
-        observer: self.observer,
-        event,
-      },
-    );
-  }
-
-  /// Runs a command on the selected task or every task in the selected group.
+  /// Runs a command on the selected task or every task in the selected
+  /// group.
   fn issue_selected(&self, make: fn(Target) -> Command) {
-    let target = match self.state.tasks.selected() {
-      Some((_, Node::Task(task))) => Target::Id(task.id),
-      Some((path, Node::Group(_))) => Target::glob(&format!("{path}/**")),
-      None => return,
+    if let Some((runner, target)) = self.selected_target() {
+      self.issue_on(runner, make(target));
+    }
+  }
+
+  fn pane_event(&mut self, number: u64, event: PaneEvent) {
+    let Some((id, current, pane)) = &mut self.pane else {
+      return;
     };
-    self.issue(make(target));
-  }
-
-  fn issue_all(&self, make: fn(Target) -> Command) {
-    let commands = self
-      .state
-      .tasks
-      .iter()
-      .map(|t| make(Target::Id(t.id)))
-      .collect();
-    self.issue(Command::Batch { commands });
-  }
-
-  fn handle_screen_notify(&mut self, notify: ScreenNotify) {
-    match notify {
+    if *current != number {
+      return;
+    }
+    let id = *id;
+    match event {
       // Only the shown task's screen is part of the picture.
-      ScreenNotify::Render { screen } => {
-        if self.shown_task() == Some(screen) {
-          self.dirty = true;
-        }
+      PaneEvent::Render => self.dirty = true,
+      PaneEvent::State(state) => {
+        pane.state = state;
+        self.state.copy = pane.state.copy;
+        self.dirty = true;
       }
-      ScreenNotify::Attached => self.dirty = true,
-      // Addressed to attach sessions, never to a screen's observer.
-      ScreenNotify::Bell
-      | ScreenNotify::Switch { .. }
-      | ScreenNotify::Detached => (),
-      ScreenNotify::CopyPresent { screen, handle } => {
-        if let Some(task) = self.state.tasks.task_mut(screen) {
-          task.present = handle;
-          self.dirty = true;
+      PaneEvent::Copy(text) => self.yank(text),
+      PaneEvent::Ended(why) => {
+        self.pane = None;
+        self.state.copy = false;
+        if let Some(why) = why {
+          // Not tried again for as long as it stays selected.
+          self.pane_failed = Some(id);
+          log::debug!("the pane closed: {why}");
         }
+        self.dirty = true;
       }
-      // Copied on behalf of whoever is attached here.
-      ScreenNotify::Yank { text } => self.yank(text),
     }
   }
 
@@ -1059,37 +893,73 @@ impl App {
     }
   }
 
-  fn handle_task_notify(&mut self, id: TaskId, notify: TaskNotify) {
-    // What the config is compared with: the tasks, not their states.
-    self.status_dirty |= !matches!(notify, TaskNotify::StateChanged(_));
-    match notify {
-      TaskNotify::Added {
-        path,
-        label,
-        after,
-        kind,
-        state,
-        vt,
-      } => self.add_task(id, label, path, after, kind, state, vt),
-      TaskNotify::FolderAdded {
-        path,
-        after,
-        collapsed,
-      } => self.state.tasks.add_folder(id, path, after, collapsed),
-      TaskNotify::StateChanged(state) => self.state.tasks.set_status(id, state),
-      TaskNotify::Removed => self.state.tasks.remove(id),
-      TaskNotify::Changed { label, kind } => {
-        if let Some(task) = self.state.tasks.task_mut(id) {
-          task.label = label;
-          task.kind = kind;
-        }
-      }
-      TaskNotify::Moved { path, after } => {
-        if let Some(path) = path {
-          self.state.tasks.move_task(id, path, after);
-        }
-      }
+  fn shown_frame(&self) -> Option<Arc<crate::term::Frame>> {
+    let (id, _, pane) = self.pane.as_ref()?;
+    (self.shown_task() == Some(*id)).then(|| pane.handle.load())
+  }
+
+  /// Attaches to the selected task's screen once it is selected, and
+  /// keeps it the size of the pane.
+  fn sync_pane(&mut self) {
+    let shown = self.shown_task();
+    if self.pane_failed.is_some() && self.pane_failed != shown {
+      self.pane_failed = None;
     }
+    let geometry = self.pane_geometry();
+    match &mut self.pane {
+      Some((id, _, pane)) if Some(*id) == shown => {
+        let size = geometry.size;
+        if (pane.state.width, pane.state.height) != (size.width, size.height)
+          && pane.asked != Some(geometry)
+        {
+          pane.asked = Some(geometry);
+          pane.send(PaneCtl::Input(TermEvent::Resize(geometry)));
+        }
+        return;
+      }
+      _ => (),
+    }
+    self.pane = None;
+    self.state.copy = false;
+    let Some(task) = shown.and_then(|id| self.state.tasks.task(id)) else {
+      return;
+    };
+    if self.pane_failed == shown
+      || geometry.size.width == 0
+      || geometry.size.height == 0
+    {
+      return;
+    }
+    let (id, remote) = (task.id, task.remote);
+    let Some(link) = self.runner(task.runner).map(|r| r.link.clone()) else {
+      return;
+    };
+    self.panes += 1;
+    let number = self.panes;
+    let tx = self.tx.clone();
+    let mut pane =
+      Pane::open(&link, remote, geometry, self.caps, move |event| {
+        let _ = tx.send(AppMsg::Pane(number, event));
+      });
+    pane.asked = Some(geometry);
+    self.pane = Some((id, number, pane));
+  }
+}
+
+fn wire_copy_move(dir: CopyMove) -> wire_screen::CopyMove {
+  match dir {
+    CopyMove::Up => wire_screen::CopyMove::Up,
+    CopyMove::Down => wire_screen::CopyMove::Down,
+    CopyMove::Left => wire_screen::CopyMove::Left,
+    CopyMove::Right => wire_screen::CopyMove::Right,
+  }
+}
+
+fn wire_scroll_unit(unit: ScrollUnit) -> wire_screen::ScrollUnit {
+  match unit {
+    ScrollUnit::Line => wire_screen::ScrollUnit::Line,
+    ScrollUnit::HalfScreen => wire_screen::ScrollUnit::HalfScreen,
+    ScrollUnit::Screen => wire_screen::ScrollUnit::Screen,
   }
 }
 
@@ -1099,16 +969,6 @@ async fn sleep_until(at: Option<Instant>) {
     Some(at) => tokio::time::sleep_until(at.into()).await,
     None => std::future::pending().await,
   }
-}
-
-/// Waits for the config's files to change, or for ever without a watch.
-async fn changed(changes: &mut Option<tokio::sync::watch::Receiver<u64>>) {
-  if let Some(changes) = changes
-    && changes.changed().await.is_ok()
-  {
-    return;
-  }
-  std::future::pending().await
 }
 
 /// Dims everything but `keep`.
@@ -1142,5 +1002,13 @@ fn shade(grid: &mut Grid, theme: &BlockTheme, keep: Option<Rect>) {
     if band.width > 0 && band.height > 0 {
       grid.map_styles(band, dim);
     }
+  }
+}
+
+/// A path in the list, as a `TaskPath`.
+fn list_path(name: &str, remote: &str) -> Option<TaskPath> {
+  match name.is_empty() {
+    true => TaskPath::new(remote).ok(),
+    false => TaskPath::new(format!("{name}/{remote}")).ok(),
   }
 }

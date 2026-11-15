@@ -193,8 +193,11 @@ pub enum KernelCommand {
 
   Query(KernelQuery),
 
-  SubscribePath(TaskKey, SubMode),
-  UnsubscribePath(TaskKey, SubMode),
+  /// What changes in the list at `key`, with `mode`, comes on the
+  /// channel, under the id it was given, each with the task as it is in
+  /// that step. The tasks there already come first,
+  /// then `Heard::Caught`. Dropping the receiver ends it.
+  Listen(TaskId, TaskKey, SubMode, UnboundedSender<Heard>),
   /// Sends the tasks the selectors match at once, and again whenever
   /// that changes: a task joins or leaves, is renamed, or becomes active
   /// or idle. Dropping the receiver ends it.
@@ -300,6 +303,22 @@ pub struct WaitRequest {
   pub on: WaitOn,
   pub cond: WaitCond,
   pub events: UnboundedSender<WaitEvent>,
+}
+
+/// What a `Listen` hears.
+#[derive(Clone, Debug)]
+pub enum Heard {
+  /// What a subscriber is told of a task or folder, with the task as it
+  /// is once it happened (none for a folder or one removed) and what is
+  /// listed right before it then.
+  Notify {
+    from: TaskId,
+    notify: super::task::TaskNotify,
+    now: Option<Box<TaskDescription>>,
+    after: Option<TaskId>,
+  },
+  /// The tasks and folders there when the listen began have been told.
+  Caught,
 }
 
 /// A task of a watched set (`WatchSet`).
@@ -737,10 +756,6 @@ impl TaskContext {
     ack_rx
   }
 
-  pub fn subscribe_path(&self, key: TaskKey, mode: SubMode) {
-    self.send(KernelCommand::SubscribePath(key, mode));
-  }
-
   /// The tasks `selectors` match, each once and in list order, now and
   /// after each change (`KernelCommand::WatchSet`).
   pub fn watch_set(
@@ -768,8 +783,15 @@ impl TaskContext {
     rx
   }
 
-  pub fn unsubscribe_path(&self, key: TaskKey, mode: SubMode) {
-    self.send(KernelCommand::UnsubscribePath(key, mode));
+  /// Hears what changes in the list at `key` (`KernelCommand::Listen`).
+  pub fn listen(
+    &self,
+    key: TaskKey,
+    mode: SubMode,
+  ) -> tokio::sync::mpsc::UnboundedReceiver<Heard> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    self.send(KernelCommand::Listen(self.alloc_id(), key, mode, tx));
+    rx
   }
 
   /// Asks now, in order with what was sent before; the answer is empty

@@ -7,9 +7,67 @@ use tokio::sync::mpsc::{
 use super::*;
 use crate::kernel::kernel_message::{
   Ack, FolderDef, FolderSettings, KernelSnapshot, Place, Registration,
+  TaskRegistration,
 };
 use crate::kernel::task::{ReadyMode, RestartMode, StateReason};
 use crate::upgrade::snapshot::TaskKind as TaskKindSnapshot;
+
+/// Records commands like `RecordingTask`; reports success the moment
+/// any message arrives.
+struct ExitOnNotify {
+  name: &'static str,
+  tx: UnboundedSender<(&'static str, RecordedCmd)>,
+}
+
+impl Task for ExitOnNotify {
+  fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
+    match cmd {
+      TaskCmd::Start(_) => {
+        self.tx.send((self.name, RecordedCmd::Start)).unwrap();
+        fx.started();
+      }
+      TaskCmd::Stop => {
+        self.tx.send((self.name, RecordedCmd::Stop)).unwrap();
+        fx.stopped(ExitInfo::code(1));
+      }
+      TaskCmd::Kill => {
+        self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
+        fx.stopped(ExitInfo::signal(9));
+      }
+      // Never frozen by these tests.
+      TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
+      TaskCmd::Msg(_) => fx.stopped(ExitInfo::code(0)),
+    }
+  }
+}
+
+/// What a listen at `path` hears of each task and folder: who it is
+/// from and what it was told, the ones there already first.
+fn notices_at(
+  pc: &TaskContext,
+  path: TaskPath,
+  mode: SubMode,
+) -> UnboundedReceiver<(TaskId, TaskNotify)> {
+  let mut heard = pc.listen(TaskKey::default_space(path), mode);
+  let (tx, rx) = unbounded_channel();
+  tokio::spawn(async move {
+    while let Some(heard) = heard.recv().await {
+      if let crate::kernel::kernel_message::Heard::Notify {
+        from, notify, ..
+      } = heard
+        && tx.send((from, notify)).is_err()
+      {
+        break;
+      }
+    }
+  });
+  rx
+}
+
+/// `notices_at` for the whole default space.
+fn notices(pc: &TaskContext) -> UnboundedReceiver<(TaskId, TaskNotify)> {
+  notices_at(pc, TaskPath::root(), SubMode::Subtree)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum RecordedCmd {
@@ -61,35 +119,6 @@ impl Task for RecordingTask {
         },
         Err(_) => (),
       },
-    }
-  }
-}
-
-/// Records commands like `RecordingTask`; reports success the moment
-/// any message arrives.
-struct ExitOnNotify {
-  name: &'static str,
-  tx: UnboundedSender<(&'static str, RecordedCmd)>,
-}
-
-impl Task for ExitOnNotify {
-  fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
-    match cmd {
-      TaskCmd::Start(_) => {
-        self.tx.send((self.name, RecordedCmd::Start)).unwrap();
-        fx.started();
-      }
-      TaskCmd::Stop => {
-        self.tx.send((self.name, RecordedCmd::Stop)).unwrap();
-        fx.stopped(ExitInfo::code(1));
-      }
-      TaskCmd::Kill => {
-        self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
-        fx.stopped(ExitInfo::signal(9));
-      }
-      // Never frozen by these tests.
-      TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
-      TaskCmd::Msg(_) => fx.stopped(ExitInfo::code(0)),
     }
   }
 }
@@ -1031,39 +1060,14 @@ async fn lists_a_batch_in_the_order_given() {
   let pc = fx.pc.clone();
 
   let (tx, mut added) = unbounded_channel();
-  let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
-  let ack = pc.spawn_async_with_id(
-    pc.alloc_id(),
-    TaskDef::default(),
-    move |pc, mut cmds| async move {
-      pc.subscribe_path(
-        TaskKey::default_space(TaskPath::root()),
-        SubMode::Subtree,
-      );
-      subscribed_tx.send(()).unwrap();
-      while let Some(cmd) = cmds.recv().await {
-        match cmd {
-          TaskCmd::Freeze(number) => pc.send(KernelCommand::TaskFrozen(
-            number,
-            TaskKindSnapshot::Console {
-              groups: Default::default(),
-            },
-          )),
-          TaskCmd::Msg(msg) => {
-            if let Ok(n) = msg.downcast::<TaskNotification>()
-              && let TaskNotify::Added { after, .. } = n.notify
-            {
-              tx.send((n.from, after)).unwrap();
-            }
-          }
-          TaskCmd::Start(_) | TaskCmd::Stop | TaskCmd::Kill | TaskCmd::Thaw => {
-          }
-        }
+  let mut heard = notices(&pc);
+  tokio::spawn(async move {
+    while let Some((from, notify)) = heard.recv().await {
+      if let TaskNotify::Added { after, .. } = notify {
+        let _ = tx.send((from, after));
       }
-    },
-  );
-  assert!(ack.await.unwrap().is_ok());
-  subscribed_rx.await.unwrap();
+    }
+  });
 
   let registration = |id: TaskId, def: TaskDef| {
     let tx = fx.tx.clone();
@@ -1682,47 +1686,60 @@ async fn start_during_stop_grace_survives_give_up() {
     .unwrap();
 }
 
-/// A job that reports success in the same step where the reconciler
-/// would stop it must land in Done, not be treated as merely stopped.
+/// A job's success queued in the step where the reconciler would stop it
+/// lands it in Done, never stopped: a step applies its effects before it
+/// drives anything.
 #[tokio::test]
 async fn job_success_beats_stop_decided_in_same_step() {
-  let mut fx = Fixture::new();
-  let d = fx.add("d", path_def("d"));
-  let tx = fx.tx.clone();
-  let j = fx.kernel.as_mut().unwrap().register_task(
+  let mut kernel = Kernel::new();
+  let (tx, mut rx) = unbounded_channel();
+  let recording = |name: &'static str| {
+    let tx = tx.clone();
+    move |ctx| -> Box<dyn Task> { Box::new(RecordingTask { name, tx, ctx }) }
+  };
+  let d = kernel.register_task(path_def("d"), recording("d"));
+  let j = kernel.register_task(
     TaskDef {
       kind: TaskKind::Job,
       deps: vec![TaskSelector::Id(d)],
       ..path_def("j")
     },
-    move |ctx| {
-      ctx.subscribe_path(
-        TaskKey::default_space(TaskPath::new("d").unwrap()),
-        SubMode::Subtree,
-      );
-      Box::new(ExitOnNotify { name: "j", tx })
-    },
+    recording("j"),
   );
-  let handle = fx.run();
+  let step = |kernel: &mut Kernel, command| {
+    kernel.dispatch(KernelMessage {
+      from: INIT_TASK_ID,
+      command,
+    });
+    kernel.graph.settle();
+  };
+  step(
+    &mut kernel,
+    KernelCommand::Act(Verb::Start, TaskSelector::Id(j), None),
+  );
+  assert_eq!(rx.try_recv().unwrap(), ("d", RecordedCmd::Start));
+  assert_eq!(rx.try_recv().unwrap(), ("j", RecordedCmd::Start));
 
-  fx.pc
-    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(j), None));
-  assert_eq!(fx.recv().await, ("d", RecordedCmd::Start));
-  assert_eq!(fx.recv().await, ("j", RecordedCmd::Start));
-  fx.flush().await;
-
-  // Stopping the dep breaks j's support in the same step in which j's
-  // success report is queued (j exits when it hears the dep stopping).
-  // The success must win: j is Done, never commanded to stop.
-  fx.pc
-    .send(KernelCommand::Act(Verb::Stop, TaskSelector::Id(d), None));
-  assert_eq!(fx.recv().await, ("d", RecordedCmd::Stop));
+  // j's success is in the step that stops its dep, which breaks j's
+  // support: the success must win, and j is never told to stop.
+  kernel
+    .graph
+    .pending_effects
+    .push_back((j, TaskEffect::Stopped(ExitInfo::code(0))));
+  step(
+    &mut kernel,
+    KernelCommand::Act(Verb::Stop, TaskSelector::Id(d), None),
+  );
+  assert_eq!(rx.try_recv().unwrap(), ("d", RecordedCmd::Stop));
+  let told: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+  assert!(
+    !told.iter().any(|(name, _)| *name == "j"),
+    "j was told {told:?}"
+  );
   assert_eq!(
-    state_of(&fx.pc, j).await,
+    kernel.graph.tasks.get(&j).map(|task| task.state),
     Some(TaskState::Done(ExitInfo::code(0)))
   );
-
-  fx.quit(handle).await;
 }
 
 #[tokio::test]
@@ -2268,7 +2285,7 @@ async fn a_set_watch_follows_its_selectors() {
 }
 
 #[tokio::test]
-async fn subscribe_replays_existing_tasks() {
+async fn listen_replays_existing_tasks() {
   let kernel = Kernel::new();
   let pc = kernel.context();
   let a = pc.register(
@@ -2285,48 +2302,20 @@ async fn subscribe_replays_existing_tasks() {
   );
   let handle = tokio::spawn(kernel.run());
 
-  let (tx, mut rx) = unbounded_channel();
-  let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
-  let listener = pc.alloc_id();
-  let ack = pc.spawn_async_with_id(
-    listener,
-    TaskDef::default(),
-    move |pc, mut cmds| async move {
-      pc.subscribe_path(
-        TaskKey::default_space(TaskPath::new("b").unwrap()),
-        SubMode::Subtree,
-      );
-      pc.subscribe_path(
-        TaskKey::default_space(TaskPath::new("b/c").unwrap()),
-        SubMode::Exact,
-      );
-      pc.subscribe_path(
-        TaskKey::default_space(TaskPath::new("b").unwrap()),
-        SubMode::Subtree,
-      );
-      subscribed_tx.send(()).unwrap();
-      while let Some(cmd) = cmds.recv().await {
-        if let TaskCmd::Msg(msg) = cmd
-          && let Ok(n) = msg.downcast::<TaskNotification>()
-          && let TaskNotify::Added { path, .. } = n.notify
-        {
-          tx.send((n.from, path)).unwrap();
-        }
-      }
-    },
-  );
-  assert!(ack.await.unwrap().is_ok());
-  subscribed_rx.await.unwrap();
+  let mut rx = notices_at(&pc, TaskPath::new("b").unwrap(), SubMode::Subtree);
   pc.list_tasks(TaskSelector::all()).await;
 
   let mut replayed = HashSet::new();
   for _ in 0..2 {
-    replayed.insert(
+    let (from, notify) =
       tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .unwrap()
-        .unwrap(),
-    );
+        .unwrap();
+    let TaskNotify::Added { path, .. } = notify else {
+      panic!("expected a task added");
+    };
+    replayed.insert((from, path));
   }
   assert_eq!(
     replayed,
@@ -2336,10 +2325,7 @@ async fn subscribe_replays_existing_tasks() {
     ])
   );
   assert!(!replayed.iter().any(|(from, _)| *from == a));
-  assert!(
-    rx.try_recv().is_err(),
-    "overlapping and duplicate subscriptions must not replay tasks again"
-  );
+  assert!(rx.try_recv().is_err(), "each task is replayed once");
 
   pc.send(KernelCommand::Quit);
   handle.await.unwrap();
@@ -3930,28 +3916,14 @@ async fn move_relists_a_group_and_notifies_in_order() {
   let handle = fx.run();
   let pc = fx.pc.clone();
   let (tx, mut moved) = unbounded_channel();
-  let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
-  let ack = pc.spawn_async_with_id(
-    pc.alloc_id(),
-    TaskDef::default(),
-    move |pc, mut cmds| async move {
-      pc.subscribe_path(
-        TaskKey::default_space(TaskPath::root()),
-        SubMode::Subtree,
-      );
-      subscribed_tx.send(()).unwrap();
-      while let Some(cmd) = cmds.recv().await {
-        if let TaskCmd::Msg(msg) = cmd
-          && let Ok(n) = msg.downcast::<TaskNotification>()
-          && let TaskNotify::Moved { path, after } = n.notify
-        {
-          tx.send((n.from, path.unwrap().to_string(), after)).unwrap();
-        }
+  let mut heard = notices(&pc);
+  tokio::spawn(async move {
+    while let Some((from, notify)) = heard.recv().await {
+      if let TaskNotify::Moved { path, after } = notify {
+        let _ = tx.send((from, path.unwrap().to_string(), after));
       }
-    },
-  );
-  assert!(ack.await.unwrap().is_ok());
-  subscribed_rx.await.unwrap();
+    }
+  });
   let mut ids = Vec::new();
   for path in ["db", "web/api", "web/ui"] {
     let id = pc.alloc_id();
@@ -4061,31 +4033,16 @@ async fn a_new_origin_is_told() {
   let handle = fx.run();
   let pc = fx.pc.clone();
   let (tx, mut told) = unbounded_channel();
-  let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
-  let ack = pc.spawn_async_with_id(
-    pc.alloc_id(),
-    TaskDef::default(),
-    move |pc, mut cmds| async move {
-      pc.subscribe_path(
-        TaskKey::default_space(TaskPath::root()),
-        SubMode::Subtree,
-      );
-      subscribed_tx.send(()).unwrap();
-      while let Some(cmd) = cmds.recv().await {
-        if let TaskCmd::Msg(msg) = cmd
-          && let Ok(n) = msg.downcast::<TaskNotification>()
-        {
-          match n.notify {
-            TaskNotify::Changed { .. } => tx.send("changed").unwrap(),
-            TaskNotify::Removed => tx.send("removed").unwrap(),
-            _ => (),
-          }
-        }
-      }
-    },
-  );
-  assert!(ack.await.unwrap().is_ok());
-  subscribed_rx.await.unwrap();
+  let mut heard = notices(&pc);
+  tokio::spawn(async move {
+    while let Some((_, notify)) = heard.recv().await {
+      let _ = match notify {
+        TaskNotify::Changed { .. } => tx.send("changed"),
+        TaskNotify::Removed => tx.send("removed"),
+        _ => Ok(()),
+      };
+    }
+  });
   let id = pc.alloc_id();
   let ack = pc.register_task(TaskRegistration {
     task_id: id,
@@ -4129,56 +4086,31 @@ enum Heard {
   Moved(TaskId, String, Option<TaskId>),
 }
 
-/// A task subscribed to the default space, and what it hears.
+/// What a listen on the default space hears of the list.
 async fn listen(pc: &TaskContext) -> UnboundedReceiver<Heard> {
   let (tx, rx) = unbounded_channel();
-  let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
-  let ack = pc.spawn_async_with_id(
-    pc.alloc_id(),
-    TaskDef::default(),
-    move |pc, mut cmds| async move {
-      pc.subscribe_path(
-        TaskKey::default_space(TaskPath::root()),
-        SubMode::Subtree,
-      );
-      subscribed_tx.send(()).unwrap();
-      while let Some(cmd) = cmds.recv().await {
-        let msg = match cmd {
-          TaskCmd::Msg(msg) => msg,
-          TaskCmd::Freeze(number) => {
-            let kind = TaskKindSnapshot::Console {
-              groups: Default::default(),
-            };
-            pc.send(KernelCommand::TaskFrozen(number, kind));
-            continue;
-          }
-          TaskCmd::Start(_) | TaskCmd::Stop | TaskCmd::Kill | TaskCmd::Thaw => {
-            continue;
-          }
-        };
-        let Ok(n) = msg.downcast::<TaskNotification>() else {
-          continue;
-        };
-        let heard = match n.notify {
-          TaskNotify::Added { after, .. } => Heard::Task(n.from, after),
-          TaskNotify::FolderAdded {
-            path,
-            after,
-            collapsed,
-          } => Heard::Folder(n.from, path.to_string(), after, collapsed),
-          TaskNotify::Removed => Heard::Removed(n.from),
-          TaskNotify::Moved { path, after } => {
-            let path = path.map_or(String::new(), |p| p.to_string());
-            Heard::Moved(n.from, path, after)
-          }
-          TaskNotify::StateChanged(_) | TaskNotify::Changed { .. } => continue,
-        };
-        tx.send(heard).unwrap();
+  let mut heard = notices(pc);
+  tokio::spawn(async move {
+    while let Some((from, notify)) = heard.recv().await {
+      let heard = match notify {
+        TaskNotify::Added { after, .. } => Heard::Task(from, after),
+        TaskNotify::FolderAdded {
+          path,
+          after,
+          collapsed,
+        } => Heard::Folder(from, path.to_string(), after, collapsed),
+        TaskNotify::Removed => Heard::Removed(from),
+        TaskNotify::Moved { path, after } => {
+          let path = path.map_or(String::new(), |p| p.to_string());
+          Heard::Moved(from, path, after)
+        }
+        TaskNotify::StateChanged(_) | TaskNotify::Changed { .. } => continue,
+      };
+      if tx.send(heard).is_err() {
+        break;
       }
-    },
-  );
-  assert!(ack.await.unwrap().is_ok());
-  subscribed_rx.await.unwrap();
+    }
+  });
   rx
 }
 
@@ -5088,5 +5020,108 @@ async fn ready_wait_fails_when_an_edit_leaves_it_behind_a_failed_dep() {
   assert_eq!(tasks[0].blocked_by.as_deref(), Some("seed"));
   assert!(tasks[0].why.is_some(), "the verdict says why");
 
+  fx.quit(handle).await;
+}
+
+/// A listener no one hears any more is dropped when the next one comes,
+/// even on a path where nothing happens.
+#[tokio::test]
+async fn a_new_listen_drops_the_ones_no_one_hears() {
+  let mut kernel = Kernel::new();
+  let listen = |kernel: &mut Kernel, id: usize| {
+    let (tx, rx) = unbounded_channel();
+    kernel.dispatch(KernelMessage {
+      from: INIT_TASK_ID,
+      command: KernelCommand::Listen(
+        TaskId(id),
+        TaskKey::default_space(TaskPath::new("quiet").unwrap()),
+        SubMode::Subtree,
+        tx,
+      ),
+    });
+    rx
+  };
+  drop(listen(&mut kernel, 100));
+  assert_eq!(kernel.graph.listeners.len(), 1);
+  let _heard = listen(&mut kernel, 101);
+  assert_eq!(
+    kernel.graph.listeners.keys().copied().collect::<Vec<_>>(),
+    [TaskId(101)]
+  );
+}
+
+/// A listen hears the tasks there, in list order, then that it has, then
+/// each change with the task as it is then, from the step it happened
+/// in; a removal has none.
+#[tokio::test]
+async fn a_listen_is_told_the_list_then_its_changes() {
+  use crate::kernel::kernel_message::Heard as Listened;
+
+  let mut fx = Fixture::new();
+  let db = fx.add("db", path_def("db"));
+  let web = fx.add("web", path_def("web/ui"));
+  let handle = fx.run();
+  let mut heard = fx
+    .pc
+    .listen(TaskKey::default_space(TaskPath::root()), SubMode::Subtree);
+  let mut next = async || {
+    tokio::time::timeout(Duration::from_secs(1), heard.recv())
+      .await
+      .expect("heard in time")
+      .expect("still listening")
+  };
+  let added = |heard: Listened| match heard {
+    Listened::Notify {
+      from,
+      notify: TaskNotify::Added { after, .. },
+      now: Some(now),
+      after: listed,
+    } => {
+      // Where it is listed, as the notice itself says.
+      assert_eq!(after, listed);
+      (from, after, now.info.path.unwrap().to_string())
+    }
+    heard => panic!("expected a task added, heard {heard:?}"),
+  };
+  assert_eq!(added(next().await), (db, None, "db".to_string()));
+  assert_eq!(added(next().await), (web, Some(db), "web/ui".to_string()));
+  assert!(matches!(next().await, Listened::Caught));
+
+  fx.pc
+    .send(KernelCommand::Act(Verb::Start, TaskSelector::Id(db), None));
+  assert_eq!(fx.recv().await, ("db", RecordedCmd::Start));
+  match next().await {
+    Listened::Notify {
+      from,
+      notify: TaskNotify::StateChanged(state),
+      now: Some(now),
+      after,
+    } => {
+      assert_eq!(from, db);
+      assert_eq!(now.info.state, state);
+      // A change says where the task is listed too.
+      assert_eq!(after, None);
+    }
+    heard => panic!("expected a state change, heard {heard:?}"),
+  }
+
+  fx.pc
+    .send(KernelCommand::Remove(TaskSelector::Id(web), None));
+  loop {
+    match next().await {
+      Listened::Notify {
+        from,
+        notify: TaskNotify::Removed,
+        now,
+        ..
+      } => {
+        assert_eq!(from, web);
+        assert!(now.is_none());
+        break;
+      }
+      Listened::Notify { .. } => continue,
+      Listened::Caught => panic!("caught twice"),
+    }
+  }
   fx.quit(handle).await;
 }

@@ -78,17 +78,6 @@ pub enum WriteKind {
   Removed,
 }
 
-/// How to write a plan back.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum How {
-  /// Edit the files here.
-  Write,
-  /// Run the agent with a prompt.
-  Agent,
-  /// Copy the prompt.
-  Copy,
-}
-
 impl WritePlan {
   pub fn chosen(&self) -> impl Iterator<Item = &WriteItem> {
     self.items.iter().filter(|item| item.apply)

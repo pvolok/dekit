@@ -72,8 +72,9 @@ list comes to.
   desc: A project root, or `dir/*` for every dir in `dir`.
 :::
 
-In the console, `<P>` lists the current runner, then the projects, then
-the other running runners.
+In the console, `<P>` lists the runner in focus, then the projects, then
+the other running runners. Picking one that runs selects its group in the
+task list; one that does not run is started, and added to it.
 
 ## Agent
 

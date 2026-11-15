@@ -288,11 +288,6 @@ impl RestartMode {
   }
 }
 
-pub struct TaskNotification {
-  pub from: TaskId,
-  pub notify: TaskNotify,
-}
-
 #[derive(Clone)]
 pub enum TaskNotify {
   Added {

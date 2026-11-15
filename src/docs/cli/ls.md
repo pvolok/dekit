@@ -6,8 +6,7 @@ related: [cli/why, cli/reload, start/targets]
 ---
 
 Lists tasks with their state, one per line; with no target, every task in
-the default space. `ls '@*/**'` also shows the runner's own tasks, such as
-`@dekit/console`. A task that has ended shows how, as in `exited (code 1)`,
+the default space; `ls '@*/**'` lists every space. A task that has ended shows how, as in `exited (code 1)`,
 `backoff (signal 9)`, or `exited (not ready in time)`. A job is `running`
 until it ends, then `done`. A task whose process outlived a kill, so
 that dekit gave up on the stop, is `idle (stop timed out)` until it starts

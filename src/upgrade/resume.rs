@@ -11,13 +11,13 @@ use futures::future::BoxFuture;
 use crate::project::Project;
 use crate::{
   config::{config::Config, hook::watch_idle},
-  console::app::console_task_registration,
   dekit::{
     attach::{Attachment, resume_session},
     main::print_warnings,
     server::{
-      Connections, Resumed, ServerCtx, SessionConn, dispatch_connection,
-      hello_from_snapshot, init_logging, runner_handle, serve,
+      ConnReg, Connections, Resumed, ServerCtx, SessionConn,
+      dispatch_connection, finish, hello_from_snapshot, init_logging,
+      runner_handle, serve,
     },
     wait::{CarriedWait, resume_wait_session},
   },
@@ -26,11 +26,10 @@ use crate::{
     kernel_message::{
       Registration, TaskContext, TaskRegistration, TaskSelector,
     },
-    task::{Effects, Task, TaskCmd, TaskDef, TaskId},
-    task_key::TaskSpaceId,
+    task::{Effects, Task, TaskCmd, TaskId},
   },
   process::unix_processes_waiter::UnixProcessesWaiter,
-  protocol::ctl::Hello,
+  protocol::{Bye, ConnReceiver, ConnSender, CtlMsg, codes, ctl::Hello},
   runner::{
     RunnerKind, RunnerSpec,
     lockfile::{LockFileGuard, runner_paths},
@@ -90,7 +89,7 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
   );
   let taken = take_over(&snapshot, &runner, &project, &lock_guard);
   let _ = std::fs::remove_file(&args.snapshot);
-  let (kernel, console, server_socket, connections) = match taken {
+  let (kernel, server_socket, connections) = match taken {
     Ok(taken) => taken,
     Err(err) => return Err(fail(&snapshot, &lock_guard, err)),
   };
@@ -108,10 +107,10 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
       log_level,
     )),
     quitting: kernel.quitting(),
+    prompts: Default::default(),
   });
   if let Some(hook) = config.on_idle.clone() {
-    let console = pc.get_task_sender(console);
-    watch_idle(&pc, &config, TaskSelector::all(), hook, console);
+    watch_idle(&pc, &config, TaskSelector::all(), hook, None);
   }
   let kernel_handle = tokio::spawn(kernel.run());
   UnixProcessesWaiter::resume();
@@ -158,6 +157,9 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
         },
         wait,
       )),
+      Carried::Ended { hello, why } => {
+        Box::pin(end_session(reg, fd, hello, why, sender, receiver))
+      }
     });
   }
 
@@ -265,7 +267,6 @@ struct Prepared<'a> {
   next_task_id: usize,
   /// The tasks and folders, in list order.
   tasks: Vec<(Option<&'a snap::Task>, Registration)>,
-  console: TaskId,
   connections: Vec<Connection>,
 }
 
@@ -287,6 +288,33 @@ enum Carried {
     hello: Hello,
     wait: CarriedWait,
   },
+  /// A session the new image has nothing for: told why, then closed.
+  Ended {
+    hello: Hello,
+    why: &'static str,
+  },
+}
+
+/// Ends a carried session with `why`.
+async fn end_session(
+  mut reg: ConnReg,
+  fd: Option<i32>,
+  hello: Hello,
+  why: &'static str,
+  mut sender: ConnSender,
+  receiver: ConnReceiver,
+) {
+  let bye = CtlMsg::Bye(Bye::new(codes::QUIT, why));
+  if sender.queue_ctl(bye).is_ok() {
+    finish(
+      &mut sender,
+      &mut reg.ctl,
+      fd,
+      Some(&hello),
+      receiver.buffered(),
+    )
+    .await;
+  }
 }
 
 fn prepare<'a>(
@@ -294,8 +322,9 @@ fn prepare<'a>(
   project: &Arc<Project>,
 ) -> anyhow::Result<Prepared<'a>> {
   let config = &project.config();
-  let mut console = None;
   let mut tasks = Vec::with_capacity(snapshot.tasks.len());
+  // An older image's console tasks, which are not carried.
+  let mut consoles = std::collections::HashSet::new();
   // Every task and folder as it was, in its order: the config is not
   // read for them. A reload brings in what changed there.
   for node in snapshot.listed() {
@@ -331,33 +360,16 @@ fn prepare<'a>(
           format!("saved task {name}")
         })?
       }
-      snap::TaskKind::Console { groups } => {
-        console = Some(task_id);
-        let (space, path) = match task.key()? {
-          Some(key) => (key.space, Some(key.path)),
-          None => (TaskSpaceId::default_space(), None),
-        };
-        console_task_registration(
-          task_id,
-          TaskDef {
-            space,
-            path,
-            label: task.label.clone(),
-            tags: task.tags.clone(),
-            pinned: task.pinned,
-            ..TaskDef::default()
-          },
-          project.clone(),
-          config.keymap.build(),
-          groups.clone(),
-        )
+      // The console is the client's now: an older image's is not
+      // carried, and a session attached to it is told so.
+      snap::TaskKind::Console { .. } => {
+        consoles.insert(task_id);
+        continue;
       }
     };
     tasks.push((Some(task), Registration::Task(registration)));
   }
   let next_task_id = snapshot.next_task_id;
-  let console =
-    console.ok_or_else(|| anyhow::anyhow!("snapshot has no console"))?;
 
   let mut connections = Vec::with_capacity(snapshot.connections.len());
   for conn in &snapshot.connections {
@@ -388,12 +400,11 @@ fn prepare<'a>(
         until_exit,
         caps,
         cell_pixels,
-      } => Carried::Attach {
-        hello: hello.ok_or_else(|| {
+      } => {
+        let hello = hello.ok_or_else(|| {
           anyhow::anyhow!("attach connection {} has no hello", conn.fd)
-        })?,
-        task: TaskId(*task),
-        attach: Attachment {
+        })?;
+        let attach = Attachment {
           geometry: Geometry {
             size: Size {
               width: *width,
@@ -403,8 +414,19 @@ fn prepare<'a>(
           },
           until_exit: *until_exit,
           caps: *caps,
-        },
-      },
+        };
+        match consoles.contains(&TaskId(*task)) {
+          true => Carried::Ended {
+            hello,
+            why: "the console runs in dekit now: update dekit to open it",
+          },
+          false => Carried::Attach {
+            hello,
+            task: TaskId(*task),
+            attach,
+          },
+        }
+      }
     };
     connections.push(Connection {
       fd: conn.fd,
@@ -416,7 +438,6 @@ fn prepare<'a>(
   Ok(Prepared {
     next_task_id,
     tasks,
-    console,
     connections,
   })
 }
@@ -430,7 +451,7 @@ fn take_over(
   runner: &RunnerSpec,
   project: &Arc<Project>,
   lock_guard: &LockFileGuard,
-) -> anyhow::Result<(Kernel, TaskId, ServerSocket, Vec<Connection>)> {
+) -> anyhow::Result<(Kernel, ServerSocket, Vec<Connection>)> {
   let prepared = prepare(snapshot, project)?;
   project.set_base(saved_base(
     snapshot,
@@ -454,12 +475,7 @@ fn take_over(
   let warnings = project.config().warnings.clone();
   // Before the upgrade is answered: its requester reads the record next.
   lock_guard.publish(runner, &warnings)?;
-  Ok((
-    kernel,
-    prepared.console,
-    server_socket,
-    prepared.connections,
-  ))
+  Ok((kernel, server_socket, prepared.connections))
 }
 
 /// This image owns the runner but cannot run it. Nothing is left running

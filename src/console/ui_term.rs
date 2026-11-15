@@ -15,7 +15,14 @@ use crate::term::{
   style::{LinkId, Style, StyleId},
 };
 
-pub fn render_term(area: Rect, grid: &mut Grid, state: &State, theme: &Theme) {
+/// `shown` is the selected task's screen, once it is attached.
+pub fn render_term(
+  area: Rect,
+  grid: &mut Grid,
+  state: &State,
+  shown: Option<&Frame>,
+  theme: &Theme,
+) {
   if area.width < 3 || area.height < 3 {
     return;
   }
@@ -23,8 +30,8 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &State, theme: &Theme) {
   let active = state.scope.is_term();
   let style = theme.block.panel(active);
 
-  let task = match state.tasks.selected() {
-    Some((_, Node::Task(task))) => task,
+  match state.tasks.selected() {
+    Some((_, Node::Task(_))) => (),
     Some((path, Node::Group(group))) => {
       return render_group(area, grid, &style, theme, path, group);
     }
@@ -34,8 +41,10 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &State, theme: &Theme) {
     }
   };
 
-  let handle = task.present.as_ref().unwrap_or(&task.vt);
-  let frame = handle.load();
+  let Some(frame) = shown else {
+    style.draw(grid, area).title(" Terminal ", style.title);
+    return;
+  };
 
   let mut block = style.draw(grid, area);
   block.title(" Terminal ", style.title);
@@ -45,7 +54,7 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &State, theme: &Theme) {
   }
 
   let inner = block.inner();
-  render_frame(&frame, inner, grid, &theme.palette);
+  render_frame(frame, inner, grid, &theme.palette);
 
   if active
     && let Some(cursor) = frame.cursor

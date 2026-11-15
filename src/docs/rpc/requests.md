@@ -8,8 +8,9 @@ order: 10
 
 A connection carries any number of requests, and several may be in flight
 at once. `id` is chosen by the client, unique per connection, and
-correlates each response; responses may arrive out of order. `attach` is
-the exception: it takes over the connection (|rpc/attach|). Empty params
+correlates each response; responses may arrive out of order. `attach`,
+`wait`, `watch`, and `logs` with `follow` are the exception: each takes
+over the connection, as its own section says. Empty params
 are omitted on the wire; receivers treat missing, `null`, and `{}` params
 the same.
 
@@ -18,6 +19,8 @@ the same.
   desc: "Params are a command verbatim (`{command: start, target: ...}`); result `{matched}` for task-directed verbs, `add`, and `up`; `{stop_within_ms}` for `down` and `quit`; `{}` for `batch`."
 - cmd: ls
   desc: "Params `{target?}`, default `**`; result `{tasks: [task-info]}`."
+- cmd: watch
+  desc: "Params `{target?}` as for `ls`; result `{}`, then the connection is a watch session (|rpc/requests#watches|). Feature `watch`."
 - cmd: why
   desc: "Params `{target}` for one task; result the why object: `wanted`, `supported`, `vetoed`, `pinned`, `saved_pin` (when set), `required_by`, `deps`, `attempts`."
 - cmd: screen
@@ -25,7 +28,9 @@ the same.
 - cmd: attach
   desc: "Params `{target, width, height, cell_width?, cell_height?, until_exit?, caps?}`; result `{}`, then the connection is in session mode (|rpc/attach|)."
 - cmd: reload
-  desc: "Params `{apply?}`; result `{plan: {changes, order?, edited_here}, applied, errors}`: what dekit.yaml would change (|cli/reload|), carried out with `apply`. A change is `{kind, path, apply, fields?, reason?, failed?}`; `reason`, why it is off unless asked, is `removed-here`, `conflict`, `changed-here`, `running`, or `{in-the-way: <path>}`. The config on disk not loading is `bad_config`."
+  desc: "Params `{apply?, plan?}`; result `{plan: {changes, order?, edited_here}, applied, errors}`: what dekit.yaml would change (|cli/reload|), carried out with `apply`. A change is `{kind, path, apply, fields?, reason?, failed?}`, a field `{key, base, here, config, conflict, take}`; `reason`, why it is off unless asked, is `removed-here`, `conflict`, `changed-here`, `running`, or `{in-the-way: <path>}`. `plan`, a plan a reload answered with its changes' `apply` and its fields' `take` set as wanted, is what the plan made now takes of each change it lists, by kind and path; the others are left (feature `reload-plan`). The config on disk not loading is `bad_config`."
+- cmd: write_back
+  desc: "Params `{include?, paths?, prompt?, plan?}`; result `{items?, failed?, prompt?, plan?}`: what changed here, written back to the config (|start/runners|); see |rpc/requests#write-back|."
 - cmd: upgrade
   desc: "Params `{binary}`; result `{version}` from the new binary once it has taken over."
 - cmd: wait
@@ -105,8 +110,12 @@ which a `stopping` task carries too while that stop is under way. An
 `idle` task carries `reason: "kill_timeout"` when its last stop was given
 up on: the process outlived a hard kill and may still run.
 Task-info is `{id, path, label?, kind, state, exit_code?, signal?,
-reason?}` where `path` is the space-qualified target of the task
-(`@dekit/console`) and `kind` is `service` or `job`.
+reason?, spec?, origin?}` where `path` is the space-qualified target of
+the task (`@space/path`, or just the path in the default space), `kind`
+is `service` or `job`, `spec` its definition as dekit.yaml writes an
+entry (absent for a task not made from one), and `origin` the config
+entry it is written in, `{file, key, mount?}` (absent for the runner's
+own).
 
 ## Waits {#waits}
 
@@ -145,6 +154,50 @@ at the root of it, when that is a dep) or `removed: true`, and in
 `wait-done` its `why` (the `why` object). A wait is carried across a
 live upgrade, and the new image sends `tasks` again; a task removed
 before it, whose standing was final, is not in that set.
+
+## Watches {#watches}
+
+`watch` is `ls` kept current: it follows the tasks its target selects,
+in one space. Like `wait`, it is the last request on its connection:
+after the ok response the server sends events until the client hangs up
+or the runner quits (`bye` with `quit`); nothing the client sends
+changes it.
+
+- `tasks {tasks, folders?}`: the selected tasks as they are, in list order, each its task-info plus `after`, the id of the task or folder listed right before it (absent for the first); with the default `**`, also the folders, each `{id, path, after?, collapsed?}`. It replaces whatever the client knew. It comes first, and again in place of the events a client too far behind missed.
+- `task {..task-info, after?}`: a selected task, new or as it is now, listed right after `after`: the client adds it, or updates it and moves it there.
+- `folder {id, path, after?, collapsed?}`: a folder, with the default `**`, new or listed elsewhere now; `collapsed` is how a new one starts out.
+- `task-removed {id}`: the task or folder is gone.
+- `config-changed {}`: a file the runner's config is read from changed, or what it last took in of it did (a reload, a write-back): a dry `reload` may answer otherwise now.
+
+`after` is in the order of the whole list: with a target other than
+`**` it can name a task or folder the session never sends, which the
+client places nothing after. Whether a target selects a task is settled
+when the task comes. A live upgrade ends a watch with `bye` (`upgrade`);
+the client watches again, and is sent `tasks` by the new image. The
+events come in the order the kernel made them. A client that stops
+reading is sent nothing more until it reads again; one that falls more
+than a few MiB behind is sent `tasks` in place of what it missed.
+
+## Write-back {#write-back}
+
+`write_back` writes back to the config what changed here: the config
+tasks changed or removed here, and the runner's own tasks in `include`
+(their ids). With neither `paths` nor `prompt` it only answers what it
+would write, as `items`: each `{path, source, kind, fields?, apply,
+note?, task?}`, `kind` being `changed`, `added` (a task of the runner's
+own), or `removed`, `fields` each `{key, was?, now?}`, `apply` whether it
+is chosen by default, `note` why the runner's writer can't do it (an
+agent can), and `task` the id of the task or folder it writes.
+
+With `paths` the runner edits the files for the items at those paths,
+and answers what it could not write, or what did not read back as
+written, as `failed`, each `{path, why}`. With `prompt: true` it writes
+nothing and answers a `prompt` for a coding agent to write those items
+(the default ones without `paths`), and the `plan` it is for. Once the
+agent is done, `{plan}` alone (with anything else it is
+`invalid_params`) has the runner record what reads back as written,
+answering `failed` the same way. The config not loading is
+`bad_config`; a plan the runner no longer has is `no_match`.
 
 ## Logs {#logs}
 

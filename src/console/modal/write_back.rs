@@ -3,13 +3,14 @@
 //! prompt.
 
 use crate::console::theme::BlockStyle;
+use crate::kernel::task::TaskId;
+use crate::protocol::rpc::RpcWriteItem;
 use crate::spec::show_value;
 use crate::term::{
   Grid,
   grid::Rect,
   key::{Key, KeyCode, KeyMods},
 };
-use crate::write_back::{How, WriteKind, WritePlan};
 
 use super::checklist::{
   Check, CheckRow, Checklist, ChecklistModal, key_column, listed,
@@ -18,19 +19,49 @@ use super::modal::ModalResult;
 
 pub type WriteBackModal = ChecklistModal<WriteBack>;
 
+/// How to write the items back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum How {
+  /// The runner edits the files.
+  Write,
+  /// Run the agent with a prompt.
+  Agent,
+  /// Copy the prompt.
+  Copy,
+}
+
 pub struct WriteBack {
-  pub plan: WritePlan,
+  /// What the runner would write.
+  pub items: Vec<RpcWriteItem>,
+  /// The runner's own tasks asked for, by its ids.
+  pub include: Vec<TaskId>,
   /// The agent's program, when one is set up or found.
   pub agent: Option<String>,
 }
 
 impl WriteBack {
   fn result(&self, how: How) -> ModalResult {
-    if self.plan.chosen().next().is_none() {
+    let chosen: Vec<String> = (self.items.iter())
+      .filter(|item| item.apply)
+      .map(|item| item.path.clone())
+      .collect();
+    if chosen.is_empty() {
       return ModalResult::Keep;
     }
-    ModalResult::WriteBack(Box::new(self.plan.clone()), how)
+    ModalResult::WriteBack {
+      include: self.include.clone(),
+      chosen,
+      how,
+    }
   }
+}
+
+/// A value of an entry as the file has it.
+fn shown(value: &Option<serde_json::Value>) -> String {
+  let value = value
+    .as_ref()
+    .and_then(|value| serde_yaml::to_value(value).ok());
+  show_value(value.as_ref())
 }
 
 impl Checklist for WriteBack {
@@ -39,17 +70,15 @@ impl Checklist for WriteBack {
   const DETAIL: u16 = 7;
 
   fn len(&self) -> usize {
-    self.plan.items.len()
+    self.items.len()
   }
 
   fn row(&self, index: usize) -> CheckRow {
-    let item = &self.plan.items[index];
-    let (mark, what) = match item.kind {
-      WriteKind::Changed => {
-        ("~", listed(item.fields.iter().map(|f| f.key.as_str())))
-      }
-      WriteKind::Added => ("+", format!("add to {}", item.source.file)),
-      WriteKind::Removed => ("-", format!("remove from {}", item.source.file)),
+    let item = &self.items[index];
+    let (mark, what) = match item.kind.as_str() {
+      "added" => ("+", format!("add to {}", item.source.file)),
+      "removed" => ("-", format!("remove from {}", item.source.file)),
+      _ => ("~", listed(item.fields.iter().map(|f| f.key.as_str()))),
     };
     CheckRow {
       check: if item.apply { Check::On } else { Check::Off },
@@ -61,7 +90,7 @@ impl Checklist for WriteBack {
   }
 
   fn toggle(&mut self, index: usize) {
-    if let Some(item) = self.plan.items.get_mut(index) {
+    if let Some(item) = self.items.get_mut(index) {
       item.apply = !item.apply;
     }
   }
@@ -96,7 +125,7 @@ impl Checklist for WriteBack {
     area: Rect,
     style: BlockStyle,
   ) {
-    let item = &self.plan.items[index];
+    let item = &self.items[index];
     let mut rows = area.rows();
     if let Some(row) = rows.next() {
       let what = format!("{}: task {}", item.source.file, item.source.key);
@@ -107,12 +136,10 @@ impl Checklist for WriteBack {
       let Some(mut row) = rows.next() else { break };
       grid.draw_text(row.take_left(key_w), &field.key, style.key);
       row.take_left(2);
-      let now = show_value(field.now.as_ref());
-      let text = match item.kind {
-        WriteKind::Added => now,
-        WriteKind::Changed | WriteKind::Removed => {
-          format!("{} → {now}", show_value(field.was.as_ref()))
-        }
+      let now = shown(&field.now);
+      let text = match item.kind.as_str() {
+        "added" => now,
+        _ => format!("{} → {now}", shown(&field.was)),
       };
       grid.draw_text(row, &text, style.text);
     }

@@ -7,14 +7,10 @@ use std::{
 };
 
 use crate::config::hook::watch_idle;
-use crate::console::app::console_task_registration;
 #[cfg(unix)]
 use crate::error::ResultLogger;
 use crate::kernel::kernel::Kernel;
 use crate::kernel::kernel_message::TaskSelector;
-use crate::kernel::task::TaskDef;
-use crate::kernel::task_key::TaskSpaceId;
-use crate::kernel::task_path::TaskPath;
 use crate::mprocs::config::{
   CmdConfig, Config, ConfigContext, ProcConfig, ServerConfig, default_stop,
 };
@@ -27,14 +23,18 @@ use crate::mprocs::settings::Settings;
 use crate::mprocs::yaml_val::Val;
 use crate::task::config_tasks::register_config_tasks;
 use crate::{
-  attach_client::client_main,
+  console::{
+    app::{AppMsg, Setup, start},
+    host::{Ended, run_on_terminal},
+    link::{Connector, Link},
+  },
   dekit::server::{Connections, ServerCtx, dispatch_connection},
   protocol::{ConnReceiver, ConnSender},
-  target::Target,
 };
 use anyhow::{Result, bail};
 use clap::{ArgMatches, arg, command};
 use serde_yaml::Value;
+use std::sync::Arc;
 
 pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
   let matches = command!()
@@ -215,39 +215,16 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
         default_dir: None,
       })?;
 
-      let (srv_to_clt_sender, srv_to_clt_receiver) = {
-        let (reader, writer) = tokio::io::simplex(8 * 1024);
-        (ConnSender::new(writer), ConnReceiver::new(reader))
-      };
-      let (clt_to_srv_sender, clt_to_srv_receiver) = {
-        let (reader, writer) = tokio::io::simplex(8 * 1024);
-        (ConnSender::new(writer), ConnReceiver::new(reader))
-      };
-
       #[cfg(unix)]
       crate::process::unix_processes_waiter::UnixProcessesWaiter::init()?;
-      let mut kernel = Kernel::new();
+      let kernel = Kernel::new();
       let pc = kernel.context();
       let server = config.server.take();
       let config =
         std::sync::Arc::new(crate::config::config::Config::from(config));
-      let app_task_id = pc.alloc_id();
-      let registration = console_task_registration(
-        app_task_id,
-        TaskDef {
-          space: TaskSpaceId::dekit(),
-          path: Some(TaskPath::new("console").expect("valid console path")),
-          pinned: true,
-          ..TaskDef::default()
-        },
-        crate::project::Project::new(config.clone()),
-        keymap,
-        Default::default(),
-      );
-      if let Err(err) = kernel.register_task_registration(registration) {
-        bail!("Failed to register console task: {err}");
-      }
-      let app_sender = pc.get_task_sender(app_task_id);
+      // What the hooks and the ctl server ask of the console, kept until
+      // it is up.
+      let (actions, mut asked) = tokio::sync::mpsc::unbounded_channel();
 
       if let Some(ServerConfig::Tcp(addr)) = server {
         let listener =
@@ -259,7 +236,7 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
           })?;
         tokio::spawn(crate::mprocs::ctl::run_ctl_server(
           listener,
-          pc.get_task_sender(app_task_id),
+          actions.clone(),
         ));
       }
 
@@ -271,37 +248,54 @@ pub async fn run_app(args: Vec<String>) -> anyhow::Result<()> {
       });
 
       if let Some(hook) = config.on_idle.clone() {
-        watch_idle(&pc, &config, TaskSelector::all(), hook, app_sender.clone());
+        watch_idle(
+          &pc,
+          &config,
+          TaskSelector::all(),
+          hook,
+          Some(actions.clone()),
+        );
       }
       register_config_tasks(&config, &pc).await?;
       if let Some(hook) = &config.on_init {
-        hook.run(&pc, &config, &app_sender);
+        hook.run(&pc, &config, Some(&actions));
       }
 
       let ctx = ServerCtx::local(pc.clone(), config.clone());
-      let reg = Connections::register(&ctx);
-      tokio::spawn(dispatch_connection(
-        ctx,
-        reg,
-        srv_to_clt_sender,
-        clt_to_srv_receiver,
-        None,
-        None,
-      ));
-
-      let ret = client_main(
-        "@dekit/console".parse::<Target>().expect("valid target"),
-        false,
-        clt_to_srv_sender,
-        srv_to_clt_receiver,
-      )
+      let link = Link::open(None, local_connector(ctx)).await?;
+      let ret = run_on_terminal(|geometry, caps| {
+        let started = start(Setup {
+          config: config.clone(),
+          keymap,
+          geometry,
+          caps,
+          links: vec![link],
+          all_runners: false,
+          follow_user_config: false,
+        });
+        let app = started.app.clone();
+        tokio::spawn(async move {
+          while let Some(action) = asked.recv().await {
+            if app.send(AppMsg::Action(action)).is_err() {
+              break;
+            }
+          }
+        });
+        started
+      })
       .await;
-      // mprocs is foreground: its only client leaving ends the run, and
-      // the tasks must come down in order rather than with the process.
+      // mprocs is foreground: its console leaving ends the run, and the
+      // tasks must come down in order rather than with the process.
       pc.send(crate::kernel::kernel_message::KernelCommand::Quit);
       let _ = kernel_handle.await;
       drop(logger);
-      ret.map(|_| ())
+      match ret? {
+        Ended::Left => Ok(()),
+        Ended::Closed(why) => {
+          eprintln!("mprocs: {why}");
+          Ok(())
+        }
+      }
     }
   }
 }
@@ -498,4 +492,29 @@ mod tests {
 
     std::fs::remove_dir_all(&temp_dir).unwrap();
   }
+}
+
+/// A connector to the runner of `ctx` that stays in this process. Its
+/// connections are never frozen: a runner without a runner record, as
+/// this one is, cannot be upgraded live.
+pub(crate) fn local_connector(ctx: Arc<ServerCtx>) -> Connector {
+  Arc::new(move || {
+    let ctx = ctx.clone();
+    Box::pin(async move {
+      let (client_reads, server_writes) = tokio::io::simplex(64 * 1024);
+      let (server_reads, client_writes) = tokio::io::simplex(64 * 1024);
+      tokio::spawn(dispatch_connection(
+        ctx.clone(),
+        Connections::register(&ctx),
+        ConnSender::new(server_writes),
+        ConnReceiver::new(server_reads),
+        None,
+        None,
+      ));
+      Ok((
+        ConnSender::new(client_writes),
+        ConnReceiver::new(client_reads),
+      ))
+    })
+  })
 }

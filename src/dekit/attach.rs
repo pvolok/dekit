@@ -19,15 +19,19 @@ use crate::{
     task_screen::{ObserverId, ScreenNotify, ScrollUnit, TaskScreenCmd},
   },
   protocol::{
-    Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Feature, Msg,
-    RpcState, ScreenCommand, TermCaps, codes,
+    Bye, ConnReceiver, ConnSender, CtlMsg, Event, Feature, Msg, RpcState,
+    ScreenCommand, TermCaps, codes,
     ctl::{
-      CopyEvent, EVENT_COPY, EVENT_SCREEN, Hello, input_of, is_input_event,
+      CopyEvent, EVENT_COPY, EVENT_SCREEN, EVENT_SCREEN_STATE,
+      FEATURE_SCREEN_STATE, Hello, MouseReports, ScreenStateEvent, input_of,
+      is_input_event,
     },
     ok_result, screen,
   },
   target::Target,
-  term::{Frame, Geometry, Painter, TermEvent, reveal, vt::emit},
+  term::{
+    Frame, Geometry, MouseProtocolMode, Painter, TermEvent, reveal, vt::emit,
+  },
   upgrade::snapshot as snap,
 };
 
@@ -161,8 +165,6 @@ async fn run_attached(
       observer,
       geometry: attach.geometry,
       sink,
-      client_version: Some(hello.version.clone()),
-      background: caps.background,
     },
   );
   // Ends once the task has no process and won't start by itself, so a
@@ -171,6 +173,7 @@ async fn run_attached(
   let until = attach
     .until_exit
     .then(|| pc.wait(WaitOn::Ids(vec![task]), WaitCond::Exit));
+  let states = hello.has(FEATURE_SCREEN_STATE);
   let freeze = FreezeInfo { fd, hello, attach };
   let mut painter = Painter::new(caps);
   let end = session(
@@ -186,6 +189,7 @@ async fn run_attached(
     &mut reg.ctl,
     freeze,
     &mut painter,
+    states,
   )
   .await;
   // Whatever ended the session, the screen must not keep our geometry.
@@ -215,10 +219,6 @@ async fn run_attached(
     SessionEnd::Closed => match *ctx.quitting.borrow() {
       true => Bye::new(codes::QUIT, "the runner stopped"),
       false => Bye::new(codes::QUIT, "the screen closed"),
-    },
-    SessionEnd::Switch { kind, root } => Bye {
-      switch: Some(ByeSwitch { kind, root }),
-      ..Bye::new(codes::QUIT, "")
     },
   };
   if sender.queue_ctl(CtlMsg::Bye(bye)).is_ok() {
@@ -299,8 +299,6 @@ enum SessionEnd {
   /// `until_exit`: the attached task's execution finished, with the
   /// state its wait for the exit saw it end in.
   TaskExited(Option<RpcState>),
-  /// The console sends the client on to another runner.
-  Switch { kind: String, root: String },
 }
 
 async fn session(
@@ -316,7 +314,33 @@ async fn session(
   ctl: &mut UnboundedReceiver<ConnCtl>,
   mut freeze: FreezeInfo<'_>,
   painter: &mut Painter,
+  states: bool,
 ) -> SessionEnd {
+  // What the client was last told of the screen, with `screen-state`.
+  let mut told: Option<ScreenStateEvent> = None;
+  let mut state = |out: &mut Vec<u8>,
+                   present: &Option<ScreenHandle>,
+                   sender: &mut ConnSender|
+   -> bool {
+    if !states {
+      return true;
+    }
+    let now = screen_state(vt, present);
+    if told.as_ref() == Some(&now) {
+      return true;
+    }
+    // Ahead of the paint that shows it: what is queued goes first.
+    if !out.is_empty() && sender.queue_out(std::mem::take(out).into()).is_err()
+    {
+      return false;
+    }
+    let event = CtlMsg::Event(Event {
+      name: EVENT_SCREEN_STATE.to_string(),
+      params: serde_json::to_value(&now).expect("a state serializes"),
+    });
+    told = Some(now);
+    sender.queue_ctl(event).is_ok()
+  };
   // Copy-mode surface, painted instead of `vt` while set.
   let mut present: Option<ScreenHandle> = None;
   let mut title = String::new();
@@ -347,6 +371,9 @@ async fn session(
       // vt, so painting now shows the complete final screen even if
       // render notifies are still queued.
       let mut out = Vec::new();
+      if !state(&mut out, &present, sender) {
+        return SessionEnd::Closed;
+      }
       render(painter, vt, &present, &mut title, &mut out);
       if !out.is_empty() {
         let _ = sender.queue_out(out.into());
@@ -397,7 +424,7 @@ async fn session(
         let mut out = Vec::new();
         for notify in batch.drain(..) {
           match notify {
-            ScreenNotify::Attached | ScreenNotify::Render { .. } => {
+            ScreenNotify::Attached | ScreenNotify::Render => {
               paint = true
             }
             ScreenNotify::Bell => out.push(0x07),
@@ -417,11 +444,11 @@ async fn session(
                 return SessionEnd::Closed;
               }
             }
-            ScreenNotify::Switch { kind, root } => {
-              return SessionEnd::Switch { kind, root };
-            }
             ScreenNotify::Detached => return SessionEnd::Detached,
           }
+        }
+        if paint && !state(&mut out, &present, sender) {
+          return SessionEnd::Closed;
         }
         match &reveal {
           Reveal::Off if paint => {
@@ -462,6 +489,9 @@ async fn session(
           // paint places the cursor and brings in what changed since.
           if swept {
             painter.assume(Some(shown));
+          }
+          if !state(&mut out, &present, sender) {
+            return SessionEnd::Closed;
           }
           render(painter, vt, &present, &mut title, &mut out);
         } else {
@@ -524,6 +554,28 @@ async fn session(
   }
 }
 
+/// What a client that runs the stream through its own emulator needs to
+/// know of the screen besides.
+fn screen_state(
+  vt: &ScreenHandle,
+  present: &Option<ScreenHandle>,
+) -> ScreenStateEvent {
+  let live = vt.load();
+  let shown = present.as_ref().map_or_else(|| live.clone(), |p| p.load());
+  ScreenStateEvent {
+    width: shown.size.width,
+    height: shown.size.height,
+    copy: present.is_some(),
+    mouse: match live.mouse {
+      MouseProtocolMode::None => None,
+      MouseProtocolMode::Press => Some(MouseReports::Press),
+      MouseProtocolMode::PressRelease => Some(MouseReports::PressRelease),
+      MouseProtocolMode::ButtonMotion => Some(MouseReports::ButtonMotion),
+      MouseProtocolMode::AnyMotion => Some(MouseReports::AnyMotion),
+    },
+  }
+}
+
 fn render(
   painter: &mut Painter,
   vt: &ScreenHandle,
@@ -576,24 +628,19 @@ mod tests {
 
   use crate::{
     config::config::Config,
-    console::app::console_task_registration,
     dekit::server::{Connections, ServerCtx, dispatch_connection},
     kernel::{
       kernel::Kernel,
       kernel_message::{KernelCommand, TaskContext},
       task::{TaskDef, TaskId},
-      task_key::{TaskKey, TaskSpaceId},
+      task_key::TaskKey,
       task_path::TaskPath,
     },
     protocol::{
-      Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Msg, Request,
-      RpcRequest, codes,
+      Bye, ConnReceiver, ConnSender, CtlMsg, Msg, Request, RpcRequest, codes,
       ctl::{GeometryParams, Hello, InputDialect, local_hello},
     },
-    term::{
-      Geometry, TermEvent,
-      key::{Key, KeyCode, KeyMods},
-    },
+    term::{Geometry, TermEvent},
   };
 
   /// The next `Out` frame, or None if the session ended first.
@@ -608,16 +655,6 @@ mod tests {
         Some(Err(_)) | None => return None,
       }
     }
-  }
-
-  async fn press(sender: &mut ConnSender, c: char) {
-    let key = Key::new(KeyCode::Char(c), KeyMods::NONE);
-    sender
-      .send_ctl(CtlMsg::Event(
-        InputDialect::Named.input_event(&TermEvent::Key(key)),
-      ))
-      .await
-      .unwrap();
   }
 
   /// Reads `Out` frames until one contains `needle`.
@@ -858,7 +895,7 @@ mod tests {
   #[tokio::test]
   async fn clients_without_atch2_are_served_the_first_dialect() {
     let config = Arc::new(Config::make_default());
-    let (pc, _, kernel_handle) = console_kernel(&config);
+    let (pc, _, kernel_handle) = screen_kernel("Tasks");
     let ctx = ServerCtx::local(pc.clone(), config.clone());
     // A client from before the feature.
     let hello = Hello {
@@ -866,8 +903,7 @@ mod tests {
       ..local_hello()
     };
     let (mut sender, mut receiver, session) =
-      attach_through(&ctx, hello, "@dekit/console", false, 64 * 1024, None)
-        .await;
+      attach_through(&ctx, hello, "shown", false, 64 * 1024, None).await;
     assert!(next_out(&mut receiver).await.is_some());
     // Its resizes come in the first dialect and still work.
     sender
@@ -876,61 +912,7 @@ mod tests {
       ))
       .await
       .unwrap();
-    assert!(wait_for(&mut receiver, b"Tasks").await);
-    finish(pc, sender, receiver, session, kernel_handle).await;
-  }
-
-  #[tokio::test]
-  async fn attaches_to_the_console_and_forwards_input() {
-    let config = Arc::new(Config::make_default());
-    let (pc, _, kernel_handle) = console_kernel(&config);
-
-    let (mut sender, mut receiver, session) =
-      attach(&pc, &config, "@dekit/console", false).await;
-
-    // The console paints its sidebar once attached.
-    assert!(wait_for(&mut receiver, b"Tasks").await);
-
-    // Input reaches the console: `?` toggles the help window.
-    press(&mut sender, '?').await;
-    let repainted = timeout(Duration::from_secs(2), next_out(&mut receiver))
-      .await
-      .unwrap();
-    assert!(repainted.is_some());
-
-    finish(pc, sender, receiver, session, kernel_handle).await;
-  }
-
-  #[tokio::test]
-  async fn console_quit_modal_detaches_without_stopping_runner() {
-    let config = Arc::new(Config::make_default());
-    let (pc, _, kernel_handle) = console_kernel(&config);
-
-    let (mut sender, mut receiver, session) =
-      attach(&pc, &config, "@dekit/console", false).await;
-    assert!(wait_for(&mut receiver, b"Tasks").await);
-
-    press(&mut sender, 'q').await;
-    assert!(wait_for(&mut receiver, b"leave everything running").await);
-    press(&mut sender, 'd').await;
-
-    // The attachment closes, but the runner remains available for another.
-    assert!(
-      timeout(Duration::from_secs(2), next_out(&mut receiver))
-        .await
-        .unwrap()
-        .is_none()
-    );
-    timeout(Duration::from_secs(2), session)
-      .await
-      .unwrap()
-      .unwrap();
-    drop(sender);
-    drop(receiver);
-
-    let (sender, mut receiver, session) =
-      attach(&pc, &config, "@dekit/console", false).await;
-    assert!(wait_for(&mut receiver, b"Tasks").await);
+    assert!(wait_for(&mut receiver, b"100x30").await);
     finish(pc, sender, receiver, session, kernel_handle).await;
   }
 
@@ -971,101 +953,14 @@ mod tests {
     .unwrap()
   }
 
-  /// A config whose console sends the attachment to another runner on
-  /// `F5`.
-  fn switching_config() -> Arc<Config> {
-    use crate::console::keymap::KeymapGroup;
-    let mut config = Config::make_default();
-    config.keymap.group_mut(KeymapGroup::Tasks).insert(
-      Key::new(KeyCode::F(5), KeyMods::NONE).into(),
-      crate::console::action::Action::SwitchRunner {
-        kind: "project".to_string(),
-        root: "/home/me/other".to_string(),
-      },
-    );
-    Arc::new(config)
-  }
-
-  async fn press_key(sender: &mut ConnSender, key: Key) {
-    sender
-      .send_ctl(CtlMsg::Event(
-        InputDialect::Named.input_event(&TermEvent::Key(key)),
-      ))
-      .await
-      .unwrap();
-  }
-
-  #[tokio::test]
-  async fn console_switch_ends_the_session_with_the_next_runner() {
-    let config = switching_config();
-    let (pc, _, kernel_handle) = console_kernel(&config);
-
-    let (mut sender, mut receiver, session) =
-      attach(&pc, &config, "@dekit/console", false).await;
-    assert!(wait_for(&mut receiver, b"Tasks").await);
-
-    press_key(&mut sender, Key::new(KeyCode::F(5), KeyMods::NONE)).await;
-    let bye = wait_for_bye(&mut receiver).await.unwrap();
-    assert_eq!(bye.code, codes::QUIT);
-    assert_eq!(
-      bye.switch,
-      Some(ByeSwitch {
-        kind: "project".to_string(),
-        root: "/home/me/other".to_string(),
-      })
-    );
-    timeout(Duration::from_secs(2), session)
-      .await
-      .unwrap()
-      .unwrap();
-    drop(sender);
-    drop(receiver);
-
-    // The console and the runner go on for the next attachment.
-    let (sender, mut receiver, session) =
-      attach(&pc, &config, "@dekit/console", false).await;
-    assert!(wait_for(&mut receiver, b"Tasks").await);
-    finish(pc, sender, receiver, session, kernel_handle).await;
-  }
-
-  /// A kernel running just the console, as `@dekit/console`.
-  fn console_kernel(
-    config: &Arc<Config>,
-  ) -> (TaskContext, TaskId, tokio::task::JoinHandle<()>) {
-    let mut kernel = Kernel::new();
-    let pc = kernel.context();
-    let console_id = pc.alloc_id();
-    kernel
-      .register_task_registration(console_task_registration(
-        console_id,
-        TaskDef {
-          space: TaskSpaceId::dekit(),
-          path: Some(TaskPath::new("console").unwrap()),
-          ..TaskDef::default()
-        },
-        crate::project::Project::new(config.clone()),
-        config.keymap.build(),
-        Default::default(),
-      ))
-      .unwrap();
-    (pc, console_id, tokio::spawn(kernel.run()))
-  }
-
   #[tokio::test]
   async fn a_client_that_stops_reading_still_freezes() {
     let config = Arc::new(Config::make_default());
-    let (pc, _, kernel_handle) = console_kernel(&config);
+    let (pc, _, kernel_handle) = screen_kernel(&"Tasks ".repeat(300));
     let ctx = ServerCtx::local(pc.clone(), config.clone());
-    // A pipe far smaller than a paint of the console.
-    let (_sender, _receiver, session) = attach_through(
-      &ctx,
-      local_hello(),
-      "@dekit/console",
-      false,
-      256,
-      Some(7),
-    )
-    .await;
+    // A pipe far smaller than a paint of the screen.
+    let (_sender, _receiver, session) =
+      attach_through(&ctx, local_hello(), "shown", false, 256, Some(7)).await;
     // From here on the client reads nothing. Once the paint is stuck in
     // the pipe, the freeze still comes back, carrying the rest.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1101,10 +996,94 @@ mod tests {
       .unwrap();
   }
 
+  /// A task whose screen shows `text`, and tells each observer to paint
+  /// it as it attaches.
+  fn screen_kernel(
+    text: &str,
+  ) -> (TaskContext, TaskId, tokio::task::JoinHandle<()>) {
+    use crate::{
+      kernel::{
+        task::{Effects, ExitInfo, Task, TaskCmd},
+        task_screen::{ScreenNotify, TaskScreenCmd},
+      },
+      term::{Screen, ScreenHandle, Size},
+    };
+
+    /// Keeps its observers, as a screen does; a resize redraws it with
+    /// the size it asks for after `text`.
+    struct Painted {
+      sinks: Vec<tokio::sync::mpsc::UnboundedSender<ScreenNotify>>,
+      text: String,
+      vt: ScreenHandle,
+    }
+    impl Task for Painted {
+      fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
+        match cmd {
+          TaskCmd::Start(_) => fx.started(),
+          TaskCmd::Stop | TaskCmd::Kill => fx.stopped(ExitInfo::code(0)),
+          TaskCmd::Msg(msg) => {
+            match msg.downcast::<TaskScreenCmd>().map(|cmd| *cmd) {
+              Ok(TaskScreenCmd::Attach { sink, .. }) => {
+                let _ = sink.send(ScreenNotify::Attached);
+                self.sinks.push(sink);
+              }
+              // A resize repaints, as a program redraws on one.
+              Ok(TaskScreenCmd::Input { event, .. }) => {
+                if let TermEvent::Resize(geometry) = event {
+                  let size = geometry.size;
+                  let text =
+                    format!("{} {}x{}", self.text, size.width, size.height);
+                  self.vt.publish(painted(&text));
+                }
+                for sink in &self.sinks {
+                  let _ = sink.send(ScreenNotify::Render);
+                }
+              }
+              Ok(_) | Err(_) => (),
+            }
+          }
+          TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
+        }
+      }
+    }
+
+    fn painted(text: &str) -> crate::term::Frame {
+      let mut screen = Screen::new(
+        Size {
+          width: 80,
+          height: 24,
+        },
+        0,
+      );
+      screen.process(text.as_bytes());
+      screen.frame()
+    }
+
+    let vt = ScreenHandle::new(painted(text));
+    let text = text.to_string();
+    let mut kernel = Kernel::new();
+    let pc = kernel.context();
+    let id = kernel.register_task(
+      TaskDef {
+        path: Some(TaskPath::new("shown").unwrap()),
+        vt: Some(vt.clone()),
+        ..TaskDef::default()
+      },
+      |_| {
+        Box::new(Painted {
+          sinks: Vec::new(),
+          text,
+          vt,
+        })
+      },
+    );
+    (pc, id, tokio::spawn(kernel.run()))
+  }
+
   #[tokio::test]
   async fn a_resumed_session_resets_the_terminal_before_painting() {
     let config = Arc::new(Config::make_default());
-    let (pc, console_id, kernel_handle) = console_kernel(&config);
+    let (pc, task, kernel_handle) = screen_kernel("Tasks");
     let (client, server) = duplex(64 * 1024);
     let (client_read, client_write) = tokio::io::split(client);
     let (server_read, server_write) = tokio::io::split(server);
@@ -1114,7 +1093,7 @@ mod tests {
       Connections::register(&ctx),
       None,
       crate::protocol::ctl::local_hello(),
-      console_id,
+      task,
       super::Attachment {
         geometry: Geometry::cells(80, 24),
         until_exit: false,

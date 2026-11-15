@@ -257,20 +257,20 @@ mod tests {
   use std::sync::Arc;
 
   use super::*;
-  use crate::kernel::{
-    kernel_message::ScreenHandle, task::TaskId, task_path::TaskPath,
-  };
-  use crate::term::{Frame, Size};
+  use crate::console::app::RunnerId;
+  use crate::kernel::{task::TaskId, task_path::TaskPath};
 
   fn label(kind: TaskKind, status: TaskState) -> String {
     let task = TaskView {
       id: TaskId(1),
+      runner: RunnerId(1),
+      remote: TaskId(1),
       label: None,
       path: Arc::new(TaskPath::new("api").unwrap()),
       kind,
       status,
-      vt: ScreenHandle::new(Frame::empty(Size::default())),
-      present: None,
+      spec: None,
+      origin: None,
     };
     task_status(&task, &Theme::dark().tasks)
       .0

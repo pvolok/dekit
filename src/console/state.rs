@@ -63,6 +63,8 @@ pub struct State {
   pub config: ConfigStatus,
   /// A task or group being dragged in the list.
   pub drag: Option<Drag>,
+  /// The shown task's screen is in copy mode.
+  pub copy: bool,
 }
 
 pub struct Toast {
@@ -94,7 +96,6 @@ impl ConfigStatus {
 
 /// A press on a row that may become a drag.
 pub struct Drag {
-  pub observer: crate::kernel::task_screen::ObserverId,
   /// The path pressed; its row is looked up as the list is now, since
   /// the list can change while the button is held.
   pub from: Arc<TaskPath>,
@@ -121,9 +122,9 @@ impl State {
   pub fn keymap_group(&self) -> KeymapGroup {
     match self.scope {
       Scope::Tasks => KeymapGroup::Tasks,
-      Scope::Term | Scope::TermZoom => match self.current_task() {
-        Some(task) if task.present.is_some() => KeymapGroup::Copy,
-        _ => KeymapGroup::Term,
+      Scope::Term | Scope::TermZoom => match self.copy {
+        true => KeymapGroup::Copy,
+        false => KeymapGroup::Term,
       },
     }
   }

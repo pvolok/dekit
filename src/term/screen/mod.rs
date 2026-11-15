@@ -518,6 +518,7 @@ impl Screen {
       cursor_style: self.cursor_style,
       title: self.title.clone(),
       images,
+      mouse: self.mouse_mode,
       placements,
     }
   }

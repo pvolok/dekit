@@ -97,10 +97,6 @@ pub struct Bye {
   /// the alternate screen (which the terminal would otherwise restore).
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub screen: Option<String>,
-  /// A `quit` bye from the console's runner selector: the runner the
-  /// client attaches to next.
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub switch: Option<ByeSwitch>,
 }
 
 impl Bye {
@@ -110,17 +106,8 @@ impl Bye {
       message: message.into(),
       state: None,
       screen: None,
-      switch: None,
     }
   }
-}
-
-/// A runner on the same machine, as its record names it: `kind` is
-/// `project` or `host`, `root` its absolute root directory.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ByeSwitch {
-  pub kind: String,
-  pub root: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -224,6 +211,39 @@ pub const EVENT_COPY: &str = "copy";
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CopyEvent {
   pub text: String,
+}
+
+/// Client feature `screen-state`: the client runs the screen stream
+/// through its own emulator, and is sent `screen-state` events.
+pub const FEATURE_SCREEN_STATE: &str = "screen-state";
+/// Server-to-client event in an attach session of a client with
+/// `screen-state`: what the stream cannot say of the attached screen.
+pub const EVENT_SCREEN_STATE: &str = "screen-state";
+
+/// Params of `screen-state`. Each event is the whole state.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScreenStateEvent {
+  /// The size the screen is painted at: the smallest attached size.
+  pub width: u16,
+  pub height: u16,
+  /// In copy mode.
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub copy: bool,
+  /// The mouse reports the program on the screen asked for; absent, the
+  /// mouse is the screen's own.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub mouse: Option<MouseReports>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MouseReports {
+  /// Presses and the wheel.
+  Press,
+  PressRelease,
+  /// And moves while a button is held.
+  ButtonMotion,
+  AnyMotion,
 }
 
 /// Geometry on the wire: columns and rows, and the size of a cell in
@@ -623,7 +643,6 @@ mod tests {
           message: String::new(),
           state: None,
           screen: None,
-          switch: None,
         }),
         r#"{"type":"bye","code":"quit"}"#,
       ),
@@ -633,7 +652,6 @@ mod tests {
           message: "speak 1".to_string(),
           state: None,
           screen: None,
-          switch: None,
         }),
         r#"{"type":"bye","code":"unsupported_protocol","message":"speak 1"}"#,
       ),
@@ -648,19 +666,8 @@ mod tests {
             reason: None,
           }),
           screen: Some("build ok".to_string()),
-          switch: None,
         }),
         r#"{"type":"bye","code":"task_exited","state":{"state":"exited","exit_code":3},"screen":"build ok"}"#,
-      ),
-      (
-        CtlMsg::Bye(Bye {
-          switch: Some(ByeSwitch {
-            kind: "project".to_string(),
-            root: "/home/me/app".to_string(),
-          }),
-          ..Bye::new(codes::QUIT, "")
-        }),
-        r#"{"type":"bye","code":"quit","switch":{"kind":"project","root":"/home/me/app"}}"#,
       ),
       (
         CtlMsg::Event(Event {
@@ -820,7 +827,6 @@ mod tests {
         message: String::new(),
         state: None,
         screen: None,
-        switch: None,
       })
     );
   }
