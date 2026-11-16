@@ -140,6 +140,8 @@ pub enum TaskScreenCmd {
     unit: ScrollUnit,
   },
   CopyYank,
+  /// Jump the view back to the live end, as if never scrolled.
+  ScrollReset,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -454,6 +456,7 @@ impl TaskScreen {
       TaskScreenCmd::CopyMove { dir } => self.copy_move(dir),
       TaskScreenCmd::CopyBeginSelection => self.copy_begin_selection(),
       TaskScreenCmd::Scroll { delta, unit } => self.scroll(delta, unit),
+      TaskScreenCmd::ScrollReset => self.scroll_reset(),
       TaskScreenCmd::CopyYank => self.copy_yank(),
     }
     self.settle(effects);
@@ -684,6 +687,17 @@ impl TaskScreen {
           .screen
           .scroll_screen_down(delta.unsigned_abs() as usize);
       }
+      self.render();
+    }
+  }
+
+  fn scroll_reset(&mut self) {
+    if let Some(session) = &mut self.copy {
+      session.state.scroll_down(usize::MAX);
+      self.sync_drag_extent();
+      self.repaint_copy();
+    } else {
+      self.screen.set_scrollback(0);
       self.render();
     }
   }
@@ -1324,6 +1338,41 @@ mod tests {
       (1, 0)
     );
     assert!(present.images.contains_key(&present.placements[0].key));
+  }
+
+  #[tokio::test]
+  async fn scroll_reset_returns_to_the_live_end() {
+    let (mut screen, _observer, _rx) = screen_with_history().await;
+    let mut effects = Vec::new();
+    screen.handle_cmd(
+      TaskScreenCmd::Scroll {
+        delta: 10,
+        unit: ScrollUnit::Line,
+      },
+      &mut effects,
+    );
+    assert_eq!(screen.screen.scrollback(), 10);
+
+    screen.handle_cmd(TaskScreenCmd::ScrollReset, &mut effects);
+    assert_eq!(screen.screen.scrollback(), 0);
+  }
+
+  #[tokio::test]
+  async fn scroll_reset_in_copy_mode_returns_to_the_live_end() {
+    let (mut screen, _observer, _rx) = screen_with_history().await;
+    let mut effects = Vec::new();
+    screen.handle_cmd(TaskScreenCmd::CopyEnter, &mut effects);
+    screen.handle_cmd(
+      TaskScreenCmd::Scroll {
+        delta: 5,
+        unit: ScrollUnit::Line,
+      },
+      &mut effects,
+    );
+    assert_eq!(copy_offset(&screen), 5);
+
+    screen.handle_cmd(TaskScreenCmd::ScrollReset, &mut effects);
+    assert_eq!(copy_offset(&screen), 0);
   }
 
   #[tokio::test]

@@ -21,6 +21,8 @@ pub enum ScreenCommand {
   /// Copy the selection (delivered back as a `copy` event) and leave
   /// copy mode.
   CopyYank,
+  /// Jump the view back to the live end, as if never scrolled.
+  ScrollReset,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -70,6 +72,7 @@ mod tests {
       ),
       (ScreenCommand::CopySelect, r#"{"command":"copy-select"}"#),
       (ScreenCommand::CopyYank, r#"{"command":"copy-yank"}"#),
+      (ScreenCommand::ScrollReset, r#"{"command":"scroll-reset"}"#),
     ];
     for (command, json) in samples {
       assert_eq!(serde_json::to_string(&command).unwrap(), json);

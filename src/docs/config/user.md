@@ -207,6 +207,8 @@ Default bindings in `tasks`:
   desc: "scroll-up, scroll-down {unit: half-screen}"
 - cmd: <PageUp>, <PageDown>
   desc: "scroll-up, scroll-down {unit: screen}"
+- cmd: G
+  desc: "scroll-reset: back to the live end"
 :::
 
 In `term_copy`: `<Esc>` copy-mode-leave, `v` copy-mode-end, `c`

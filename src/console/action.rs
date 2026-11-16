@@ -116,6 +116,8 @@ pub enum Action {
     #[serde(default = "default_scroll_unit")]
     unit: ScrollUnit,
   },
+  /// Back to the live end of the scrollback, in one step.
+  ScrollReset,
 
   CopyModeEnter,
   CopyModeLeave,
@@ -211,6 +213,7 @@ impl Action {
       Action::CloseCurrentModal => "Close current modal".to_string(),
       Action::ScrollUp { n, unit } => scroll_desc("up", *n, *unit),
       Action::ScrollDown { n, unit } => scroll_desc("down", *n, *unit),
+      Action::ScrollReset => "Back to the live end".to_string(),
       Action::CopyModeEnter => "Enter copy mode".to_string(),
       Action::CopyModeLeave => "Leave copy mode".to_string(),
       Action::CopyModeMove { dir } => {
@@ -338,6 +341,9 @@ mod tests {
         unit: ScrollUnit::Line
       }
     );
+
+    let a: Action = serde_yaml::from_str("action: scroll-reset\n").unwrap();
+    assert_eq!(a, Action::ScrollReset);
   }
 }
 
