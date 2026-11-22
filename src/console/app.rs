@@ -779,7 +779,9 @@ impl App {
           unit: wire_scroll_unit(unit),
         });
       }
-      Action::ScrollReset => self.screen_command(ScreenCommand::ScrollReset),
+      Action::ScrollToBottom => {
+        self.screen_command(ScreenCommand::ScrollToBottom)
+      }
       Action::CopyModeEnter => {
         if self.state.current_task().is_some() {
           self.state.scope = Scope::Term;

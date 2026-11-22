@@ -218,7 +218,7 @@ impl KeymapConfig {
         ("<C-d>", scroll_down(1, ScrollUnit::HalfScreen)),
         ("<PageUp>", scroll_up(1, ScrollUnit::Screen)),
         ("<PageDown>", scroll_down(1, ScrollUnit::Screen)),
-        ("G", Action::ScrollReset),
+        ("<End>", Action::ScrollToBottom),
       ] {
         self.bind(group, keys, action);
       }
@@ -378,10 +378,13 @@ mod tests {
   }
 
   #[test]
-  fn g_resets_the_scroll_to_the_live_end() {
+  fn end_scrolls_to_the_bottom() {
     let config = KeymapConfig::default();
     for group in [KeymapGroup::Tasks, KeymapGroup::Copy] {
-      assert_eq!(bound(&config, group, "G"), Some(&Action::ScrollReset));
+      assert_eq!(
+        bound(&config, group, "<End>"),
+        Some(&Action::ScrollToBottom)
+      );
     }
   }
 

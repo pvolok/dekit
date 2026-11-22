@@ -140,8 +140,8 @@ pub enum TaskScreenCmd {
     unit: ScrollUnit,
   },
   CopyYank,
-  /// Jump the view back to the live end, as if never scrolled.
-  ScrollReset,
+  /// To the bottom: the live screen, or the copy-mode snapshot's last row.
+  ScrollToBottom,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -456,7 +456,7 @@ impl TaskScreen {
       TaskScreenCmd::CopyMove { dir } => self.copy_move(dir),
       TaskScreenCmd::CopyBeginSelection => self.copy_begin_selection(),
       TaskScreenCmd::Scroll { delta, unit } => self.scroll(delta, unit),
-      TaskScreenCmd::ScrollReset => self.scroll_reset(),
+      TaskScreenCmd::ScrollToBottom => self.scroll_to_bottom(),
       TaskScreenCmd::CopyYank => self.copy_yank(),
     }
     self.settle(effects);
@@ -691,9 +691,9 @@ impl TaskScreen {
     }
   }
 
-  fn scroll_reset(&mut self) {
+  fn scroll_to_bottom(&mut self) {
     if let Some(session) = &mut self.copy {
-      session.state.scroll_down(usize::MAX);
+      session.state.scroll_to_bottom();
       self.sync_drag_extent();
       self.repaint_copy();
     } else {
@@ -702,9 +702,6 @@ impl TaskScreen {
     }
   }
 
-  /// Composes the frozen snapshot (scrolled), the selection highlight, the HUD
-  /// badge, and the selection cursor into the `present` surface that observers
-  /// render.
   /// Repaints copy mode for its observers.
   fn repaint_copy(&mut self) {
     self.render_present();
@@ -1341,7 +1338,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn scroll_reset_returns_to_the_live_end() {
+  async fn scroll_to_bottom_shows_the_live_screen() {
     let (mut screen, _observer, _rx) = screen_with_history().await;
     let mut effects = Vec::new();
     screen.handle_cmd(
@@ -1353,26 +1350,36 @@ mod tests {
     );
     assert_eq!(screen.screen.scrollback(), 10);
 
-    screen.handle_cmd(TaskScreenCmd::ScrollReset, &mut effects);
+    screen.handle_cmd(TaskScreenCmd::ScrollToBottom, &mut effects);
     assert_eq!(screen.screen.scrollback(), 0);
   }
 
   #[tokio::test]
-  async fn scroll_reset_in_copy_mode_returns_to_the_live_end() {
+  async fn scroll_to_bottom_in_copy_mode_brings_the_cursor_along() {
     let (mut screen, _observer, _rx) = screen_with_history().await;
     let mut effects = Vec::new();
     screen.handle_cmd(TaskScreenCmd::CopyEnter, &mut effects);
+    for dir in [CopyMove::Right, CopyMove::Right] {
+      screen.handle_cmd(TaskScreenCmd::CopyMove { dir }, &mut effects);
+    }
+    screen.handle_cmd(TaskScreenCmd::CopyBeginSelection, &mut effects);
+    for _ in 0..30 {
+      let dir = CopyMove::Up;
+      screen.handle_cmd(TaskScreenCmd::CopyMove { dir }, &mut effects);
+    }
     screen.handle_cmd(
       TaskScreenCmd::Scroll {
-        delta: 5,
+        delta: 10,
         unit: ScrollUnit::Line,
       },
       &mut effects,
     );
-    assert_eq!(copy_offset(&screen), 5);
+    assert_eq!(copy_offset(&screen), 10);
 
-    screen.handle_cmd(TaskScreenCmd::ScrollReset, &mut effects);
+    screen.handle_cmd(TaskScreenCmd::ScrollToBottom, &mut effects);
     assert_eq!(copy_offset(&screen), 0);
+    // The selection extends to the bottom row, in the cursor's column.
+    assert_eq!(copy_end(&screen), Pos { y: 23, x: 2 });
   }
 
   #[tokio::test]

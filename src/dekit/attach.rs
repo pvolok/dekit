@@ -617,7 +617,7 @@ fn screen_cmd(command: ScreenCommand) -> TaskScreenCmd {
     },
     ScreenCommand::CopySelect => TaskScreenCmd::CopyBeginSelection,
     ScreenCommand::CopyYank => TaskScreenCmd::CopyYank,
-    ScreenCommand::ScrollReset => TaskScreenCmd::ScrollReset,
+    ScreenCommand::ScrollToBottom => TaskScreenCmd::ScrollToBottom,
   }
 }
 

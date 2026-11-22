@@ -215,7 +215,7 @@ fn menu_items() -> Vec<MenuItem> {
       n: 1,
       unit: ScrollUnit::HalfScreen,
     },
-    Action::ScrollReset,
+    Action::ScrollToBottom,
     Action::CopyModeEnter,
     Action::CopyModeLeave,
     Action::CopyModeEnd,

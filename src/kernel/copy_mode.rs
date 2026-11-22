@@ -126,6 +126,14 @@ impl CopyState {
     self.snapshot.set_scrollback(offset);
   }
 
+  /// Scrolls to the bottom and puts the cursor on the bottom row, in the
+  /// same column: a started selection extends to it.
+  pub fn scroll_to_bottom(&mut self) {
+    self.snapshot.set_scrollback(0);
+    let y = (self.snapshot.size().height as i32 - 1).max(0);
+    self.cursor_mut().y = y;
+  }
+
   /// Current scroll offset (rows above the live bottom).
   pub fn scrollback(&self) -> usize {
     self.snapshot.scrollback()
