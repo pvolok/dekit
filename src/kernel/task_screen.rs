@@ -663,13 +663,12 @@ impl TaskScreen {
   /// Positive `delta` scrolls up into history.
   fn scroll(&mut self, delta: i32, unit: ScrollUnit) {
     let height = self.size.y.max(1) as i32;
-    let delta = delta
-      * match unit {
-        ScrollUnit::Line => 1,
-        ScrollUnit::HalfScreen => (height / 2).max(1),
-        // Keep one line of overlap for continuity when paging.
-        ScrollUnit::Screen => (height - 1).max(1),
-      };
+    let delta = delta.saturating_mul(match unit {
+      ScrollUnit::Line => 1,
+      ScrollUnit::HalfScreen => (height / 2).max(1),
+      // Keep one line of overlap for continuity when paging.
+      ScrollUnit::Screen => (height - 1).max(1),
+    });
     if let Some(session) = &mut self.copy {
       if delta >= 0 {
         session.state.scroll_up(delta as usize);
@@ -1380,6 +1379,17 @@ mod tests {
     assert_eq!(copy_offset(&screen), 0);
     // The selection extends to the bottom row, in the cursor's column.
     assert_eq!(copy_end(&screen), Pos { y: 23, x: 2 });
+  }
+
+  #[tokio::test]
+  async fn a_huge_scroll_stops_at_the_ends() {
+    let (mut screen, _observer, _rx) = screen_with_history().await;
+    let mut effects = Vec::new();
+    for (delta, offset) in [(i32::MAX, 37), (i32::MIN, 0)] {
+      let unit = ScrollUnit::Screen;
+      screen.handle_cmd(TaskScreenCmd::Scroll { delta, unit }, &mut effects);
+      assert_eq!(screen.screen.scrollback(), offset);
+    }
   }
 
   #[tokio::test]
